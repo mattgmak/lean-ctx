@@ -283,6 +283,11 @@ pub(crate) fn compress_if_beneficial(command: &str, output: &str) -> String {
     let original_tokens = count_tokens(output);
 
     if original_tokens < 30 {
+        if is_search_output(command) {
+            if let Some(truncated) = crate::core::patterns::grep::truncate_oversized_lines(output) {
+                return truncated;
+            }
+        }
         return output.to_string();
     }
 
@@ -437,6 +442,12 @@ pub(crate) fn compress_if_beneficial(command: &str, output: &str) -> String {
         && let Some(c) = truncate_with_safety_scan(&lines, original_tokens)
     {
         return c;
+    }
+
+    if is_search_output(command) {
+        if let Some(truncated) = crate::core::patterns::grep::truncate_oversized_lines(output) {
+            return truncated;
+        }
     }
 
     output.to_string()

@@ -2,13 +2,40 @@ use std::collections::HashMap;
 
 use crate::core::tokens::count_tokens;
 
+const MAX_LINE_CHARS: usize = 250;
+
 fn normalize_shell_tokens(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn truncate_line_content(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.len() <= MAX_LINE_CHARS {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(MAX_LINE_CHARS - 1).collect();
+    format!("{truncated}…")
+}
+
+/// Truncate any overlong lines when structured grep compression does not apply.
+pub(crate) fn truncate_oversized_lines(output: &str) -> Option<String> {
+    let mut changed = false;
+    let truncated: Vec<String> = output
+        .lines()
+        .map(|line| {
+            if line.len() <= MAX_LINE_CHARS {
+                return line.to_string();
+            }
+            changed = true;
+            truncate_line_content(line)
+        })
+        .collect();
+    changed.then(|| truncated.join("\n"))
+}
+
 pub fn compress(output: &str) -> Option<String> {
     let lines: Vec<&str> = output.lines().collect();
-    if lines.len() < 3 {
+    if lines.is_empty() {
         return None;
     }
 
@@ -25,7 +52,7 @@ pub fn compress(output: &str) -> Option<String> {
     }
 
     if total_matches == 0 {
-        return None;
+        return truncate_oversized_lines(output);
     }
 
     let max_matches_per_file = if total_matches > 200 { 5 } else { 10 };
@@ -39,13 +66,7 @@ pub fn compress(output: &str) -> Option<String> {
         result.push_str(&format!("\n{short} ({}):", matches.len()));
         let show = matches.iter().take(max_matches_per_file);
         for (ln, content) in show {
-            let trimmed = content.trim();
-            let short_content = if trimmed.len() > 120 {
-                let truncated: String = trimmed.chars().take(119).collect();
-                format!("{truncated}…")
-            } else {
-                trimmed.to_string()
-            };
+            let short_content = truncate_line_content(content);
             if *ln > 0 {
                 result.push_str(&format!("\n  {ln}: {short_content}"));
             } else {
@@ -65,7 +86,7 @@ pub fn compress(output: &str) -> Option<String> {
     let ct_r = count_tokens(&res_n);
     let ct_o = count_tokens(&out_n);
     if ct_r >= ct_o && !(ct_r == ct_o && res_n.len() < out_n.len()) {
-        return None;
+        return truncate_oversized_lines(output);
     }
 
     Some(result)
@@ -120,6 +141,56 @@ mod tests {
     #[test]
     fn small_grep_output_is_not_claimed_without_matches() {
         assert!(compress("hello\nworld").is_none());
+    }
+
+    #[test]
+    fn single_oversized_grep_line_is_truncated() {
+        let huge = "x".repeat(50_000);
+        let output = format!("data.json:1:{huge}");
+        let result = compress(&output).expect("oversized grep line must truncate");
+        assert!(
+            result.len() < output.len(),
+            "must shrink: {} vs {}",
+            result.len(),
+            output.len()
+        );
+        assert!(
+            count_tokens(&result) < count_tokens(&output),
+            "must save tokens: {} vs {}",
+            count_tokens(&result),
+            count_tokens(&output)
+        );
+        assert!(
+            !result.contains(&huge),
+            "must not pass through the full payload"
+        );
+    }
+
+    #[test]
+    fn two_oversized_non_grep_lines_are_truncated() {
+        let huge = "y".repeat(40_000);
+        let output = format!("{huge}\n{huge}");
+        let result = compress(&output).expect("oversized lines must truncate");
+        assert!(result.len() < output.len());
+        assert!(!result.contains(&huge));
+    }
+
+    #[test]
+    fn single_match_grep_line_is_truncated_without_three_line_minimum() {
+        let huge = "z".repeat(50_000);
+        let output = format!("src/main.rs:42: {huge}");
+        let result = compress(&output).expect("single grep match must still truncate");
+        assert!(!result.contains(&huge));
+        assert!(result.len() < output.len());
+    }
+
+    #[test]
+    fn two_match_grep_output_is_not_skipped() {
+        let huge = "w".repeat(50_000);
+        let output = format!("a.rs:1: {huge}\nb.rs:2: short");
+        let result = compress(&output).expect("two grep matches must not be skipped");
+        assert!(!result.contains(&huge));
+        assert!(result.contains("b.rs"));
     }
 
     #[test]
