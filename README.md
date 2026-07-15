@@ -226,7 +226,7 @@ wire path:   AI tool  →  lean-ctx proxy        →  model provider   (every re
 - **Session memory**: persists state with structured recovery so long-running work never "cold starts"
 - **Context Manager**: browser dashboard for real-time visibility into what's in your context window
 
-## Get started (60 seconds)
+## Get started (30 seconds)
 
 ```bash
 # 1) Install (pick one)
@@ -236,17 +236,24 @@ npm install -g lean-ctx-bin                          # Node.js
 cargo install lean-ctx                               # Rust
 pi install npm:pi-lean-ctx                           # Pi Coding Agent
 
-# 2) Connect your AI tools (zero prompts, sensible defaults)
-lean-ctx onboard          # or: lean-ctx setup  (guided, full control)
+# 2) One-command setup for your agent
+lean-ctx wrap cursor      # or: wrap claude / wrap codex / wrap vscode
 
-# 3) Verify
-lean-ctx doctor
-
-# 4) Restart your shell + AI tool, use it normally, then see the payoff
-lean-ctx gain             # savings appear after your AI's first lean-ctx call
+# Done. Savings appear after your AI's first lean-ctx call.
+lean-ctx gain
 ```
 
-After onboarding, restart your shell and your editor/AI tool once so the MCP + hooks are active. `lean-ctx gain` is empty until your AI tool makes its first lean-ctx call — that's expected, not a misconfiguration.
+`lean-ctx wrap` installs shell hooks, registers the MCP server, sets up agent hooks, starts the daemon, and verifies the connection — all in one command. Undo anytime with `lean-ctx unwrap cursor`.
+
+<details>
+<summary><strong>Alternative: full control</strong></summary>
+
+```bash
+lean-ctx onboard          # connect all detected AI tools (zero prompts)
+lean-ctx setup            # interactive wizard with every option
+```
+
+</details>
 
 **Building from source on Windows?** Clone the repo and run `./install.ps1` in PowerShell — it builds the release binary and installs it into Cargo's bin directory (pass `-BuildOnly` to build without installing).
 
@@ -304,14 +311,14 @@ tools are documented there).
 <tr>
 <td width="50%" valign="top">
 
-### 🟢 Your first 60 seconds
+### 🟢 Your first 30 seconds
 *"I just installed it — now what?"*
 
 ```bash
-lean-ctx onboard      # connect every detected AI tool
+lean-ctx wrap cursor  # one-command setup for your agent
 lean-ctx doctor       # confirm you're wired up
 ```
-One command auto-detects Cursor/Claude/Codex/… and configures MCP + hooks.
+One command installs hooks, MCP registration, and verifies the connection.
 → **[Journey 1 — Setup & Onboarding](docs/reference/01-setup-and-onboarding.md)**
 
 </td>
@@ -682,3 +689,6 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md). Easy first PR: propose a new CLI 
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+
+--- lean-ctx: ctx_compose bundles search+read+symbols in one call ---

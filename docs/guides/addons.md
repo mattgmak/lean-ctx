@@ -165,7 +165,7 @@ registry validator, so upstream can't change under you silently.
 | `mem0` | listed | official MCP server (hosted) | `MEM0_API_KEY` |
 | `claude-context` | listed | `npx @zilliz/claude-context-mcp` | `OPENAI_API_KEY` + Milvus |
 | `rtk` | listed | shell-output hook; MCP via the `rtk-mcp` bridge | — |
-| `lmd` | listed | Markdown directive layer — no MCP endpoint | — |
+| `lean-md` | listed | Directive-driven Markdown for agent plans (`@dasTholo/lean-md`) | — |
 
 *Listed* tools either need secrets/a backend or don't ship a clean, pinned,
 out-of-the-box MCP server yet. Each flips to install-on-add with a one-line
@@ -220,6 +220,15 @@ args = ["serve"]
 # transport = "http"
 # url = "https://my-addon.example.com/mcp"
 # headers = { Authorization = "Bearer ..." }
+
+# Context packages this addon needs at runtime (depth-1, installed first):
+[[dependencies]]
+name        = "@dasTholo/lean-md-skills"
+version_req = "^0.2"
+optional    = false
+
+[mcp.env]
+LEAN_MD_SKILLS_DIR = "{pack_dir:@dasTholo/lean-md-skills}"
 ```
 
 See the [contract](../contracts/addon-manifest-v1.md) for every field.

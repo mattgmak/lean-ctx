@@ -83,10 +83,9 @@ fn to_ws_url(upstream: &str, path: &str) -> Option<String> {
     let base = upstream.trim_end_matches('/');
     let ws_base = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{rest}")
     } else {
-        return None;
+        let rest = base.strip_prefix("http://")?;
+        format!("ws://{rest}")
     };
     Some(format!("{ws_base}{path}"))
 }

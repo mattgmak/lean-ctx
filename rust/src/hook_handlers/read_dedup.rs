@@ -124,6 +124,14 @@ fn compute_read_dedup(input: &str) -> Option<String> {
         return None;
     }
     let updated = replace_slot(tool_response, &slot, &stub)?;
+
+    // Track dedup savings in stats.json so CEP/dashboard can report them.
+    // The hook subprocess is short-lived, so flush immediately.
+    let original_tokens = crate::core::tokens::count_tokens(original);
+    let stub_tokens = crate::core::tokens::count_tokens(&stub);
+    crate::core::stats::record("cli_read_dedup", original_tokens, stub_tokens);
+    crate::core::stats::flush();
+
     debug_log::log_hook_decision(
         "read-dedup",
         "Read",
@@ -339,18 +347,22 @@ fn sweep_stale_sessions(root: &std::path::Path) {
 mod tests {
     use super::*;
 
-    /// RAII guard-host marker (read_dedup=auto requires one). Restores the
-    /// environment on drop, even when an assert fails mid-test. Callers hold
-    /// `test_env_lock`, so the set/remove pair is race-free.
+    /// RAII guard that forces `read_dedup=on` for deterministic tests regardless
+    /// of host (Cursor exports its own env vars that would make Auto resolve to
+    /// disabled). Restores the environment on drop.
     struct GuardHost;
     impl GuardHost {
         fn claude() -> Self {
+            // Force dedup on — avoids depending on host_has_read_before_write_guard()
+            // which fails inside Cursor agent shells (CURSOR_* vars present).
+            crate::test_env::set_var("LEAN_CTX_READ_DEDUP", "on");
             crate::test_env::set_var("CLAUDE_PROJECT_DIR", "/repo");
             GuardHost
         }
     }
     impl Drop for GuardHost {
         fn drop(&mut self) {
+            crate::test_env::remove_var("LEAN_CTX_READ_DEDUP");
             crate::test_env::remove_var("CLAUDE_PROJECT_DIR");
         }
     }

@@ -3,6 +3,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
+use crate::core::error::DispatchError;
 use crate::server::registry::build_registry;
 use crate::server::tool_trait::ToolContext;
 
@@ -15,7 +16,7 @@ pub(crate) enum CallError {
     UnknownTool(String),
     BadJson(String),
     UnsafeRoot(String),
-    Dispatch(String),
+    Dispatch(DispatchError),
 }
 
 impl std::fmt::Display for CallError {
@@ -30,7 +31,7 @@ impl std::fmt::Display for CallError {
             CallError::UnsafeRoot(p) => {
                 write!(f, "error: refusing broad/unsafe --project-root '{p}'")
             }
-            CallError::Dispatch(m) => write!(f, "error: {m}"),
+            CallError::Dispatch(e) => write!(f, "error: {e}"),
         }
     }
 }
@@ -169,7 +170,11 @@ pub(crate) fn run_call(args: &[String]) -> Result<String, CallError> {
                 };
                 resolved_paths.insert("path".to_string(), resolved);
             }
-            Err(e) => return Err(CallError::Dispatch(format!("path resolution failed: {e}"))),
+            Err(e) => {
+                return Err(CallError::Dispatch(DispatchError::PathResolution {
+                    message: e,
+                }));
+            }
         }
     }
 
@@ -182,9 +187,11 @@ pub(crate) fn run_call(args: &[String]) -> Result<String, CallError> {
 
     // Handlers are synchronous (the JetBrains backend uses blocking `ureq`),
     // so no tokio runtime is required here.
-    let output = tool
-        .handle(&args_map, &ctx)
-        .map_err(|e| CallError::Dispatch(format!("{e}")))?;
+    let output = tool.handle(&args_map, &ctx).map_err(|e| {
+        CallError::Dispatch(DispatchError::Tool {
+            message: e.to_string(),
+        })
+    })?;
 
     Ok(output.text)
 }

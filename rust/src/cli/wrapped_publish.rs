@@ -280,6 +280,24 @@ pub(crate) fn link(code: Option<&str>) {
     }
 }
 
+/// Dashboard-friendly link start: mint a pairing code (returns Result instead of
+/// exiting). Used by the dashboard link proxy endpoint.
+pub(crate) fn link_start() -> Result<cloud_client::LinkCode, String> {
+    let store = PublishedStore::load();
+    let card = linkable_card(&store)
+        .ok_or("No published card on this machine yet. Submit to the leaderboard first.")?;
+    cloud_client::link_wrapped_start(&card.id, &card.edit_token)
+}
+
+/// Dashboard-friendly link complete: join this card into a pairing code's group
+/// (returns Result instead of exiting). Used by the dashboard link proxy endpoint.
+pub(crate) fn link_complete(code: &str) -> Result<(), String> {
+    let store = PublishedStore::load();
+    let card = linkable_card(&store)
+        .ok_or("No published card on this machine yet. Submit to the leaderboard first.")?;
+    cloud_client::link_wrapped_complete(&card.id, &card.edit_token, code)
+}
+
 impl PublishedStore {
     fn load() -> Self {
         store_path()
@@ -449,10 +467,12 @@ pub(crate) fn publish(period: &str, name: Option<&str>, leaderboard: bool) {
                         "Linked to your account — all your machines now stack under one leaderboard entry."
                     );
                 } else {
-                    println!(
-                        "Tip: more than one machine? Run  lean-ctx gain --link  to combine them \
-                         into one leaderboard entry (no account needed)."
-                    );
+                    println!();
+                    println!("  ┌─ Multiple machines? ─────────────────────────────────┐");
+                    println!("  │  Combine them into one leaderboard entry:            │");
+                    println!("  │  lean-ctx gain --link   (no account needed)          │");
+                    println!("  │  Or use the dashboard:  http://localhost:3333        │");
+                    println!("  └─────────────────────────────────────────────────────┘");
                 }
                 // A nameless entry shows as "anonymous" on the board — nudge once toward a handle.
                 if effective_name.is_none() {

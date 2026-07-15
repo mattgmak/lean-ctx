@@ -53,7 +53,7 @@ pub struct GatewayServer {
     /// Extra environment variables for the child process.
     pub env: BTreeMap<String, String>,
     /// Optional SHA-256 pin of the stdio `command` binary (P3). When set, the
-    /// spawn point ([`crate::core::gateway::client`]) verifies the resolved
+    /// spawn point ([`crate::core::mcp_catalog::client`]) verifies the resolved
     /// binary's hash and refuses to launch a swapped executable. Empty =
     /// unpinned (legacy behaviour). Part of the wiring, so it is covered by the
     /// install-time integrity hash ([`crate::core::addons::integrity`]).

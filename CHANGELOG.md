@@ -3,7 +3,277 @@
 All notable changes to lean-ctx are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [3.9.9] — 2026-07-14
+
+### Fixed
+- **CRITICAL: Worktree data-loss prevention for `ctx_patch replace_symbol` (#803).**
+  When both `name_path` and `path` are provided, the resolved symbol location
+  is now verified against the caller's explicit path via `canonicalize()`. A
+  mismatch (e.g. main checkout vs linked git worktree) returns
+  `ERROR: WORKTREE_MISMATCH` instead of silently writing to the wrong file.
+- **CRITICAL: Agent wrapper detection for sandbox-exec wrapped commands (#745).**
+  `strip_outer_shell_invocation` now recursively removes `/bin/{zsh,bash,sh} -c '...'`
+  wrappers before detecting the inner agent command. Fixes cases where macOS
+  `sandbox-exec` added an outer shell invocation that broke `has_trailing_bare_pwd`
+  detection due to a trailing quote character.
+- **Compression-marker guard for Write/Edit hooks (#805).**
+  `PreToolUse` deny handler now intercepts Write, Edit, StrReplace, and MultiEdit
+  payloads containing `[lean-ctx:` compression markers and blocks the operation
+  before compressed output is written to disk. Escape hatch:
+  `LEAN_CTX_ALLOW_COMPRESSED_WRITE=1`. Fixed false-positive for Markdown links
+  like `[lean-ctx docs](url)` by removing the overly broad `[lean-ctx ` pattern.
+- **Hermes rules marker-based updates (#802).**
+  `install_hermes_rules` now uses `marked_block::upsert` with `<!-- lean-ctx -->`
+  markers instead of a substring check, ensuring rules update correctly across
+  versions while preserving user content in `HERMES.md`.
+- **CODEX_THREAD_ID forwarding via parent-env probe (#800).**
+  When no captured agent runtime variables exist, `load()` now probes the parent
+  process environment (`/proc/<ppid>/environ` on Linux, `ps eww` on macOS) for
+  forwardable `CODEX_*`/`CLAUDE_*` variables. Filtered by prefix allowlist +
+  credential exclusion, persisted with 0o600 permissions and 2h TTL.
+- **Tool health hint typo (PR #804).** Config key in the "consider disabling"
+  hint corrected from `tools_disabled` to `disabled_tools`.
+
+## [3.9.8] — 2026-07-12
+
+### Added
+- **Smart Read redirect for Cursor (auto mode).**
+  Native Read calls in Cursor are now transparently compressed via lean-ctx's
+  `auto` mode — selecting the optimal compression (signatures, map, etc.) per
+  file for 87-97% token savings. Windowed reads (offset/limit) remain verbatim
+  (`full-compact`) to preserve line indexing. Validated by edit-probe PoC:
+  StrReplace does NOT fire a Read PreToolUse, so the redirect is safe.
+- **Replace mode hardening for all agents.**
+  - Claude Code / CodeBuddy: content-aware CLAUDE.md block updates; Replace
+    mode block is now correctly installed even when block version matches.
+  - Codex: mode-aware pretooluse handler — denies Bash in Replace mode,
+    rewrites in Hybrid mode. Removed dead `install_codex_deny_hook`.
+  - Pi: propagates replace mode to extension config + dedicated
+    `PI_AGENTS_REPLACE.md` template.
+  - Qoder: deny hooks for Read|Grep|Glob in Replace mode + replace rules.
+  - Crush / Hermes: mode-aware rules installation via `replace_rules_content()`.
+  - CodeBuddy added to `REPLACE_AGENTS`.
+- **lean-md addon integration (PR #721).** External addon by @dasTholo —
+  directive-driven Markdown for agent plans. Reverse-cut: renderer lives in
+  `dasTholo/lean-md`, lean-ctx hosts only the thin surface (registry entry,
+  LSP formatter routing, `RenderTransform` trait, `.lmd.md` raw read).
+- **SessionStart nudge improvements.** Explicit ctx_read cache statistics
+  for shared-mode hosts (Cursor); fixed stale `ctx_semantic_search` reference.
+
+### Fixed
+- **Cursor Read redirect regression (GH #1250 follow-up).**
+  `install_cursor_deny_hook` was re-adding the Read redirect that
+  `merge_cursor_hooks` had removed, causing `cli_full` traffic with 0%
+  compression (1.4M tokens wasted). Now correctly separated: Read → redirect
+  (smart compression), Grep|Glob → deny.
+- **Cursor Glob deny.** Added Glob to the deny matcher alongside Grep —
+  forces use of `ctx_glob` instead of native Glob.
+- **Claude/CodeBuddy CLAUDE.md not updating in Replace mode.** Block
+  installer now checks content (not just version) to detect stale blocks.
+- **lean-md registry `integration: "mcp"` → `"none"`.** Invalid enum value
+  from PR #721 corrected; `IntegrationKind::parse("mcp")` silently returned
+  `None`.
+- **Codex integration test adjusted.** `agent_init_codex` test updated from
+  3 to 2 PreToolUse entries after removing the separate deny hook.
+
+### Changed
+- `redirect_read_args()` now returns `Vec<String>` with dynamic mode
+  selection instead of a fixed `[&str; 4]` array.
+- `refresh_agent_hooks()` is now fully mode-aware — determines the
+  recommended `HookMode` per agent and installs the correct artifacts.
+- Removed PoC `edit_probe` handler (served its diagnostic purpose).
+
+## [3.9.7] — 2026-07-11
+
+### Added
+- **Runtime `tools/list_changed` notifications (GH #1250).**
+  When the user changes `tool_profile`, `tools_enabled`, or `disabled_tools`
+  via dashboard, CLI, or manual config edit, the MCP server now automatically
+  sends a `notifications/tools/list_changed` to the IDE client on the next
+  tool call. No more "restart IDE to pick up profile changes" — Cursor,
+  Claude Code, and all MCP clients refresh their tool surface immediately.
+  New module: `server/tools_config_watch` with hash-based change detection.
+- **CLI profile-switch messaging updated.**
+  `lean-ctx tools <profile>` now prints "Changes take effect on the next
+  tool call (auto-detected)" instead of "Restart your AI tool / IDE".
+
+### Fixed
+- **`lean-ctx index build` memory explosion capped (GH #790).**
+  Six fixes that together prevent unbounded RAM growth during index builds:
+  1. **Memory Guardian activated for CLI builds** — `start_guard()` now runs
+     before `ensure_all_background()`, so pressure/abort checks in graph and
+     BM25 code actually fire (previously only started in daemon mode).
+  2. **`graph_index_max_files` default 0 → 15 000** — caps the graph scan;
+     override with `graph_index_max_files = 0` for unlimited.
+  3. **Graph `content_cache` capped at 256 MB** — stops caching file contents
+     once the budget is hit; the edge builder falls back to disk reads.
+  4. **Edge build batched (500 files/batch)** — `par_iter(ALL)` replaced with
+     chunked parallel batches and memory-pressure checks between them.
+  5. **BM25 chunk content truncated to 10-line snippets during build** — full
+     text is tokenised for scoring, then the stored body is snipped immediately
+     (no more holding every file's full content in the chunk vector).
+  6. **BM25 save streams through zstd** — `postcard::to_allocvec` replaced with
+     `postcard::to_io` → `zstd::Encoder` → temp file; eliminates the
+     intermediate uncompressed `Vec<u8>` allocation entirely.
+  7. **BM25 parallel path (`prepare_chunk`) now truncates** — the parallel build
+     path (`add_prepared`) previously bypassed the 10-line snippet truncation,
+     holding full file bodies for all chunks simultaneously.
+  8. **Memory Guardian: immediate first RSS sample** — closes the 3-second blind
+     window where builders allocated freely with stale Normal pressure flags.
+  9. **CLI build evicts content_cache on Hard+ pressure** — previously only
+     called `jemalloc_purge`; now clears the 128 MB shared content cache.
+  10. **Graph + BM25 run sequentially under memory pressure** — prevents peak
+      allocations from compounding when the system is already low on RAM.
+  11. **Graph scan admission control** — uses `index_admission` (same as BM25)
+      before parallel fan-out; oversized corpora degrade to sequential.
+  12. **Graph scan batch size 2000 → 500** — matches BM25's `MAX_BATCH_FILES`;
+      reduces per-batch peak from ~40 MB to ~10 MB of `ScanFileResult` content.
+  13. **Batch-0 pressure check** — graph scan now checks `abort_requested` on
+      the very first batch (previously batch 0 always ran unchecked).
+  14. **Tightened guardian pressure thresholds** — Hard fires at 1.5× (was 2×),
+      Critical at 2× (was 3×) of `max_ram_percent`. On a 64 GB machine at 10%:
+      Hard = 9.6 GB (was 12.8 GB), Critical = 12.8 GB (was 19.2 GB).
+  15. **Edge parallel batches check `is_under_pressure`** — previously only
+      checked `abort_requested` (Hard+); Soft pressure now stops edge-building.
+  16. **`build-full` and `build-semantic` start the memory guardian** — previously
+      only `build` activated the guardian; full/semantic builds ran unprotected.
+- **Cursor Read redirect removed — savings jump from 9.5 % to 73+ % (GH #1250).**
+  Cursor's `StrReplace` internally triggers a native `Read` that the
+  redirect hook intercepted, producing verbatim `cli_full` output with
+  ~0.5 % savings. This dominated the token stats (68 % of all input tokens!)
+  and dragged the overall savings rate to single digits. The Read matcher
+  is now removed from Cursor's `preToolUse` redirect hook — native Reads
+  pass through unmodified (StrReplace works), and the agent uses `ctx_read`
+  (MCP) for compressed reads, matching how Claude Code already works
+  (`read_redirect = auto`). Grep redirect remains for compression.
+
+## [3.9.6] — 2026-07-10
+
+### Added
+- **`full-compact` read mode.**
+  New `ctx_read` mode: headerless, trailing-whitespace-stripped verbatim
+  content. Used by the Read redirect to produce temp files faithful to the
+  original line structure while giving ~5–10 % compression without breaking
+  the host's `offset`/`limit` windowed reads (fixes header-in-temp-file offset
+  bug from the original `full` mode, #1021 follow-up).
+- **Dashboard channel-breakdown API.**
+  New `/api/stats` field `channel_breakdown` classifies every recorded command
+  into `redirect` (hook-intercepted native tools), `rewrite` (shell commands
+  rewritten to lean-ctx), or `mcp` (direct ctx_* calls). Powers the Cockpit
+  Proof/Trends chart showing which delivery channel contributes what savings.
+
+### Changed
+- **Default `memory_cleanup` switched from `aggressive` to `shared`.**
+  Idle cache TTL rises from 5 minutes to **1 hour**, matching real-world agent
+  session durations (think pauses, context switches). Low-memory devices can
+  opt back via `memory_cleanup = "aggressive"` or `LEAN_CTX_MEMORY_CLEANUP=aggressive`.
+- **Default `cache_max_tokens` raised from 500k to 2M.**
+  Four times more headroom for the in-memory read cache — eliminates premature
+  eviction in large codebases. Override via `LEAN_CTX_CACHE_MAX_TOKENS`.
+- **Read redirect switched from `full` to `full-compact` mode.**
+  Redirect hook now produces headerless, whitespace-trimmed temp files. Fixes
+  offset/limit correctness (#1021 follow-up) and saves ~5–10 % on every
+  redirected native Read.
+- **Grep redirect now host-aware (GH #398 follow-up).**
+  `grep_content_mode()` no longer requires an explicit `output_mode=content`
+  parameter — when the mode is absent, it detects the host IDE and allows the
+  redirect on Cursor (which defaults to `content`) while blocking it on Claude
+  Code (which defaults to `files_with_matches`).
+- **Rules enforcement strengthened across all IDEs (RULES_VERSION 8 → 9, CLAUDE.md v6 → v7).**
+  All 28 supported IDEs now receive MUST/NEVER/SELF-CORRECT language with
+  quantitative evidence (~1 % hook redirect vs 13–70 % direct ctx_* savings),
+  replacing the previous "prefer" wording that let agents fall back to native
+  tools silently.
+
+### Fixed
+- **Compressed-output cache hits now properly counted.**
+  `SessionCache::get_compressed()` increments `cache_hits` and `total_reads`,
+  so re-reads of auto/map/signatures outputs appear in CEP stats and dashboard.
+- **`read_dedup` savings tracked in CEP stats.**
+  The PostToolUse `read_dedup` hook now calls `stats::record("cli_read_dedup")`
+  + `stats::flush()`, surfacing dedup savings in the redirect channel on the
+  dashboard.
+- **Dashboard channel-breakdown empty state.**
+  `cockpit-remaining.js` now shows a helpful "No channel data yet" message
+  instead of silently rendering nothing (which previously caused a
+  `SyntaxError` on the Proof/Trends page).
+- **`cap_to_raw()` inflation prevention tracked as metric.**
+  Events where framed output would exceed raw content are now counted in
+  `cache_telemetry` and shown in `ctx_cache status`.
+- **CLI `ls` tree-tracking fix.**
+  `cmd_ls` now passes the real `original` token count to `cli_track_tree`
+  instead of `0`, so tree-view savings appear correctly in CEP stats.
+- **agent_wrapper: `pwd -` and unquoted eval arg (GH #745 follow-up).**
+  Two additional Claude Code sandbox variants now handled: (1) trailing
+  `pwd -` (lone dash flag) not matched by `has_trailing_bare_pwd`; (2) unquoted
+  eval arguments (`eval pwd` vs `eval 'pwd'`).
+- **Doctor text corrected:** shared cleanup description updated from
+  "30 min" to "1 hour" to match the new default TTL.
+
+## [3.9.5] — 2026-07-10
+
+### Fixed
+- **Prompt-cache invalidation via `additionalContext` injection (GH #778).**
+  PostToolUse `[CODE HEALTH]` notices and PreToolUse shadow-mode nudges injected
+  text into `additionalContext` on every qualifying event. On Anthropic models
+  this retroactively mutates the cached prefix, causing 440–520k tokens of cache
+  re-bills per injection. Fix: default `inject_context = false` in `[code_health]`
+  config — notices now route to `ctx_knowledge` and the ContextBus (dashboard).
+  Opt-in via `[code_health] inject_context = true` or `LEAN_CTX_INJECT_CONTEXT=1`.
+- **Marker contamination in source files — root-cause fix.** The redirect-suffix
+  (`--- lean-ctx: ctx_compose ...`) was appended directly to `.lctx` temp files.
+  When agents copied temp-file content back into source, the marker leaked into
+  `.rs`/`.js`/`.sh` files, breaking builds. Fix: the suffix is never written to
+  file content; the nudge travels exclusively via `additionalContext` (gated by
+  `inject_context`) or is suppressed entirely.
+- **Release pipeline: rmcp crates.io compile bug.** `rmcp 2.2.0` on crates.io
+  calls `SseStream::from_bytes_stream` but `sse-stream 0.2.x` only provides
+  `from_byte_stream`. Restored `[patch.crates-io]` to upstream git rev `67a3085`
+  which has the fix; `cargo publish --no-verify` bypasses broken verification.
+- **Release pipeline: Homebrew SHA256 grep collision.** The grep pattern
+  `x86_64-unknown-linux-gnu` also matched the `-cuda` variant, producing
+  multiple SHA256 values and breaking the GitHub Actions output format. Fixed
+  with `.tar.gz` suffix anchoring.
+- **agent_wrapper detection — `pwd -` and unquoted eval arg (GH #745 follow-up).**
+  Two additional Claude Code sandbox variants still hit the `eval` hard-block in
+  v3.9.3: (1) trailing `&& pwd -` (lone dash flag) was not matched by
+  `has_trailing_bare_pwd`; (2) unquoted eval arguments (`eval pwd` vs `eval 'pwd'`).
+  Fix: `has_trailing_bare_pwd` now accepts any `pwd` followed by flag-only tokens
+  (no redirect operator), covering `pwd`, `pwd -P`, `pwd -`, and future variants.
+
+## [3.9.4] — 2026-07-09
+
+### Added
+- **`lean-ctx wrap <agent>` — one-command setup (GH #premium-setup).** Replaces
+  the 5-step manual setup (install → PATH → onboard → shell reload → IDE restart)
+  with a single command that orchestrates everything: config snapshot, shell hooks,
+  MCP registration, agent hooks, daemon start, MCP connection probe, and a premium
+  terminal summary. Undo with `lean-ctx unwrap <agent>`.
+- **`lean-ctx unwrap <agent>` — byte-for-byte config restore.** Reads the wrap
+  snapshot and restores every modified file to its pre-wrap state, removes MCP
+  registration, and cleans up the snapshot directory.
+- **MCP verify probe.** `wrap` spawns `lean-ctx mcp`, sends JSON-RPC `initialize`
+  + `tools/list`, and confirms `ctx_read` is present — gives instant feedback that
+  the MCP server works before the user opens their editor.
+- **Agent launch detection.** `wrap` checks whether Cursor/VS Code is already
+  running and gives context-aware restart hints (process detection via `pgrep`
+  on macOS/Linux, `tasklist` on Windows).
+- **install.sh auto-PATH fix.** The installer now adds `~/.local/bin` to PATH
+  automatically (appends to shell RC + exports in current session). Opt out with
+  `LEAN_CTX_NO_PATH_FIX=1`.
+- **install.sh auto-onboard.** After binary installation, `lean-ctx onboard` runs
+  automatically. Opt out with `LEAN_CTX_NO_ONBOARD=1`.
+- **npm postinstall auto-onboard.** `npm install -g lean-ctx-bin` now runs
+  `lean-ctx onboard` after download (skipped in CI).
+
+### Changed
+- **CLI help: wrap-first progressive disclosure.** Quickstart, concise help, and
+  full reference now lead with `lean-ctx wrap <agent>` as the primary getting-started
+  path. `onboard` and `setup` remain available as alternatives.
+- **README: 30-second setup.** "Get started" section updated from 5 manual steps
+  to `lean-ctx wrap cursor`.
+- **Website: wrap-first flow.** Landing page hero, getting-started prompt generator,
+  and setup commands reference all updated to the wrap-first workflow.
 
 ## [3.9.3] — 2026-07-08
 

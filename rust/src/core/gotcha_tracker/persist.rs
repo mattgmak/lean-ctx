@@ -9,6 +9,7 @@ impl GotchaStore {
             && let Ok(mut store) = serde_json::from_str::<GotchaStore>(&content)
         {
             store.apply_decay();
+            store.cross_session_boost();
             // #451 shell-ding: keep persisted pending errors so a fail→fix that
             // spans two `lean-ctx -c` processes still correlates — but drop
             // expired ones (15-min TTL) and bound to the most recent MAX_PENDING
@@ -33,6 +34,10 @@ impl GotchaStore {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        let universal = self.extract_universal();
+        if !universal.is_empty() {
+            let _ = save_universal_gotchas(&universal);
+        }
         Ok(())
     }
 }

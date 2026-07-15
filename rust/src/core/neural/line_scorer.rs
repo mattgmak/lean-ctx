@@ -224,7 +224,7 @@ pub struct LineContext {
 impl NeuralLineScorer {
     #[cfg(feature = "neural")]
     pub fn load(model_path: &Path) -> anyhow::Result<Self> {
-        let eps = crate::core::ort_execution_providers::gpu_execution_providers();
+        let eps = crate::core::ort_execution_providers::execution_providers();
         let num_cpus = std::thread::available_parallelism().map_or(4, |n| n.get().max(1));
         crate::core::ort_environment::ensure_ort_env(&eps)?;
         let session = ort::session::Session::builder()
@@ -294,7 +294,10 @@ impl NeuralLineScorer {
                 return 0.5;
             }
         };
-        let mut _guard = self.session.lock().unwrap();
+        let mut _guard = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let outputs = match _guard.run(ort::inputs![self.input_name.as_str() => tensor]) {
             Ok(o) => o,
             Err(e) => {

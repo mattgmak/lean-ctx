@@ -25,6 +25,17 @@ pub(crate) fn cmd_index(args: &[String]) {
             }
         }
         Some("build") => {
+            // #790: activate memory guardian for CLI builds so graph/BM25 abort
+            // checks actually fire (previously only started in daemon mode).
+            crate::core::memory_guard::start_guard(std::sync::Arc::new(|level| {
+                tracing::warn!(
+                    "[index build] memory pressure: {level:?} — background tasks will throttle"
+                );
+                if level >= crate::core::memory_guard::PressureLevel::Hard {
+                    crate::core::content_cache::clear();
+                }
+                crate::core::memory_guard::force_purge();
+            }));
             crate::core::index_orchestrator::ensure_all_background(&project_root);
 
             let started = std::time::Instant::now();
@@ -55,6 +66,15 @@ pub(crate) fn cmd_index(args: &[String]) {
             }
         }
         Some("build-full") => {
+            // #790: activate memory guardian for full builds too.
+            crate::core::memory_guard::start_guard(std::sync::Arc::new(|level| {
+                tracing::warn!("[index build-full] memory pressure: {level:?}");
+                if level >= crate::core::memory_guard::PressureLevel::Hard {
+                    crate::core::content_cache::clear();
+                }
+                crate::core::memory_guard::force_purge();
+            }));
+            crate::core::interrupt::install_ctrlc_handler();
             let bm25_path = crate::core::bm25_index::BM25Index::index_file_path(root);
             let _ = std::fs::remove_file(&bm25_path);
             // #696 C4: purge the property graph (graph.db + wal/shm + meta) and
@@ -148,6 +168,15 @@ pub(crate) fn cmd_index(args: &[String]) {
             }
         }
         Some("build-semantic") => {
+            // #790: activate memory guardian for semantic builds too.
+            crate::core::memory_guard::start_guard(std::sync::Arc::new(|level| {
+                tracing::warn!("[index build-semantic] memory pressure: {level:?}");
+                if level >= crate::core::memory_guard::PressureLevel::Hard {
+                    crate::core::content_cache::clear();
+                }
+                crate::core::memory_guard::force_purge();
+            }));
+            crate::core::interrupt::install_ctrlc_handler();
             // Build the dense embedding index on top of BM25.  If BM25 is not yet
             // built, build graph + BM25 first, then build semantic.
             let disk = crate::core::index_orchestrator::disk_status(&project_root);

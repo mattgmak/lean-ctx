@@ -42,6 +42,12 @@ class CockpitLeaderboard extends HTMLElement {
     this._boardLoading = true;
     this._boardError = null;
     this._onRefresh = this._onRefresh.bind(this);
+    // Machine linking (GH #736)
+    this._linkCode = null;
+    this._linkExpiry = null;
+    this._linkInput = '';
+    this._linkBusy = null; // 'start' | 'complete'
+    this._linkNotice = null;
   }
 
   connectedCallback() {
@@ -207,6 +213,7 @@ class CockpitLeaderboard extends HTMLElement {
       '<div style="display:grid;gap:14px">' +
       this._renderStanding(esc) +
       this._renderBoard(esc) +
+      this._renderLink(esc) +
       this._renderSubmit(esc) +
       this._renderAuto(esc) +
       '</div>' +
@@ -455,12 +462,136 @@ class CockpitLeaderboard extends HTMLElement {
     );
   }
 
+  // ─── Machine linking (GH #736) ──────────────────────────────────────────────
+
+  async _linkStart() {
+    var fetchJson = api();
+    if (!fetchJson || this._linkBusy) return;
+    this._linkBusy = 'start';
+    this._linkNotice = null;
+    this._linkCode = null;
+    this.render();
+    this._bind();
+    try {
+      var resp = await fetchJson('/api/leaderboard/link/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+        timeoutMs: 15000,
+      });
+      this._linkCode = resp && resp.code ? String(resp.code) : null;
+      this._linkExpiry = resp && resp.expires_in_secs ? Number(resp.expires_in_secs) : 600;
+      if (this._linkCode) {
+        this._linkNotice = { kind: 'ok', msg: 'Pairing code generated. Enter it on your other machine within ' + Math.ceil(this._linkExpiry / 60) + ' minutes.' };
+      }
+    } catch (e) {
+      this._linkNotice = { kind: 'err', msg: e && e.error ? String(e.error) : 'Could not generate pairing code.' };
+    }
+    this._linkBusy = null;
+    this.render();
+    this._bind();
+  }
+
+  async _linkComplete() {
+    var fetchJson = api();
+    if (!fetchJson || this._linkBusy) return;
+    var code = (this._linkInput || '').trim();
+    if (!code) {
+      this._linkNotice = { kind: 'err', msg: 'Enter the pairing code from your other machine.' };
+      this.render();
+      this._bind();
+      return;
+    }
+    this._linkBusy = 'complete';
+    this._linkNotice = null;
+    this.render();
+    this._bind();
+    try {
+      await fetchJson('/api/leaderboard/link/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: code }),
+        timeoutMs: 15000,
+      });
+      this._linkNotice = { kind: 'ok', msg: 'Linked! Both machines now appear as one leaderboard entry.' };
+      this._linkInput = '';
+      this._linkCode = null;
+    } catch (e) {
+      var msg = e && e.error ? String(e.error) : 'Link failed.';
+      if (msg.indexOf('invalid or expired') !== -1) {
+        msg = 'Code invalid or expired \u2014 generate a fresh one on the other machine.';
+      }
+      this._linkNotice = { kind: 'err', msg: msg };
+    }
+    this._linkBusy = null;
+    this.render();
+    this._bind();
+  }
+
+  _renderLink(esc) {
+    var s = this._status || {};
+    if (!s.published) return '';
+
+    var startBusy = this._linkBusy === 'start';
+    var completeBusy = this._linkBusy === 'complete';
+
+    var codeDisplay = '';
+    if (this._linkCode) {
+      codeDisplay =
+        '<div style="margin:12px 0;padding:16px;background:var(--bg-2,#111);' +
+        'border:1px solid var(--border,#2a2a2a);border-radius:10px;text-align:center">' +
+        '<p class="hs" style="margin:0 0 6px;font-size:11px;opacity:.7;text-transform:uppercase;' +
+        'letter-spacing:.05em">Your pairing code</p>' +
+        '<p style="margin:0;font-size:28px;font-weight:700;font-family:monospace;' +
+        'letter-spacing:.15em;color:var(--green)">' + esc(this._linkCode) + '</p>' +
+        '<p class="hs" style="margin:8px 0 0;font-size:11px;opacity:.6">' +
+        'Enter this on your other machine within ' +
+        Math.ceil((this._linkExpiry || 600) / 60) + ' minutes</p>' +
+        '</div>';
+    }
+
+    return (
+      '<div class="card">' +
+      '<div class="card-header"><h3>Link machines</h3></div>' +
+      '<p class="hs" style="margin:0 0 12px;font-size:12px;opacity:.8">' +
+      'Combine multiple computers into one leaderboard entry. ' +
+      'Tokens saved are summed \u2014 no account needed.</p>' +
+
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">' +
+      '<button type="button" class="filter-btn" id="lbLinkStart"' +
+      (startBusy ? ' disabled style="opacity:.5;cursor:not-allowed"' : '') +
+      '>' + (startBusy ? 'Generating\u2026' : 'Generate pairing code') + '</button>' +
+      '<span class="hs" style="font-size:12px;opacity:.6">or</span>' +
+      '</div>' +
+
+      codeDisplay +
+
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
+      '<input type="text" id="lbLinkCode" maxlength="16" placeholder="Enter code from other machine" ' +
+      'value="' + esc(this._linkInput || '') + '" ' +
+      (completeBusy ? 'disabled ' : '') +
+      'style="flex:1 1 200px;min-width:160px;padding:8px 10px;border-radius:8px;' +
+      'border:1px solid var(--border,#2a2a2a);background:var(--bg-2,#111);' +
+      'color:inherit;font:inherit;font-family:monospace;letter-spacing:.08em;text-transform:uppercase">' +
+      '<button type="button" class="filter-btn active" id="lbLinkComplete"' +
+      (completeBusy ? ' disabled style="opacity:.5;cursor:not-allowed"' : '') +
+      '>' + (completeBusy ? 'Linking\u2026' : 'Link') + '</button>' +
+      '</div>' +
+
+      this._renderInlineNotice(esc, this._linkNotice) +
+      '</div>'
+    );
+  }
+
   _renderFooter(S) {
     if (!S.howItWorks) {
       return (
         '<p class="hs" style="margin-top:14px;font-size:11px;opacity:.7">' +
         'Submitting publishes a signed, login-less card. Remove it anytime with ' +
-        '<code>lean-ctx gain --unpublish</code>.</p>'
+        '<code>lean-ctx gain --unpublish</code>.</p>' +
+        '<p class="hs" style="margin-top:6px;font-size:11px;opacity:.7">' +
+        'Multiple machines? Use the \u201CLink machines\u201D card above or run ' +
+        '<code>lean-ctx gain --link</code> on each machine to combine them into one entry.</p>'
       );
     }
     return S.howItWorks(
@@ -468,7 +599,9 @@ class CockpitLeaderboard extends HTMLElement {
       '<strong>Share what you save.</strong> Submit publishes your all-time ' +
         'tokens saved to the community board at <code>leanctx.com/metrics</code> ' +
         'as a signed, login-less card (one per machine — re-submitting refreshes ' +
-        'the same card, never duplicates).<br><br>' +
+        'the same card, never duplicates). <strong>Multiple machines?</strong> ' +
+        'Use the \u201CLink machines\u201D card or <code>lean-ctx gain --link</code> ' +
+        'to combine them into one entry (no account needed).<br><br>' +
         'The payload is a fixed, minimal set of <strong>aggregate numbers</strong> ' +
         '(tokens saved, estimated USD, compression rate) plus the optional handle ' +
         'you choose — enforced by the same whitelist the CLI uses. Your code, file ' +
@@ -515,6 +648,19 @@ class CockpitLeaderboard extends HTMLElement {
         self._setAuto(want);
       });
     });
+    // Link machine bindings
+    var linkStartBtn = this.querySelector('#lbLinkStart');
+    if (linkStartBtn && !linkStartBtn.disabled) {
+      linkStartBtn.addEventListener('click', function () { self._linkStart(); });
+    }
+    var linkCodeInput = this.querySelector('#lbLinkCode');
+    if (linkCodeInput) {
+      linkCodeInput.addEventListener('input', function () { self._linkInput = linkCodeInput.value; });
+    }
+    var linkCompleteBtn = this.querySelector('#lbLinkComplete');
+    if (linkCompleteBtn && !linkCompleteBtn.disabled) {
+      linkCompleteBtn.addEventListener('click', function () { self._linkComplete(); });
+    }
     var S = shared();
     if (S.bindHowItWorks) S.bindHowItWorks(this);
   }

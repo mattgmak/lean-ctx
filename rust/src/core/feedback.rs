@@ -132,11 +132,10 @@ impl FeedbackStore {
     }
 
     fn update_bandit(&self, outcome: &CompressionOutcome) {
-        let key = format!("{}_feedback", outcome.language);
+        let key = crate::core::bandit::bandit_key("feedback", &outcome.language, None);
         let project_root = self.project_root.as_deref().unwrap_or(".");
         let mut store = crate::core::bandit::BanditStore::load(project_root);
         let bandit = store.get_or_create(&key);
-        bandit.total_pulls = bandit.total_pulls.saturating_add(1);
 
         let efficiency = if outcome.tokens_original > 0 {
             outcome.tokens_saved as f64 / outcome.tokens_original as f64

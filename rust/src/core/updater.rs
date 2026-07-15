@@ -4,6 +4,20 @@ const GITHUB_API_RELEASES: &str = "https://api.github.com/repos/yvgude/lean-ctx/
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn run(args: &[String]) {
+    run_with_mode(args, UpdateMode::Normal);
+}
+
+pub fn enable_gpu(args: &[String]) {
+    run_with_mode(args, UpdateMode::EnableGpu);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateMode {
+    Normal,
+    EnableGpu,
+}
+
+fn run_with_mode(args: &[String], mode: UpdateMode) {
     let mut check_only = args.iter().any(|a| a == "--check");
     let insecure = args.iter().any(|a| a == "--insecure");
     let quiet = args.iter().any(|a| a == "--quiet");
@@ -130,7 +144,11 @@ pub fn run(args: &[String]) {
 
     if !quiet {
         println!();
-        println!("  \x1b[1m◆ lean-ctx updater\x1b[0m  \x1b[2mv{CURRENT_VERSION}\x1b[0m");
+        let title = match mode {
+            UpdateMode::Normal => "lean-ctx updater",
+            UpdateMode::EnableGpu => "lean-ctx GPU enablement",
+        };
+        println!("  \x1b[1m◆ {title}\x1b[0m  \x1b[2mv{CURRENT_VERSION}\x1b[0m");
         println!("  \x1b[2mChecking github.com/yvgude/lean-ctx …\x1b[0m");
     }
 
@@ -156,7 +174,7 @@ pub fn run(args: &[String]) {
         std::process::exit(1);
     };
 
-    if target_tag == CURRENT_VERSION {
+    if target_tag == CURRENT_VERSION && mode == UpdateMode::Normal {
         if quiet {
             return;
         }
@@ -195,16 +213,28 @@ pub fn run(args: &[String]) {
         }
     }
 
+    let asset_name = match mode {
+        UpdateMode::Normal => platform_asset_name(),
+        UpdateMode::EnableGpu => match gpu_platform_asset_name() {
+            Ok(name) => name,
+            Err(e) => {
+                tracing::error!("{e}");
+                std::process::exit(1);
+            }
+        },
+    };
+
     if check_only {
-        if pinned {
-            println!("Run 'lean-ctx update {target_tag}' to install.");
-        } else {
-            println!("Run 'lean-ctx update' to install.");
+        match mode {
+            UpdateMode::Normal if pinned => {
+                println!("Run 'lean-ctx update {target_tag}' to install.");
+            }
+            UpdateMode::Normal => println!("Run 'lean-ctx update' to install."),
+            UpdateMode::EnableGpu => println!("Run 'lean-ctx enable-gpu' to install {asset_name}."),
         }
         return;
     }
 
-    let asset_name = platform_asset_name();
     if !quiet {
         println!("  \x1b[2mDownloading {asset_name} …\x1b[0m");
     }
@@ -258,10 +288,17 @@ pub fn run(args: &[String]) {
         println!();
         if pinned {
             println!("  \x1b[1;32m✓ Now running lean-ctx v{target_tag}\x1b[0m");
+        } else if mode == UpdateMode::EnableGpu {
+            println!("  \x1b[1;32m✓ Enabled lean-ctx GPU binary v{target_tag}\x1b[0m");
         } else {
             println!("  \x1b[1;32m✓ Updated to lean-ctx v{target_tag}\x1b[0m");
         }
         println!("  \x1b[2mBinary: {}\x1b[0m", current_exe.display());
+        if mode == UpdateMode::EnableGpu {
+            println!(
+                "  \x1b[2mSet ORT_DYLIB_PATH to your ONNX Runtime GPU lib; lean-ctx auto-detects it.\x1b[0m"
+            );
+        }
     }
 
     if !quiet {
@@ -1075,7 +1112,14 @@ fn platform_asset_name() -> String {
     let target = match (os, arch) {
         ("macos", "aarch64") => "aarch64-apple-darwin".to_string(),
         ("macos", "x86_64") => "x86_64-apple-darwin".to_string(),
-        ("linux", "x86_64") => format!("x86_64-unknown-linux-{}", detect_linux_libc()),
+        ("linux", "x86_64") => {
+            let libc = detect_linux_libc();
+            if current_build_prefers_gpu_asset() && libc == "gnu" {
+                "x86_64-unknown-linux-gnu-cuda".to_string()
+            } else {
+                format!("x86_64-unknown-linux-{libc}")
+            }
+        }
         ("linux", "aarch64") => format!("aarch64-unknown-linux-{}", detect_linux_libc()),
         ("windows", "x86_64") => "x86_64-pc-windows-msvc".to_string(),
         _ => {
@@ -1092,6 +1136,26 @@ fn platform_asset_name() -> String {
     } else {
         format!("lean-ctx-{target}.tar.gz")
     }
+}
+
+fn gpu_platform_asset_name() -> Result<String, String> {
+    if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
+        return Err(
+            "CUDA binary is currently published for x86_64 GNU/Linux only. Use `lean-ctx update` for the CPU binary or build with --features ort-cuda."
+                .to_string(),
+        );
+    }
+    if detect_linux_libc() != "gnu" {
+        return Err(
+            "CUDA binary requires GNU libc Linux. This system detected musl; use the CPU binary or build with --features ort-cuda."
+                .to_string(),
+        );
+    }
+    Ok("lean-ctx-x86_64-unknown-linux-gnu-cuda.tar.gz".to_string())
+}
+
+fn current_build_prefers_gpu_asset() -> bool {
+    cfg!(feature = "ort-cuda")
 }
 
 #[cfg(test)]

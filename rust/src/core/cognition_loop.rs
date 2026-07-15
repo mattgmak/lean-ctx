@@ -196,13 +196,17 @@ fn promote_proven_gotchas(
     policy: &MemoryPolicy,
 ) -> u32 {
     const MAX_PROMOTED: usize = 8;
-    let store = crate::core::gotcha_tracker::GotchaStore::load(project_root);
+    let mut store = crate::core::gotcha_tracker::GotchaStore::load(project_root);
+    let promoted = store.check_promotions();
     let mut count = 0u32;
-    for g in store.promotable().into_iter().take(MAX_PROMOTED) {
-        let key = crate::core::consolidation_engine::slug_key(&g.trigger, 50);
-        let value = format!("{} → {}", g.trigger, g.resolution);
-        knowledge.remember("gotcha", &key, &value, session_id, g.confidence, policy);
+    for (_, trigger, resolution, confidence) in promoted.iter().take(MAX_PROMOTED) {
+        let key = crate::core::consolidation_engine::slug_key(trigger, 50);
+        let value = format!("{trigger} → {resolution}");
+        knowledge.remember("gotcha", &key, &value, session_id, *confidence, policy);
         count += 1;
+    }
+    if count > 0 {
+        let _ = store.save(project_root);
     }
     count
 }

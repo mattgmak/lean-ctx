@@ -33,7 +33,7 @@ pub fn cmd_init(args: &[String]) {
             .windows(2)
             .find(|w| w[0] == "--mode")
             .map_or("?", |w| w[1].as_str());
-        eprintln!("Unknown hook mode: '{bad}'. Valid: mcp, hybrid");
+        eprintln!("Unknown hook mode: '{bad}'. Valid: mcp, hybrid, replace");
         std::process::exit(1);
     }
 
@@ -186,7 +186,7 @@ pub fn cmd_init(args: &[String]) {
     qprintln!("    claude, cline, codex, continue, copilot, crush, cursor, emacs, gemini,");
     qprintln!("    hermes, jetbrains, kiro, neovim, openclaw, opencode, pi, qoder,");
     qprintln!("    qoderwork, qwen, roo, sublime, trae, verdent, vscode, windsurf, zed");
-    qprintln!("  Modes: mcp, hybrid  (auto-detected per agent, override with --mode)");
+    qprintln!("  Modes: mcp, hybrid, replace  (auto-detected per agent, override with --mode)");
 }
 
 pub fn cmd_init_quiet(args: &[String]) {

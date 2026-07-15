@@ -683,12 +683,17 @@ fn draw_live_feed(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 } => (
                     "$$",
                     "budget",
-                    format!("{role} {dimension} {percent}% WARNING"),
+                    format!("role:{role} {dimension} {percent}% WARNING"),
                     YELLOW,
                 ),
                 EventKind::BudgetExhausted {
                     role, dimension, ..
-                } => ("!!", "budget", format!("{role} {dimension} EXHAUSTED"), RED),
+                } => (
+                    "!!",
+                    "budget",
+                    format!("role:{role} {dimension} EXHAUSTED"),
+                    RED,
+                ),
                 EventKind::PolicyViolation { role, tool, reason } => (
                     "XX",
                     "policy",

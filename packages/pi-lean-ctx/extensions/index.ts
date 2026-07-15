@@ -13,6 +13,8 @@ import {
   DEFAULT_MAX_LINES,
   getLanguageFromPath,
   highlightCode,
+  isEditToolResult,
+  isWriteToolResult,
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -767,6 +769,51 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
+  // ── ctx_edit (local wrapper with full-fidelity schema) ─────────────────
+  const editSchema = Type.Object({
+    path: Type.String({ description: "File path to edit" }),
+    old_string: Type.Optional(
+      Type.String({ description: "Text to replace (unique unless replace_all=true)" }),
+    ),
+    new_string: Type.String({ description: "Replacement text" }),
+    replace_all: Type.Optional(
+      Type.Boolean({ description: "Replace all occurrences (default false)" }),
+    ),
+    create: Type.Optional(
+      Type.Boolean({ description: "Create file if it does not exist" }),
+    ),
+  });
+
+  registerTool({
+    name: "ctx_edit",
+    label: "ctx_edit",
+    description:
+      "Search-and-replace edit with race-condition guards. "
+      + "old_string must be unique unless replace_all=true. create=true writes new files. "
+      + "For editing code you've read, prefer ctx_patch (hash-anchored). "
+      + "Pi's native edit tool is always available — use ctx_edit when you need TOCTOU "
+      + "protection or lean-ctx cache coherence.",
+    promptSnippet: "Edit file (search-and-replace with TOCTOU guards)",
+    promptGuidelines: [
+      "Pi's native edit is preferred for most edits (better TUI diff rendering).",
+      "Use ctx_edit when cache coherence matters or for race-condition protection.",
+    ],
+    parameters: editSchema,
+    async execute(_toolCallId, params) {
+      if (!mcpBridge?.isConnected()) {
+        throw new Error(
+          "lean-ctx MCP bridge not connected. Use Pi's native edit tool instead.",
+        );
+      }
+      const result = await mcpBridge.callTool("ctx_edit", params as Record<string, unknown>);
+      const text = result.content.map((b) => b.text).join("");
+      return {
+        content: [{ type: "text", text }],
+        details: undefined,
+      };
+    },
+  });
+
   const enableMcpBridge = PI_CONFIG.enableMcp;
   const adapterConfigured = isMcpAdapterConfigured();
   // An explicit opt-in to the embedded bridge wins over mcp.json detection (#361).
@@ -785,6 +832,23 @@ export default async function (pi: ExtensionAPI) {
   if (mcpBridge) {
     pi.on("session_shutdown", async () => {
       await mcpBridge?.shutdown();
+    });
+
+    // Invalidate lean-ctx read cache when Pi's native edit/write modifies a
+    // file, so subsequent ctx_read calls return fresh content.
+    pi.on("tool_result", async (event) => {
+      if (!mcpBridge?.isConnected()) return;
+      if (!isEditToolResult(event) && !isWriteToolResult(event)) return;
+      const path = event.input?.path as string | undefined;
+      if (!path) return;
+      try {
+        await mcpBridge.callTool("ctx_session", {
+          action: "invalidate",
+          path,
+        });
+      } catch {
+        // Best-effort: cache miss on next read is harmless.
+      }
     });
 
     try {

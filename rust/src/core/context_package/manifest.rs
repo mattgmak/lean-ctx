@@ -117,7 +117,7 @@ impl PackageLayer {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackageDependency {
     pub name: String,
     pub version_req: String,

@@ -62,7 +62,7 @@ impl McpTool for CtxShellTool {
         if let Err(msg) = crate::core::shell_allowlist::check_shell_allowlist(&command) {
             return Ok(ToolOutput {
                 shell_outcome: Some(ShellOutcome::Blocked),
-                ..ToolOutput::simple(msg)
+                ..ToolOutput::simple(msg.to_string())
             });
         }
 
@@ -117,10 +117,10 @@ impl McpTool for CtxShellTool {
                     let output = redact_shell_output_secrets(&raw_output);
                     // Keep failure reporting consistent on this degraded path:
                     // same [exit:N] footer and the same structured outcome (#389).
-                    let exit_suffix = if exit_code != 0 {
-                        format!("\n[exit:{exit_code}]")
-                    } else {
-                        String::new()
+                    let exit_suffix = match exit_code {
+                        0 => String::new(),
+                        124 => "\n[exit:124 — command timed out]".to_string(),
+                        _ => format!("\n[exit:{exit_code}]"),
                     };
                     return Ok(ToolOutput {
                         shell_outcome: Some(ShellOutcome::Exit(exit_code)),
@@ -241,10 +241,13 @@ impl McpTool for CtxShellTool {
             };
 
             let result_out = crate::core::redaction::redact_text_if_enabled(&result_out);
-            let exit_suffix = if exit_code != 0 {
-                format!("\n[exit:{exit_code}]")
-            } else {
-                String::new()
+            // #815: exit 124 = timeout signal (from timeout(1) / lean-ctx
+            // shell timeout). Make it explicit so agents don't confuse a
+            // timed-out command with a successful empty result.
+            let exit_suffix = match exit_code {
+                0 => String::new(),
+                124 => "\n[exit:124 — command timed out]".to_string(),
+                _ => format!("\n[exit:{exit_code}]"),
             };
             let final_out =
                 format!("{result_out}{tee_hint}{shell_mismatch}{cwd_jail_hint}{exit_suffix}");

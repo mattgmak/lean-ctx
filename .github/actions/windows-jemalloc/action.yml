@@ -41,6 +41,18 @@ runs:
   using: composite
   steps:
 
+    # Cache the compiled jemalloc prefix across runs — building it from
+    # source (configure + make) takes real minutes and never changes unless
+    # this action's build recipe does. Cached under the workspace (a stable,
+    # known Windows-native path) rather than MSYS2's /tmp, whose real
+    # location is an implementation detail of the msys2/setup-msys2 action.
+    - name: Cache jemalloc build
+      id: jemalloc-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ github.workspace }}\.jemalloc-prefix
+        key: windows-jemalloc-5.3.0-${{ hashFiles('.github/actions/windows-jemalloc/action.yml') }}
+
     # Step 1 — compile jemalloc 5.3.0 from the GitHub Release tarball
     # ---------------------------------------------------------------
     # Git tag 5.3.0 only has configure.ac / Makefile.in — the generated
@@ -48,12 +60,14 @@ runs:
     # We must pass --with-jemalloc-prefix=_rjem_ (tikv-jemallocator expects
     # _rjem_malloc symbols) and rename the MinGW .lib to the expected name.
     - name: Build jemalloc 5.3.0 from release tarball
+      if: steps.jemalloc-cache.outputs.cache-hit != 'true'
       shell: msys2 {0}
       run: |
         set -eux
+        PREFIX="$(cygpath -u "$GITHUB_WORKSPACE")/.jemalloc-prefix"
         curl -fsSL https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 \
           -o /tmp/jemalloc.tar.bz2
-        mkdir -p /tmp/jemalloc-build /tmp/jemalloc-prefix/lib
+        mkdir -p /tmp/jemalloc-build "$PREFIX/lib"
         tar -xf /tmp/jemalloc.tar.bz2 -C /tmp/jemalloc-build --strip-components=1
         cd /tmp/jemalloc-build
         # config.sub from 2021 doesn't know win32* (MSYS2's build triple)
@@ -62,12 +76,11 @@ runs:
                     --disable-cxx --enable-shared=no \
                     --with-jemalloc-prefix=_rjem_ \
                     --with-private-namespace=_rjem_ \
-                    --prefix=/tmp/jemalloc-prefix
+                    --prefix="$PREFIX"
         make -j$(nproc)
         make install_lib_static install_include
         # MinGW → jemalloc_s.lib; rename for JEMALLOC_OVERRIDE (strips "lib")
-        cp /tmp/jemalloc-prefix/lib/jemalloc_s.lib \
-           /tmp/jemalloc-prefix/lib/libjemalloc.a
+        cp "$PREFIX/lib/jemalloc_s.lib" "$PREFIX/lib/libjemalloc.a"
 
     # Step 2 — create a dummy liballoc.a
     # -----------------------------------
@@ -76,26 +89,28 @@ runs:
     # (no liballoc.a exists).  An empty archive with a single object file
     # satisfies the flag — real symbols come from the .rlib that is already
     # linked statically upstream of the native-library resolution pass.
+    # Cheap either way, so it isn't gated on the cache hit — reruns
+    # harmlessly on a cache hit too.
     - name: Create dummy liballoc.a for -lalloc linker flag
       shell: msys2 {0}
       run: |
         set -eux
+        PREFIX="$(cygpath -u "$GITHUB_WORKSPACE")/.jemalloc-prefix"
         printf 'void __dummy_alloc_ignore(void) {}\n' | \
-          gcc -xc -c - -o /tmp/jemalloc-prefix/lib/dummy.o
-        ar crs /tmp/jemalloc-prefix/lib/liballoc.a \
-              /tmp/jemalloc-prefix/lib/dummy.o
-        rm -f /tmp/jemalloc-prefix/lib/dummy.o
+          gcc -xc -c - -o "$PREFIX/lib/dummy.o"
+        ar crs "$PREFIX/lib/liballoc.a" "$PREFIX/lib/dummy.o"
+        rm -f "$PREFIX/lib/dummy.o"
 
     # Step 3 — export Windows-native paths for subsequent build steps
     # ----------------------------------------------------------------
     # The Rust build script is a native Windows process and cannot resolve
-    # MSYS2 virtual paths (/tmp/...).  cygpath -w produces a proper
-    # absolute Windows path (e.g. D:\a\_temp\msys64\tmp\...) that the
-    # native linker can open.
+    # MSYS2 virtual paths. cygpath -w produces a proper absolute Windows
+    # path that the native linker can open.
     - name: Export Windows-native paths as outputs
       id: set-paths
       shell: msys2 {0}
       run: |
         set -eux
-        echo "jemalloc-override=$(cygpath -w /tmp/jemalloc-prefix/lib/libjemalloc.a)" >> $GITHUB_OUTPUT
-        echo "dummy-dir=$(cygpath -w /tmp/jemalloc-prefix/lib)" >> $GITHUB_OUTPUT
+        PREFIX="$(cygpath -u "$GITHUB_WORKSPACE")/.jemalloc-prefix"
+        echo "jemalloc-override=$(cygpath -w "$PREFIX/lib/libjemalloc.a")" >> $GITHUB_OUTPUT
+        echo "dummy-dir=$(cygpath -w "$PREFIX/lib")" >> $GITHUB_OUTPUT

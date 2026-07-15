@@ -227,6 +227,10 @@ pub enum CompressionLevel {
     Lite,
     Standard,
     Max,
+    /// Ultra-dense bullet-point-only mode — zero prose, diff-style facts,
+    /// strictest token budget (<=50 tokens per non-code response). Maps to
+    /// CrpMode::Tdd with tighter output constraints (#795).
+    Raw,
 }
 
 /// Outcome of [`CompressionLevel::degrade_action`]: what to do with the session
@@ -250,7 +254,7 @@ impl CompressionLevel {
             Self::Off => (TerseAgent::Off, OutputDensity::Normal, "off", false),
             Self::Lite => (TerseAgent::Lite, OutputDensity::Terse, "off", true),
             Self::Standard => (TerseAgent::Full, OutputDensity::Terse, "compact", true),
-            Self::Max => (TerseAgent::Ultra, OutputDensity::Ultra, "tdd", true),
+            Self::Max | Self::Raw => (TerseAgent::Ultra, OutputDensity::Ultra, "tdd", true),
         }
     }
 
@@ -273,6 +277,7 @@ impl CompressionLevel {
                 "lite" => Some(Self::Lite),
                 "standard" => Some(Self::Standard),
                 "max" => Some(Self::Max),
+                "raw" => Some(Self::Raw),
                 _ => None,
             }
         })
@@ -389,6 +394,7 @@ impl CompressionLevel {
             Self::Lite => "lite",
             Self::Standard => "standard",
             Self::Max => "max",
+            Self::Raw => "raw",
         }
     }
 
@@ -400,6 +406,7 @@ impl CompressionLevel {
                 "Standard compression — dense output, compact protocol, pattern-aware"
             }
             Self::Max => "Maximum compression — expert mode, TDD protocol, all layers active",
+            Self::Raw => "Raw-dense compression — bullet points only, zero prose, diff-style facts",
         }
     }
 }

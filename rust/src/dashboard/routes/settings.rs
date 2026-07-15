@@ -94,9 +94,9 @@ fn apply_setting(key: &str, value: &str) -> Result<(), String> {
     match key {
         "compression_level" => apply_compression(value),
         "tool_profile" => apply_tool_profile(value),
-        "structure_first" => {
-            crate::core::config::setter::set_by_key("structure_first", value).map(|_| ())
-        }
+        "structure_first" => crate::core::config::setter::set_by_key("structure_first", value)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
         "terse_agent" => apply_terse_agent(value),
         // validate_setting already rejected anything else.
         _ => Err(format!("unknown or non-editable setting: '{key}'")),
@@ -109,7 +109,7 @@ fn apply_setting(key: &str, value: &str) -> Result<(), String> {
 /// the change would not reach the agent (and the UI footer's "terse changes
 /// re-inject the agent rules" claim would be false).
 fn apply_terse_agent(value: &str) -> Result<(), String> {
-    crate::core::config::setter::set_by_key("terse_agent", value)?;
+    crate::core::config::setter::set_by_key("terse_agent", value).map_err(|e| e.to_string())?;
     let home = dirs::home_dir().unwrap_or_default();
     let _ = crate::rules_inject::inject_all_rules(&home);
     Ok(())
@@ -212,7 +212,7 @@ fn compression_canon(level: &CompressionLevel) -> &'static str {
         CompressionLevel::Off => "off",
         CompressionLevel::Lite => "lite",
         CompressionLevel::Standard => "standard",
-        CompressionLevel::Max => "max",
+        CompressionLevel::Max | CompressionLevel::Raw => "max",
     }
 }
 

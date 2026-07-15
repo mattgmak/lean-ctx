@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rmcp::model::Tool;
+use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Map, Value};
 
 mod granular;
@@ -13,6 +13,53 @@ pub fn tool_def(name: &'static str, description: &'static str, schema_value: Val
     };
     normalize_for_strict_validators(&mut schema);
     Tool::new(name, description, Arc::new(schema))
+}
+
+/// Tools that never mutate their environment (files, indexes, session state).
+/// MCP clients (Cursor, Claude Desktop) may use `readOnlyHint` to allow these
+/// tools in restricted/readonly subagent contexts.
+pub const READONLY_TOOL_NAMES: &[&str] = &[
+    "ctx_read",
+    "ctx_compose",
+    "ctx_search",
+    "ctx_tree",
+    "ctx_glob",
+    "ctx_callgraph",
+    "ctx_overview",
+    "ctx_expand",
+    "ctx_explore",
+    "ctx_delta",
+    "ctx_url_read",
+    "ctx_benchmark",
+    "ctx_analyze",
+    "ctx_discover",
+    "ctx_response",
+];
+
+/// Tools that may destructively modify their environment.
+pub const DESTRUCTIVE_TOOL_NAMES: &[&str] = &["ctx_shell", "ctx_execute", "ctx_patch"];
+
+/// Apply MCP `ToolAnnotations` (readOnlyHint, destructiveHint) to a set of
+/// tool definitions. Called by the registry before serving `tools/list`.
+pub fn apply_tool_annotations(tools: Vec<Tool>) -> Vec<Tool> {
+    tools
+        .into_iter()
+        .map(|t| {
+            let name = t.name.as_ref();
+            if READONLY_TOOL_NAMES.contains(&name) {
+                t.annotate(
+                    ToolAnnotations::new()
+                        .read_only(true)
+                        .destructive(false)
+                        .idempotent(true),
+                )
+            } else if DESTRUCTIVE_TOOL_NAMES.contains(&name) {
+                t.annotate(ToolAnnotations::new().destructive(true))
+            } else {
+                t
+            }
+        })
+        .collect()
 }
 
 /// Make a tool input schema acceptable to *strict* JSON-Schema validators.

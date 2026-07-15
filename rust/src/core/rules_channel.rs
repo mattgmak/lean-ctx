@@ -397,22 +397,21 @@ mod tests {
         // every MCP session).
         use crate::core::config::CompressionLevel;
         use crate::core::rules_canonical::{Wrapper, render};
+        use crate::core::tool_profiles::ToolProfile;
 
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         assert!(!cursor_compression_covered(home));
 
-        // Exactly what `rules_content`/inject writes to the Cursor mdc (frontmatter
-        // is irrelevant to substring detection).
-        let block = render(false, Wrapper::Dedicated, CompressionLevel::Standard);
+        let tp = ToolProfile::Power;
+        let block = render(false, Wrapper::Dedicated, CompressionLevel::Standard, &tp);
         std::fs::create_dir_all(home.join(".cursor/rules")).unwrap();
         std::fs::write(home.join(".cursor/rules/lean-ctx.mdc"), &block).unwrap();
 
         assert!(cursor_compression_covered(home));
         assert!(client_autoloads_compression("cursor", home));
 
-        // An Off render carries no payload, so it must NOT count as coverage.
-        let off = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let off = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp);
         std::fs::write(home.join(".cursor/rules/lean-ctx.mdc"), &off).unwrap();
         assert!(!cursor_compression_covered(home));
     }

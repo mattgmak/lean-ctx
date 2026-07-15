@@ -313,7 +313,8 @@ pub fn adaptive_thresholds(path: &str, content: &str) -> CompressionThresholds {
     if let Some(project_root) =
         crate::core::session::SessionState::load_latest().and_then(|s| s.project_root)
     {
-        let bandit_key = format!("{ext}_{}", token_bucket_label(content));
+        let bandit_key =
+            crate::core::bandit::bandit_key("threshold", ext, Some(token_bucket_label(content)));
         let mut store = super::bandit::BanditStore::load(&project_root);
         let bandit = store.get_or_create(&bandit_key);
         // #4: deterministic argmax-of-mean by default (Thompson only under the
@@ -489,16 +490,16 @@ mod tests {
         record_selected_arm(
             "src/foo.rs",
             root.into(),
-            "rs_md".into(),
+            "threshold:rs:md".into(),
             "aggressive".into(),
         );
 
-        let before = arm_mean(root, "rs_md", "aggressive");
+        let before = arm_mean(root, "threshold:rs:md", "aggressive");
         for _ in 0..15 {
             record_quality_signal("src/foo.rs", QualitySignal::Bounce);
         }
         record_quality_signal("src/foo.rs", QualitySignal::EditFail);
-        let after = arm_mean(root, "rs_md", "aggressive");
+        let after = arm_mean(root, "threshold:rs:md", "aggressive");
 
         assert!(
             after < before,
@@ -510,12 +511,17 @@ mod tests {
     fn clean_and_wasted_signals_leave_bandit_untouched() {
         let _data = crate::core::data_dir::isolated_data_dir();
         let root = "/fix1/untouched";
-        record_selected_arm("a.rs", root.into(), "rs_sm".into(), "balanced".into());
+        record_selected_arm(
+            "a.rs",
+            root.into(),
+            "threshold:rs:sm".into(),
+            "balanced".into(),
+        );
 
-        let before = arm_mean(root, "rs_sm", "balanced");
+        let before = arm_mean(root, "threshold:rs:sm", "balanced");
         record_quality_signal("a.rs", QualitySignal::CleanCompressed);
         record_quality_signal("a.rs", QualitySignal::WastedFull);
-        let after = arm_mean(root, "rs_sm", "balanced");
+        let after = arm_mean(root, "threshold:rs:sm", "balanced");
 
         assert!(
             (before - after).abs() < f64::EPSILON,
@@ -545,7 +551,7 @@ mod tests {
             record_selected_arm(
                 &format!("evict/f{i}.rs"),
                 "/fix1/evict".into(),
-                "rs_md".into(),
+                "threshold:rs:md".into(),
                 "balanced".into(),
             );
         }

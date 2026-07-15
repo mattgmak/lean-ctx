@@ -21,6 +21,7 @@ pub mod extractive;
 pub mod finops_export;
 pub mod information_bottleneck;
 pub mod json_crush;
+pub mod json_sample;
 pub mod markdown_compact;
 pub mod output_sanitizer;
 pub mod policy;
@@ -36,6 +37,7 @@ pub mod rule_artifacts;
 pub mod rules_canonical;
 pub mod rules_channel;
 pub mod rules_overhead;
+pub mod rules_sections;
 pub mod structural_tokenizer;
 pub mod structured_read;
 pub mod tabular_crush;
@@ -50,6 +52,7 @@ pub mod compression {
     pub use super::entropy;
     pub use super::information_bottleneck;
     pub use super::json_crush;
+    pub use super::json_sample;
     pub use super::pop_pruning;
     pub use super::preservation;
     pub use super::progressive_compression;
@@ -61,6 +64,7 @@ pub mod compression {
 // Domain: Memory
 // ---------------------------------------------------------------------------
 pub mod episodic_memory;
+pub mod interrupt;
 pub mod memory_archive;
 pub mod memory_boundary;
 pub mod memory_capacity;
@@ -373,7 +377,6 @@ pub mod fep_prefetch;
 pub mod filters;
 pub mod free_energy_budget;
 pub mod gain;
-pub mod gateway;
 pub mod git;
 pub mod git_cache;
 pub mod git_signals;
@@ -388,6 +391,7 @@ pub mod hnsw;
 pub mod home;
 pub mod homeostasis;
 pub mod immune_detector;
+pub mod mcp_catalog;
 pub mod qubo_select;
 
 pub mod agent_registry;

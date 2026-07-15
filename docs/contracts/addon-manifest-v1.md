@@ -28,7 +28,7 @@ Two tables: `[addon]` (metadata) and `[mcp]` (how lean-ctx runs the server).
 | `license` | string | `""` | SPDX id (e.g. `Apache-2.0`). |
 | `categories` | string[] | `[]` | Coarse buckets for browsing (e.g. `plans`, `workflow`, `search`). |
 | `keywords` | string[] | `[]` | Free-form search terms. |
-| `min_lean_ctx` | string | `""` | Minimum lean-ctx version targeted (informational). |
+| `min_lean_ctx` | string | `""` | Minimum lean-ctx version required. **Enforced** from the release that introduced `[[dependencies]]` (3.9.x) onward: `addon add` / `addon update` abort when the running binary is older, naming both versions. Caveat: a binary predating that release contains neither the gate nor the `[[dependencies]]` / `{pack_dir:}` feature, so it silently ignores both this field and the declaration — check the running binary's version if the guarantee matters. Empty = no requirement. |
 | `verified` | bool | `false` | **Registry-controlled** trust tier. `true` only for entries a maintainer has audited and vouched for. Setting it in a hand-written manifest is meaningless — trust is conferred by the registry an entry ships in, not by the entry claiming it. |
 
 ### `[mcp]`
@@ -40,7 +40,7 @@ Mirrors a `[[gateway.servers]]` entry — installation is a direct translation.
 | `transport` | `stdio` \| `http` | `stdio` | both | Wire protocol. |
 | `command` | string | `""` | stdio | Executable to spawn. |
 | `args` | string[] | `[]` | stdio | Arguments passed to `command`. |
-| `env` | table | `{}` | stdio | Extra environment variables for the child process. |
+| `env` | table | `{}` | stdio | Extra environment variables for the child process. A value may contain `{pack_dir:@ns/name}`, which lean-ctx expands at install time to the on-disk directory of a declared `kind=skills` dependency. Any other `{…}` pattern, and any `{` without a closing `}`, is rejected at manifest parse. |
 | `sha256` | string | `""` | stdio | Optional SHA-256 pin of the `command` binary (the value `shasum -a 256` prints). When set, the gateway hashes the resolved binary before spawn and refuses a mismatch (fail-closed). Empty = unpinned. |
 | `url` | string | `""` | http | Streamable-HTTP endpoint (must be `http(s)://`). |
 | `headers` | table | `{}` | http | Extra request headers (e.g. auth). |
@@ -106,6 +106,32 @@ all platforms.
 
 The capabilities the user consents to at install are recorded in
 `installed.json` as `granted_capabilities`.
+
+### `[[dependencies]]` (optional, additive in v1)
+
+Context packages this addon needs at runtime, resolved depth-1 against the
+hosted registry and installed **before** the addon is wired.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `name` | string | — (required) | Scoped package reference `@ns/name`. |
+| `version_req` | string | — (required) | SemVer range (e.g. `^0.2`). Empty or `*` means any version. |
+| `optional` | bool | `false` | `true` → never resolved by `addon add`. A `{pack_dir:…}` placeholder may not name an optional dependency. |
+
+```toml
+[[dependencies]]
+name        = "@dasTholo/lean-md-skills"
+version_req = "^0.2"
+optional    = false
+
+[mcp.env]
+LEAN_MD_SKILLS_DIR = "{pack_dir:@dasTholo/lean-md-skills}"
+```
+
+A dependency must be published to the hosted registry: the resolver looks
+versions up through the registry index only. A pack that exists solely as a
+GitHub release asset (the `[artifacts]` channel) is invisible to it, and
+`addon add` fails with "no installable version matches".
 
 ### `[pricing]` (optional — sellable addons, Track B)
 

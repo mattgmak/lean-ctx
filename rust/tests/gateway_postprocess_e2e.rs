@@ -32,9 +32,9 @@ use serial_test::serial;
 
 use lean_ctx::core::bm25_index::BM25Index;
 use lean_ctx::core::extension_registry::Compressor;
-use lean_ctx::core::gateway::adapters::compression::GatewayCompressor;
-use lean_ctx::core::gateway::{GatewayConfig, GatewayServer, TransportKind, pool, proxy};
 use lean_ctx::core::knowledge::ProjectKnowledge;
+use lean_ctx::core::mcp_catalog::adapters::compression::GatewayCompressor;
+use lean_ctx::core::mcp_catalog::{GatewayConfig, GatewayServer, TransportKind, pool, proxy};
 use lean_ctx::core::property_graph::CodeGraph;
 
 /// Absolute path to the Node MCP fixture that emits adapter-shaped payloads.

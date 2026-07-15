@@ -22,17 +22,34 @@ use rayon::prelude::*;
 /// early-break). Output is identical either way.
 pub(super) const PARALLEL_MIN_FILES: usize = 32;
 
-/// Batch size for the parallel paths (#685). The fan-out used to materialize
-/// *all* `PreparedFile`s (chunk contents + lowered token vectors) in one
-/// `par_iter().collect()` before merging — on a 1M-file corpus that transient
-/// state alone reached tens of GB with zero pressure checks after launch.
-/// Processing in batches keeps the peak transient state bounded to one batch
-/// and re-checks the memory guardian between batches, mirroring the
-/// sequential path's per-500-files early-break. `chunks()` preserves input
-/// order, so the merged index stays byte-identical to the sequential build
-/// (determinism contract #498) — an early pressure break just yields a
-/// partial index, exactly like the sequential path's break.
-const PARALLEL_BATCH_FILES: usize = 2_000;
+/// Upper bound for batch size — the parallel paths never exceed this even with
+/// generous headroom. Lowered from 2000 to 500 after reports of 30 GB RSS
+/// spikes: `par_iter().collect()` materializes the entire batch atomically,
+/// so every file in the batch is live in RAM simultaneously.
+const MAX_BATCH_FILES: usize = 500;
+
+/// Lower bound — below this the rayon overhead dominates.
+const MIN_BATCH_FILES: usize = 50;
+
+/// Conservative estimate of peak transient memory per file during parallel
+/// preparation: file content (~20 KB avg) + tree-sitter chunks + lowered
+/// token vectors. Files up to 2 MB are admitted, but the average is far lower.
+const EST_TRANSIENT_PER_FILE: u64 = 150_000;
+
+/// Computes the effective batch size based on current memory headroom.
+/// Returns a value in `[MIN_BATCH_FILES, MAX_BATCH_FILES]` that keeps the
+/// estimated peak transient allocation within the guardian's hard threshold.
+fn effective_batch_size() -> usize {
+    let headroom = match (
+        crate::core::memory_guard::rss_limit_bytes(),
+        crate::core::memory_guard::get_rss_bytes(),
+    ) {
+        (Some(limit), Some(rss)) => limit.saturating_mul(2).saturating_sub(rss),
+        _ => return MAX_BATCH_FILES,
+    };
+    let by_headroom = (headroom / EST_TRANSIENT_PER_FILE).min(MAX_BATCH_FILES as u64) as usize;
+    by_headroom.clamp(MIN_BATCH_FILES, MAX_BATCH_FILES)
+}
 
 const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -74,11 +91,25 @@ fn parallel_build_must_stop(what: &str, files_done: usize) -> bool {
 /// Pure, thread-safe per-chunk preparation: enrich → tokenize → lowercase.
 /// Mirrors the first half of [`BM25Index::add_chunk`] so the cheap sequential
 /// merge only has to update the shared maps.
-fn prepare_chunk(chunk: CodeChunk) -> PreparedChunk {
+fn prepare_chunk(mut chunk: CodeChunk) -> PreparedChunk {
     let enriched = enrich_for_bm25(&chunk);
     let tokens = tokenize(&enriched);
     let lowered: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
     let token_count = tokens.len();
+
+    // #790: truncate content AFTER tokenization (full text used for BM25 scoring
+    // above). Must mirror add_chunk's SNIPPET_LINES to keep parallel ≡ sequential.
+    const SNIPPET_LINES: usize = 10;
+    if chunk.content.lines().nth(SNIPPET_LINES).is_some() {
+        chunk.content = chunk
+            .content
+            .lines()
+            .take(SNIPPET_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        chunk.content.shrink_to_fit();
+    }
+
     PreparedChunk {
         chunk: CodeChunk {
             token_count,
@@ -200,7 +231,7 @@ impl BM25Index {
         content_hint: &HashMap<String, String>,
         files: &[String],
     ) -> Self {
-        Self::build_parallel_batched(root, content_hint, files, PARALLEL_BATCH_FILES)
+        Self::build_parallel_batched(root, content_hint, files, effective_batch_size())
     }
 
     /// Batch-size-injectable core of [`Self::build_parallel`] so the multi-batch
@@ -218,7 +249,7 @@ impl BM25Index {
         // between batches. `chunks()` keeps the sorted file order — identical
         // output to the sequential path.
         for (batch_no, batch) in files.chunks(batch_size.max(1)).enumerate() {
-            if batch_no > 0 && parallel_build_must_stop("bm25", batch_no * batch_size) {
+            if parallel_build_must_stop("bm25", batch_no * batch_size) {
                 break;
             }
             let prepared: Vec<Option<PreparedFile>> = batch
@@ -230,6 +261,11 @@ impl BM25Index {
                     index.add_prepared(pc);
                 }
                 index.files.insert(pf.rel, pf.state);
+            }
+            // Reclaim freed transient state immediately so RSS does not
+            // accumulate across batches due to jemalloc page retention.
+            if batch_no > 0 {
+                crate::core::memory_guard::jemalloc_purge();
             }
         }
         index.finalize();
@@ -258,10 +294,9 @@ impl BM25Index {
         // Batched fan-out (#685) — see `build_parallel`. `chunks()` keeps the
         // input file order, so the merge sees files exactly as the sequential
         // rebuild iterates them — the foundation of identical output.
-        for (batch_no, batch) in files.chunks(PARALLEL_BATCH_FILES).enumerate() {
-            if batch_no > 0
-                && parallel_build_must_stop("bm25-incr", batch_no * PARALLEL_BATCH_FILES)
-            {
+        let batch_size = effective_batch_size();
+        for (batch_no, batch) in files.chunks(batch_size).enumerate() {
+            if parallel_build_must_stop("bm25-incr", batch_no * batch_size) {
                 break;
             }
             let prepared: Vec<Option<PreparedFile>> = batch
@@ -273,6 +308,9 @@ impl BM25Index {
                     index.add_prepared(pc);
                 }
                 index.files.insert(pf.rel, pf.state);
+            }
+            if batch_no > 0 {
+                crate::core::memory_guard::jemalloc_purge();
             }
         }
         index.finalize();

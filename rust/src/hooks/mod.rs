@@ -7,12 +7,15 @@ mod support;
 ///
 /// * `Mcp` — MCP server only (extension/plugin-based agents without reliable shell).
 /// * `Hybrid` — MCP server + shell hooks for command compression (best of both).
+/// * `Replace` — Native Read/Grep/Glob/Shell are **denied**; lean-ctx MCP tools are
+///   the only path. Eliminates tool drift entirely — no agent compliance needed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookMode {
     #[default]
     Mcp,
     Hybrid,
+    Replace,
 }
 
 impl std::fmt::Display for HookMode {
@@ -20,6 +23,7 @@ impl std::fmt::Display for HookMode {
         match self {
             Self::Mcp => write!(f, "MCP"),
             Self::Hybrid => write!(f, "Hybrid"),
+            Self::Replace => write!(f, "Replace"),
         }
     }
 }
@@ -29,6 +33,7 @@ impl HookMode {
         match s.to_lowercase().replace('-', "").as_str() {
             "mcp" => Some(Self::Mcp),
             "hybrid" => Some(Self::Hybrid),
+            "replace" => Some(Self::Replace),
             _ => None,
         }
     }
@@ -37,20 +42,29 @@ impl HookMode {
         match self {
             Self::Mcp => "MCP server only (extension/plugin-based agents without reliable shell)",
             Self::Hybrid => "MCP server + shell hooks for command compression (best of both)",
+            Self::Replace => {
+                "Native tools denied — lean-ctx MCP is the only path (zero tool drift)"
+            }
         }
     }
 }
 
-/// Auto-detect the best hook mode for a given agent key based on its shell capabilities.
-///
-/// Criteria (verified against provider docs May 2026):
-///   Hybrid — MCP server (full Context OS) + shell hooks where available.
-///            Read/Search via MCP (reliable, cached). Shell via hooks (zero overhead).
-///   Mcp    — agent has no reliable direct shell tool (e.g. IDE plugin only)
-/// Agents that get the Hybrid integration (MCP for reads/search + shell hooks
-/// or rules for command compression). Kept as a single data list so it is
-/// testable and so `refresh_installed_hooks` can prove it covers every one of
-/// them (see `refresh_covers_every_hybrid_agent`).
+/// Agents with reliable shell + hook infrastructure that support Replace mode
+/// (native tools denied, lean-ctx MCP is the only path). These agents have
+/// either `permissions.deny` support or PreToolUse deny-hook capability.
+pub const REPLACE_AGENTS: &[&str] = &[
+    "cursor",
+    "claude",
+    "claude-code",
+    "codebuddy",
+    "codex",
+    "windsurf",
+    "opencode",
+    "gemini",
+];
+
+/// Agents that get Hybrid mode (MCP + shell hooks) because they lack reliable
+/// deny infrastructure but do have shell hooks for command compression.
 pub const HYBRID_AGENTS: &[&str] = &[
     "cursor",
     "gemini",
@@ -77,26 +91,38 @@ pub const HYBRID_AGENTS: &[&str] = &[
     "verdent",
 ];
 
+/// Auto-detect the best hook mode for a given agent key.
+///
+/// Priority: config override > Replace > Hybrid > Mcp
+/// - Replace: native tools denied, MCP-only path (zero tool drift)
+/// - Hybrid: MCP + shell hooks (fallback for agents without deny support)
+/// - Mcp: MCP server only (no shell hooks available)
 pub fn recommend_hook_mode(agent_key: &str) -> HookMode {
-    if HYBRID_AGENTS.contains(&agent_key) {
+    if let Some(override_mode) = crate::core::config::Config::load().hook_mode_override() {
+        return override_mode;
+    }
+    if REPLACE_AGENTS.contains(&agent_key) {
+        HookMode::Replace
+    } else if HYBRID_AGENTS.contains(&agent_key) {
         HookMode::Hybrid
     } else {
-        // No reliable direct shell tool → MCP only.
         HookMode::Mcp
     }
 }
 use agents::{
     install_amp_hook, install_antigravity_cli_hook, install_antigravity_hook,
     install_claude_hook_config, install_claude_hook_scripts, install_claude_hook_with_mode,
-    install_claude_project_hooks, install_cline_rules, install_codebuddy_hook_config,
-    install_codebuddy_hook_scripts, install_codebuddy_hook_with_mode,
+    install_claude_permissions_deny_replace, install_claude_project_hooks, install_cline_rules,
+    install_codebuddy_hook_config, install_codebuddy_hook_scripts,
+    install_codebuddy_hook_with_mode, install_codebuddy_permissions_deny_replace,
     install_codebuddy_project_hooks, install_codex_hook, install_copilot_hook,
-    install_crush_hook_with_mode, install_cursor_hook_config, install_cursor_hook_scripts,
-    install_cursor_hook_with_mode, install_gemini_hook, install_gemini_hook_config,
-    install_gemini_hook_scripts, install_hermes_hook_with_mode, install_jetbrains_hook,
-    install_kiro_hook, install_openclaw_hook, install_opencode_hook_with_mode,
-    install_pi_hook_with_mode, install_qoder_hook, install_qoder_hook_with_mode,
-    install_windsurf_hooks, install_windsurf_rules,
+    install_crush_hook_with_mode, install_cursor_deny_hook, install_cursor_hook_config,
+    install_cursor_hook_scripts, install_cursor_hook_with_mode, install_gemini_deny_hook,
+    install_gemini_hook, install_gemini_hook_config, install_gemini_hook_scripts,
+    install_hermes_hook_with_mode, install_jetbrains_hook, install_kiro_hook,
+    install_openclaw_hook, install_opencode_hook_with_mode, install_pi_hook_with_mode,
+    install_qoder_hook, install_qoder_hook_with_mode, install_windsurf_hooks,
+    install_windsurf_hooks_replace, install_windsurf_rules,
 };
 use support::{
     ensure_codex_hooks_enabled, install_codex_instruction_docs, install_named_json_server,
@@ -205,26 +231,47 @@ fn hooks_installed_for(agent: &str, home: &std::path::Path) -> bool {
 
 /// Re-render the hook artifacts for an already-configured agent. Only calls
 /// narrow, subprocess-free, global installers (never the full agent setup).
+/// Mode-aware: preserves Replace-mode deny artifacts (permissions.deny, deny
+/// hooks) so an MCP server restart never downgrades Replace → Hybrid.
 fn refresh_agent_hooks(agent: &str, home: &std::path::Path) {
+    let mode = recommend_hook_mode(agent);
     match agent {
         "claude" => {
             install_claude_hook_scripts(home);
             install_claude_hook_config(home);
+            if mode == HookMode::Replace {
+                install_claude_permissions_deny_replace(home);
+            }
         }
         "codebuddy" => {
             install_codebuddy_hook_scripts(home);
             install_codebuddy_hook_config(home);
+            if mode == HookMode::Replace {
+                install_codebuddy_permissions_deny_replace(home);
+            }
         }
         "cursor" => {
             install_cursor_hook_scripts(home);
             install_cursor_hook_config(home);
+            if mode == HookMode::Replace {
+                install_cursor_deny_hook(true);
+            }
         }
         "gemini" => {
             install_gemini_hook_scripts(home);
             install_gemini_hook_config(home);
+            if mode == HookMode::Replace {
+                install_gemini_deny_hook(home);
+            }
         }
         "codex" => install_codex_hook(),
-        "windsurf" => install_windsurf_hooks(home),
+        "windsurf" => {
+            if mode == HookMode::Replace {
+                install_windsurf_hooks_replace(home);
+            } else {
+                install_windsurf_hooks(home);
+            }
+        }
         "copilot" => install_copilot_hook(true),
         "qoder" => install_qoder_hook(),
         _ => {}
@@ -418,6 +465,10 @@ if [ -z "$CMD" ] || echo "$CMD" | grep -qE "^(lean-ctx |\"?$LEAN_CTX_BIN\"? )"; 
   exit 0
 fi
 
+# Skip multi-line commands: the grep/sed extraction above does not decode
+# JSON \n into real newlines, so lean-ctx -c would receive fused lines (#787).
+if printf '%s' "$CMD" | grep -qF '\n'; then exit 0; fi
+
 case "$CMD" in
   {case_pattern})
     # Shell-escape then JSON-escape (two passes)
@@ -443,6 +494,7 @@ LEAN_CTX_BIN={quoted_binary}
 INPUT=$(cat)
 CMD=$(echo "$INPUT" | grep -oE '"command":"([^"\\]|\\.)*"' | head -1 | sed 's/^"command":"//;s/"$//' | sed 's/\\"/"/g;s/\\\\/\\/g' 2>/dev/null || echo "")
 if [ -z "$CMD" ] || echo "$CMD" | grep -qE "^(lean-ctx |\"?$LEAN_CTX_BIN\"? )"; then exit 0; fi
+if printf '%s' "$CMD" | grep -qF '\n'; then exit 0; fi
 case "$CMD" in
   {case_pattern})
     SHELL_ESC=$(printf '%s' "$CMD" | sed 's/\\/\\\\/g;s/"/\\"/g')
@@ -479,6 +531,25 @@ pub fn hybrid_rules_content() -> String {
         version = rules_canonical::RULES_VERSION,
         bullets = rules_canonical::BULLETS,
         never = rules_canonical::NEVER,
+        end = rules_canonical::END_MARK,
+    )
+}
+
+pub fn replace_rules_content() -> String {
+    use crate::core::rules_canonical;
+    format!(
+        "{start}\n<!-- version: {version} -->\n\n\
+# lean-ctx \u{2014} Replace Mode (native tools denied)\n\n\
+Native Read/Grep/Glob/Bash are denied by policy. Use ONLY ctx_* MCP tools:\n\
+- ctx_read for ALL file reads (cached, 10 modes, re-reads ~13 tokens)\n\
+- ctx_shell for ALL shell commands (95+ compression patterns)\n\
+- ctx_search instead of Grep/rg (compact results)\n\
+- ctx_tree instead of ls/find (compact directory maps)\n\
+- ctx_glob instead of Glob (file pattern matching)\n\n\
+Do NOT attempt native Read, Grep, Glob, or Bash \u{2014} they will be denied.\n\n\
+{end}",
+        start = rules_canonical::START_MARK,
+        version = rules_canonical::RULES_VERSION,
         end = rules_canonical::END_MARK,
     )
 }
@@ -858,6 +929,9 @@ pub fn install_agent_hook_with_mode(agent: &str, global: bool, mode: HookMode) {
         "cursor" => install_cursor_hook_with_mode(global, mode),
         "gemini" => {
             install_gemini_hook();
+            if mode == HookMode::Replace {
+                install_gemini_deny_hook(&home);
+            }
             // Google is transitioning Gemini CLI → Antigravity CLI (`agy`), and
             // `gemini` setup also configures the Antigravity CLI MCP target. The
             // hooks must follow: `agy` reads hooks only from its plugin dir
@@ -872,8 +946,15 @@ pub fn install_agent_hook_with_mode(agent: &str, global: bool, mode: HookMode) {
             "~/.augment/settings.json",
             &crate::core::editor_registry::augment_cli_settings_path(&home),
         ),
-        "codex" => install_codex_hook(),
-        "windsurf" => install_windsurf_rules(global),
+        "codex" => {
+            install_codex_hook();
+        }
+        "windsurf" => {
+            install_windsurf_rules(global);
+            if mode == HookMode::Replace {
+                install_windsurf_hooks_replace(&home);
+            }
+        }
         "cline" | "roo" => install_cline_rules(global),
         "copilot" | "vscode" => install_copilot_hook(global),
         // VS Code Insiders needs no hook install of its own: the MCP entry in

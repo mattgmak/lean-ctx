@@ -42,12 +42,20 @@ pub trait ReadMode: Send + Sync {
     fn render(&self, source: &str, path: &str) -> String;
 }
 
+/// `@render type=<name>` — a WASM-backed render transform.
+/// `hint`: consumer hint (ai = 0, human = 1).
+pub trait RenderTransform: Send + Sync {
+    fn name(&self) -> &str;
+    fn render(&self, input: &str, hint: i32) -> String;
+}
+
 /// Registry of pluggable read-modes, compressors, and chunkers.
 #[derive(Default)]
 pub struct ExtensionRegistry {
     read_modes: BTreeMap<String, Arc<dyn ReadMode>>,
     compressors: BTreeMap<String, Arc<dyn Compressor>>,
     chunkers: BTreeMap<String, Arc<dyn Chunker>>,
+    render_transforms: BTreeMap<String, Arc<dyn RenderTransform>>,
 }
 
 impl ExtensionRegistry {
@@ -133,6 +141,24 @@ impl ExtensionRegistry {
     #[must_use]
     pub fn chunker_names(&self) -> Vec<String> {
         self.chunkers.keys().cloned().collect()
+    }
+
+    /// Register (or replace) a render transform by its name.
+    pub fn register_render_transform(&mut self, handler: Arc<dyn RenderTransform>) {
+        self.render_transforms
+            .insert(handler.name().to_string(), handler);
+    }
+
+    /// Look up a render transform by name.
+    #[must_use]
+    pub fn render_transform(&self, name: &str) -> Option<Arc<dyn RenderTransform>> {
+        self.render_transforms.get(name).cloned()
+    }
+
+    /// Registered render transform names (sorted).
+    #[must_use]
+    pub fn render_transform_names(&self) -> Vec<String> {
+        self.render_transforms.keys().cloned().collect()
     }
 }
 
@@ -317,6 +343,25 @@ mod tests {
         assert!(reg.compressor_names().contains(&"uppercase".to_string()));
         let c = reg.compressor("uppercase").unwrap();
         assert_eq!(c.compress("hi", None), "HI");
+    }
+
+    struct UpperRender;
+    impl RenderTransform for UpperRender {
+        fn name(&self) -> &str {
+            "upper"
+        }
+        fn render(&self, input: &str, hint: i32) -> String {
+            format!("{}:{}", hint, input.to_uppercase())
+        }
+    }
+
+    #[test]
+    fn render_transform_registers_and_resolves_with_hint() {
+        let mut reg = ExtensionRegistry::with_builtins();
+        reg.register_render_transform(Arc::new(UpperRender));
+        let r = reg.render_transform("upper").unwrap();
+        assert_eq!(r.render("hi", 1), "1:HI");
+        assert!(reg.render_transform_names().contains(&"upper".to_string()));
     }
 
     #[test]

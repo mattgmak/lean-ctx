@@ -1,65 +1,54 @@
-# The Context Stack — Ecosystem Overview
+# LeanCTX — Ecosystem Overview
 
-> Public overview of how the products compose. Per-product manifestos:
-> [`lean-ctx/VISION.md`](VISION.md) · `ctxpkg-org/VISION.md` ·
-> `ctxpkg-com/VISION.md`.
+> Product vision: [`VISION.md`](VISION.md)
 
 Software ate the world. Agents are eating software. And every agent is exactly
 as good as the context it is given — context decides what an agent knows, what
 it may do, and what it provably did. Today that context is unmanaged: untyped
 markdown, copy-pasted prompts, vendor-locked memory, zero provenance.
 
-**The Context Stack makes context infrastructure**: efficient, verifiable,
-tradable, organizational — managed with the same rigor as code.
+**LeanCTX makes context infrastructure**: efficient, verifiable, portable,
+organizational — managed with the same rigor as code.
 
-## The four layers
+## One product, three pillars
 
-| # | Layer | Product | Question it answers |
-|---|-------|---------|--------------------|
-| 1 | **Law** | **ctxpkg.org** — the open standard | What is valid context, and can any tool verify it offline? |
-| 2 | **Distribution** | **ctxpkg.com** — the registry & marketplace | Where does context come from, and why trust the download? |
-| 3 | **Enforcement** | **LeanCTX** — the context engine | What may *this* agent see, at what cost, and can we prove what it saw? |
-| 4 | **Connection** | **CTXFabric** — the organizational context platform | How does an organization's knowledge become — and stay — governed, AI-ready context? |
+| Pillar | What it does | Who it serves |
+|--------|-------------|---------------|
+| **Engine** | Active token reduction — compression, MCP tools, agent hooks, local dashboard | Individual developers |
+| **Gateway** | Org-wide LLM proxy — usage tracking, budget enforcement, FinOps, compliance | Companies, Ops, FinOps, CISOs |
+| **Cloud** | Hosted services — accounts, sync, team provisioning, billing, registry | Teams, Pro users, managed enterprise |
 
-Read bottom-up it is a supply chain: *distill → seal → publish → verify →
-enforce* (told on [ctxpkg.com/governance/](https://ctxpkg.com/governance/)).
-Read top-down it is a control plane: law constrains distribution, distribution
-feeds enforcement, the fabric feeds and consumes both.
+All three pillars ship in **one binary** (`lean-ctx`). Every feature works
+self-hosted for free. Cloud and Enterprise tiers add hosting, support, and
+managed infrastructure — never features.
 
-Each layer is independently replaceable **by design** — that is what makes the
-whole credible, and why adopting one layer never forces buying another. The
-interfaces are open (spec, registry protocol, RFC process); the implementations
-compete on quality.
+### Engine
 
-## CTXFabric in one paragraph
+The developer-facing context compression layer: 10 read modes, 95+ shell
+compression patterns, tree-sitter AST for 27 languages, semantic search with
+hybrid BM25 + dense retrieval, session continuity protocol (~400 tokens instead
+of ~50K cold start). Ships as MCP tools (`ctx_read`, `ctx_compose`,
+`ctx_search`, …) and transparent agent hooks.
 
-LeanCTX distills context from *code and sessions*; CTXFabric distills it from
-*the organization* — policies, processes, compliance rules, historical
-decisions — without requiring technical skills. Imported knowledge is curated,
-compiled into signed `.ctxpkg` packages and governed (who uses what, is it
-still valid, which agent consumed it). Its second act connects engines into a
-fleet: shared organizational memory, policy-routed in real time, with evidence
-at fleet scale. Packages stay on the registry; the fabric keeps them alive.
+### Gateway
 
-## How the layers compound
+The org-wide LLM reverse proxy: intercepts Anthropic, OpenAI, Gemini and
+ChatGPT traffic, compresses prompts in-flight, meters per-request cost
+attribution, enforces budgets, and provides FinOps dashboards. Self-hosted with
+`--features gateway-server`, no license required.
 
-1. **LeanCTX** makes every session cheaper and distills knowledge as a
-   byproduct → raw material.
-2. **CTXPKG** makes that knowledge portable and verifiable → assets instead of
-   session artifacts. This includes *learned optimization profiles* — the
-   engine learns locally (zero telemetry, always) and the results travel as
-   signed packages, not as harvested data. Anchored to git and chained over
-   time, the same format becomes a *Context Snapshot* — version control for the
-   context layer (see
-   [`docs/concepts/context-time-machine.md`](docs/concepts/context-time-machine.md)).
-3. **ctxpkg.com** makes the assets distributable and worth money → publishers
-   are paid to produce exactly what makes engines smarter.
-4. **CTXFabric** makes the assets organizational and alive → the value of
-   every package multiplies by the number of connected agents → more engines
-   adopt → back to 1.
+### Cloud
 
-**The engine creates supply, the standard creates trust, the registry creates
-a market, the fabric creates network effects.**
+The hosted coordination layer: user accounts, team provisioning, knowledge
+sync, billing edge, and the context package registry. Enables Pro/Team/
+Enterprise tiers without requiring self-hosted infrastructure.
+
+## Companion projects
+
+| Project | Role |
+|---------|------|
+| **ctxpkg.org** | Open standard for signed, typed context packages (`.ctxpkg`) |
+| **ctxpkg.com** | Registry and marketplace for context packages |
 
 ## Doctrines
 
@@ -67,11 +56,6 @@ a market, the fabric creates network effects.**
   explicit, locally computed, user-invoked shares only.
 - **Trust is never for sale** — no paid placement, ranking or verification on
   any surface.
-- **No layer merges** — the standard never grows vendor hooks, the registry
-  never requires our engine, the fabric never requires our registry.
+- **Local-Free Invariant** — every feature works self-hosted for free;
+  commercial tiers add hosting and support, never capabilities.
 - **Distilled, typed, signed knowledge only** — never raw transcripts.
-
----
-
-*The stack in one line:*
-**LeanCTX compresses it. CTXPKG seals it. ctxpkg.com ships it. CTXFabric keeps it alive.**

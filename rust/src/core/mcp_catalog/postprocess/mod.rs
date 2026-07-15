@@ -86,7 +86,7 @@ pub fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::gateway::config::GatewayServer;
+    use crate::core::mcp_catalog::config::GatewayServer;
     use std::fmt::Write as _;
 
     fn server(name: &str) -> GatewayServer {

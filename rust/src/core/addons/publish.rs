@@ -132,7 +132,7 @@ pub fn build_addon_pack(manifest_path: &Path, namespace: &str) -> Result<AddonPa
         created_at: Utc::now(),
         updated_at: None,
         layers: Vec::new(),
-        dependencies: Vec::new(),
+        dependencies: addon.dependencies.clone(),
         tags: addon
             .addon
             .categories
@@ -315,5 +315,38 @@ sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
         let err = build_addon_pack(&path, "acme").expect_err("must fail");
         assert!(err.contains("description"), "got: {err}");
+    }
+
+    #[test]
+    fn build_addon_pack_forwards_declared_dependencies() {
+        let dir = std::env::temp_dir().join(format!("lc-addon-deps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("lean-ctx-addon.toml");
+        std::fs::write(
+            &path,
+            r#"
+[addon]
+name = "demo"
+version = "0.2.0"
+description = "a demo addon"
+
+[mcp]
+command = "demo-bin"
+
+[[dependencies]]
+name = "@dasTholo/lean-md-skills"
+version_req = "^0.2"
+"#,
+        )
+        .expect("write manifest");
+
+        let plan = build_addon_pack(&path, "dastholo").expect("builds");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let bundle: serde_json::Value =
+            serde_json::from_str(&plan.bundle_json).expect("bundle json");
+        let deps = &bundle["manifest"]["dependencies"];
+        assert_eq!(deps[0]["name"], "@dasTholo/lean-md-skills");
+        assert_eq!(deps[0]["version_req"], "^0.2");
     }
 }

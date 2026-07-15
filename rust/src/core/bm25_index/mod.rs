@@ -217,11 +217,11 @@ impl BM25Index {
     /// `content.lines().take(5)` for snippets, so the trimmed copy is functionally
     /// complete for BM25/dense/hybrid result rendering.
     ///
-    /// RESIDENT-ONLY: this mutates the in-memory copy. The persisted `.bin.zst`
-    /// keeps full content (truncation never runs before `save`), so a reload
-    /// restores complete bodies. Sets `content_truncated` so a later
-    /// `ensure_embeddings` against this same resident index skips re-embedding
-    /// (which would otherwise feed truncated bodies to the embedder).
+    /// Further shrinks resident content (chunks are already truncated to 10 lines
+    /// during `add_chunk`; this method can tighten that further). Sets
+    /// `content_truncated` so a later `ensure_embeddings` against this same
+    /// resident index skips re-embedding (which would otherwise feed truncated
+    /// bodies to the embedder).
     ///
     /// Idempotent and only ever shrinks: chunks shorter than `keep_lines` are
     /// left untouched.
@@ -429,7 +429,7 @@ impl BM25Index {
         index
     }
 
-    fn add_chunk(&mut self, chunk: CodeChunk) {
+    fn add_chunk(&mut self, mut chunk: CodeChunk) {
         let idx = self.chunks.len();
 
         let enriched = enrich_for_bm25(&chunk);
@@ -441,6 +441,19 @@ impl BM25Index {
                 *self.doc_freqs.entry(lower).or_insert(0) += 1;
             }
             postings.push((idx, 1.0));
+        }
+
+        // #790: truncate content to snippet AFTER tokenization — full text was
+        // used for BM25 scoring above; stored content is only for result display.
+        const SNIPPET_LINES: usize = 10;
+        if chunk.content.lines().nth(SNIPPET_LINES).is_some() {
+            chunk.content = chunk
+                .content
+                .lines()
+                .take(SNIPPET_LINES)
+                .collect::<Vec<_>>()
+                .join("\n");
+            chunk.content.shrink_to_fit();
         }
 
         self.chunks.push(CodeChunk {
@@ -539,19 +552,25 @@ impl BM25Index {
 
         let dir = index_dir(root);
         std::fs::create_dir_all(&dir)?;
-        let data = postcard::to_allocvec(self).map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let compressed = zstd::encode_all(data.as_slice(), ZSTD_LEVEL)
-            .map_err(|e| std::io::Error::other(format!("zstd compress: {e}")))?;
-        let compressed_bytes = compressed.len() as u64;
+        // #790: stream postcard → zstd → file to avoid holding the full
+        // serialized buffer in memory. Temp-file + rename for atomicity.
+        let target = dir.join("bm25_index.bin.zst");
+        let tmp = dir.join("bm25_index.bin.zst.tmp");
+        {
+            let file = std::fs::File::create(&tmp)?;
+            let buf_writer = std::io::BufWriter::new(file);
+            let mut encoder = zstd::Encoder::new(buf_writer, ZSTD_LEVEL)
+                .map_err(|e| std::io::Error::other(format!("zstd encoder init: {e}")))?;
+            postcard::to_io(self, &mut encoder)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            encoder.finish()?;
+        }
 
+        let compressed_bytes = std::fs::metadata(&tmp)?.len();
         let max_bytes = max_bm25_cache_bytes();
         if compressed_bytes > max_bytes {
-            // Do NOT pretend success: a silent `Ok(())` here made `load` return
-            // `None` forever and the index rebuild on every call (issue #249).
-            // Report the refusal so the orchestrator can record an actionable
-            // note and the agent-facing tools can stop claiming the index will
-            // be "ready next call".
+            let _ = std::fs::remove_file(&tmp);
             tracing::warn!(
                 "[bm25] compressed index too large ({:.1} MB, limit {:.0} MB), refusing to persist: {}",
                 compressed_bytes as f64 / 1_048_576.0,
@@ -565,15 +584,10 @@ impl BM25Index {
         }
 
         tracing::info!(
-            "[bm25] index: {:.1} MB postcard → {:.1} MB zstd ({:.0}% saved)",
-            data.len() as f64 / 1_048_576.0,
+            "[bm25] index: {:.1} MB zstd compressed",
             compressed_bytes as f64 / 1_048_576.0,
-            (1.0 - compressed_bytes as f64 / data.len().max(1) as f64) * 100.0
         );
 
-        let target = dir.join("bm25_index.bin.zst");
-        let tmp = dir.join("bm25_index.bin.zst.tmp");
-        std::fs::write(&tmp, &compressed)?;
         std::fs::rename(&tmp, &target)?;
 
         let _ = std::fs::remove_file(dir.join("bm25_index.bin"));

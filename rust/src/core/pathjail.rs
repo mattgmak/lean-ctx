@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::core::error::PathJailError;
+
 /// `allow_paths` / `extra_roots` come from `config.toml`, where no shell ever
 /// runs — users writing `"$HOME/code"` or `"~/code"` got a literal,
 /// never-matching prefix and concluded the whole option was broken (GH #392).
@@ -352,7 +354,7 @@ fn canonicalize_existing_ancestor(path: &Path) -> Option<(PathBuf, Vec<std::ffi:
     }
 }
 
-pub fn jail_path(candidate: &Path, jail_root: &Path) -> Result<PathBuf, String> {
+pub fn jail_path(candidate: &Path, jail_root: &Path) -> Result<PathBuf, PathJailError> {
     jail_path_with_roots(candidate, jail_root, &[])
 }
 
@@ -369,9 +371,9 @@ pub fn jail_path_with_roots(
     candidate: &Path,
     jail_root: &Path,
     extra_roots: &[String],
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, PathJailError> {
     if candidate.to_string_lossy().as_bytes().contains(&0) {
-        return Err("path contains null byte".to_string());
+        return Err(PathJailError::NullByte);
     }
 
     #[cfg(feature = "no-jail")]
@@ -410,11 +412,24 @@ pub fn jail_path_with_roots(
                 .map(|r| canonicalize_secure(Path::new(r))),
         );
 
+        // #820: lean-ctx's own state dir (tee files, artifacts, tool-results)
+        // must be readable even when outside the project root. ctx_shell
+        // tells agents to read tee-file paths, so the jail must allow them.
+        if let Ok(state) = crate::core::paths::state_dir() {
+            allow.push(canonicalize_secure(&state));
+        }
+        // Read-only roots are also allowed for reads (they only block writes
+        // via enforce_writable, not reads via the jail).
+        allow.extend(
+            read_only_roots_from_env_and_config()
+                .into_iter()
+                .map(|p| canonicalize_secure(&p)),
+        );
+
         let (base, remainder) = canonicalize_existing_ancestor(candidate).ok_or_else(|| {
-            format!(
-                "path does not exist and has no existing ancestor: {}",
-                candidate.display()
-            )
+            PathJailError::NoExistingAncestor {
+                path: candidate.to_path_buf(),
+            }
         })?;
 
         let allowed =
@@ -424,17 +439,13 @@ pub fn jail_path_with_roots(
         let allowed = allowed || is_under_prefix_windows(&base, &root);
 
         if !allowed {
-            let base_msg = format!(
-                "path escapes project root: {} (root: {})",
-                candidate.display(),
-                root.display(),
-            );
             let mut hint = if crate::core::protocol::meta_visible() {
                 let dir = candidate.parent().unwrap_or(candidate).display();
                 format!(
-                    ". Hint: set LEAN_CTX_READ_ONLY_ROOTS={dir} for read-only access, \
-                     or LEAN_CTX_ALLOW_PATH={dir} for read-write access, \
-                     or add entries to read_only_roots/allow_paths in ~/.config/lean-ctx/config.toml"
+                    ". Hint: set LEAN_CTX_ALLOW_PATH={dir} for read-write access \
+                     (colon-separated for multiple: /path/a:/path/b), \
+                     LEAN_CTX_READ_ONLY_ROOTS={dir} for read-only, \
+                     or add entries to allow_paths = [\"{dir}\"] in ~/.config/lean-ctx/config.toml"
                 )
             } else {
                 String::new()
@@ -457,7 +468,11 @@ pub fn jail_path_with_roots(
                     missing.display()
                 ));
             }
-            return Err(format!("{base_msg}{hint}"));
+            return Err(PathJailError::EscapesRoot {
+                path: candidate.to_path_buf(),
+                root,
+                hint,
+            });
         }
 
         #[cfg(windows)]
@@ -477,11 +492,10 @@ pub fn jail_path_with_roots(
             #[cfg(windows)]
             let final_ok = final_ok || is_under_prefix_windows(&final_canon, &root);
             if !final_ok {
-                return Err(format!(
-                    "post-canonicalize jail escape detected: {} resolves to {}",
-                    candidate.display(),
-                    final_canon.display()
-                ));
+                return Err(PathJailError::PostCanonicalizeEscape {
+                    path: candidate.to_path_buf(),
+                    resolved: final_canon,
+                });
             }
         }
 
@@ -503,15 +517,14 @@ fn normalize_windows_path(s: &str) -> String {
 }
 
 #[cfg(windows)]
-fn reject_symlink_on_windows(path: &Path) -> Result<(), String> {
+fn reject_symlink_on_windows(path: &Path) -> Result<(), PathJailError> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         // Junctions and other reparse points redirect like symlinks but are
         // invisible to `is_symlink()` — reject them too (GL#442).
         if super::pathutil::is_symlink_or_reparse(&meta) {
-            return Err(format!(
-                "symlink not allowed in jailed path: {}",
-                path.display()
-            ));
+            return Err(PathJailError::Symlink {
+                path: path.to_path_buf(),
+            });
         }
     }
     Ok(())
@@ -797,7 +810,7 @@ mod tests {
 
         let err = jail_path(&other.join("b.txt"), &root).unwrap_err();
         assert!(
-            err.contains("path escapes project root"),
+            err.to_string().contains("path escapes project root"),
             "error should mention escape: {err}"
         );
     }
@@ -953,7 +966,7 @@ mod tests {
         let result = jail_path(&bad_path, &root);
         assert!(result.is_err(), "null byte in path must be rejected");
         assert!(
-            result.unwrap_err().contains("null byte"),
+            result.unwrap_err().to_string().contains("null byte"),
             "error must mention null byte"
         );
     }
@@ -1000,5 +1013,30 @@ mod tests {
 
         // Empty entries are ignored (no accidental allow-all).
         assert!(jail_path_with_roots(&outside, &root, &[String::new()]).is_err());
+    }
+
+    /// #820: lean-ctx state dir (tee files) is implicitly allowed by the jail.
+    #[test]
+    fn state_dir_tee_files_pass_jail() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        let state = crate::core::paths::state_dir().expect("state_dir must be available");
+        let tee_path = state.join("tee").join("some_command_deadbeef.log");
+        // Use a root that is clearly NOT the state dir's parent
+        let fake_root = std::env::temp_dir().join("pathjail_test_820_root");
+        std::fs::create_dir_all(&fake_root).ok();
+        // The tee path is outside the fake root, but the state dir allowance
+        // should make it pass (the state dir itself exists on disk).
+        let result = jail_path_with_roots(&tee_path, &fake_root, &[]);
+        // If state_dir exists on disk (it does in dev), the path should be allowed.
+        // If the tee file itself doesn't exist, canonicalize_existing_ancestor
+        // resolves to the state_dir (which does exist) + remainder.
+        if state.exists() {
+            assert!(
+                result.is_ok(),
+                "tee-file path under lean-ctx state dir must be auto-allowed: {:?}",
+                result
+            );
+        }
+        std::fs::remove_dir_all(&fake_root).ok();
     }
 }

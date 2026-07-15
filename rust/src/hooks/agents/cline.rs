@@ -43,10 +43,13 @@ pub(crate) fn install_cline_rules(global: bool) {
 /// emitting the compression block here too would only duplicate it (#684). The
 /// `START_MARK`/`END_MARK` wrapper is what `uninstall` strips.
 fn cline_rules_body(shadow: bool) -> String {
+    let cfg = crate::core::config::Config::load();
+    let profile = crate::core::tool_profiles::ToolProfile::from_config(&cfg);
     crate::core::rules_canonical::render(
         shadow,
         crate::core::rules_canonical::Wrapper::Dedicated,
         crate::core::config::CompressionLevel::Off,
+        &profile,
     )
 }
 

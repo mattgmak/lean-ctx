@@ -17,8 +17,11 @@ use crate::core::rules_canonical::{self as rc, Wrapper};
 /// homes and the real `~/.cursor` behave identically.
 pub(super) fn cursor_wrapper_for_mdc(mdc_path: &Path) -> Wrapper {
     let covered = mdc_path
-        .parent()
-        .and_then(Path::parent)
+        .ancestors()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new(".cursor"))
+        })
         .is_some_and(|cursor_dir| {
             crate::core::rules_channel::cursor_hooks_json_covers(&cursor_dir.join("hooks.json"))
         });
@@ -48,12 +51,17 @@ pub(super) fn rules_content(
     format: &RulesFormat,
     level: CompressionLevel,
     wrapper: Wrapper,
+    tool_profile: &crate::core::tool_profiles::ToolProfile,
 ) -> String {
     let shadow = crate::core::config::Config::load().shadow_mode;
     match format {
-        RulesFormat::SharedMarkdown => rc::render(shadow, Wrapper::Shared, level),
-        RulesFormat::DedicatedMarkdown => rc::render(shadow, Wrapper::Dedicated, level),
-        RulesFormat::CursorMdc => cursor_mdc_document(&rc::render(shadow, wrapper, level)),
+        RulesFormat::SharedMarkdown => rc::render(shadow, Wrapper::Shared, level, tool_profile),
+        RulesFormat::DedicatedMarkdown => {
+            rc::render(shadow, Wrapper::Dedicated, level, tool_profile)
+        }
+        RulesFormat::CursorMdc => {
+            cursor_mdc_document(&rc::render(shadow, wrapper, level, tool_profile))
+        }
     }
 }
 

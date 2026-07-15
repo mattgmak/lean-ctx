@@ -2,7 +2,7 @@
 
 > **Control what your AI can see.**
 >
-> Stack overview (LeanCTX · CTXPKG · ctxpkg.com · CTXFabric): [`ECOSYSTEM.md`](ECOSYSTEM.md)
+> Ecosystem overview: [`ECOSYSTEM.md`](ECOSYSTEM.md)
 
 ## The Cognitive Context Layer
 
@@ -102,7 +102,7 @@ the always-local core.
   one semantic graph with graph-aware reads.
 - **Provider framework** — issues, tickets, CI and logs flowing through the
   same consolidation pipeline as code.
-- **Fabric primitives** — agent handoffs, cross-session memory and org
+- **Org-wide context** — agent handoffs, cross-session memory and team
   accounts as the substrate for fleet-level context (see `ECOSYSTEM.md`).
 
 The end state: an AI that sees only what matters, remembers what's relevant,

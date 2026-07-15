@@ -1,5 +1,6 @@
 //! Dashboard leaderboard API (#466) — submit this machine's recap to the public
-//! board and flip auto-submit, without dropping to `lean-ctx gain --publish`.
+//! board, flip auto-submit, and link multiple machines (GH #736), without
+//! dropping to `lean-ctx gain --publish` or `--link`.
 //!
 //! - `GET  /api/leaderboard/status` → current publish / leaderboard / auto-submit
 //!   state ([`wrapped_publish::leaderboard_status`]) the card renders.
@@ -7,6 +8,9 @@
 //!   leaderboard opt-in (optional `{ "name": "handle" }`); returns the permalink.
 //! - `POST /api/leaderboard/auto`   → `{ "on": true|false }` flips `[gain]
 //!   auto_publish` (and opts in to the board when turning it on).
+//! - `POST /api/leaderboard/link/start`    → mint a pairing code for this card.
+//! - `POST /api/leaderboard/link/complete` → `{ "code": "XXXX-XXXX" }` joins
+//!   this card into the initiator's link group (login-less machine linking).
 //!
 //! Security: like every dashboard mutation, the POSTs are Bearer-token gated and
 //! CSRF-`Origin` checked *before* the router runs (see `dashboard/mod.rs`). The
@@ -33,6 +37,14 @@ pub(super) fn handle(
         "/api/leaderboard/submit" => Some(method_not_allowed("submit a leaderboard entry")),
         "/api/leaderboard/auto" if method.eq_ignore_ascii_case("POST") => Some(post_auto(body)),
         "/api/leaderboard/auto" => Some(method_not_allowed("toggle auto-submit")),
+        "/api/leaderboard/link/start" if method.eq_ignore_ascii_case("POST") => {
+            Some(post_link_start())
+        }
+        "/api/leaderboard/link/start" => Some(method_not_allowed("start a machine link")),
+        "/api/leaderboard/link/complete" if method.eq_ignore_ascii_case("POST") => {
+            Some(post_link_complete(body))
+        }
+        "/api/leaderboard/link/complete" => Some(method_not_allowed("complete a machine link")),
         _ => None,
     }
 }
@@ -154,6 +166,73 @@ fn post_auto(body: &str) -> (&'static str, &'static str, String) {
     }
 }
 
+// ─── Login-less machine linking (GH #736) ─────────────────────────────────────
+
+/// Mint a pairing code for this machine’s card. The dashboard proxies the cloud
+/// API so the browser never reaches `api.leanctx.com` directly (CSP `connect-src`
+/// = `'self'`). Auth is the card’s `edit_token`, not the dashboard bearer token.
+fn post_link_start() -> (&'static str, &'static str, String) {
+    match wrapped_publish::link_start() {
+        Ok(minted) => {
+            let body = serde_json::json!({
+                "ok": true,
+                "code": minted.code,
+                "expires_in_secs": minted.expires_in_secs,
+            })
+            .to_string();
+            ("200 OK", "application/json", body)
+        }
+        Err(e) if e.contains("No published card") => {
+            ("409 Conflict", "application/json", json_err(&e))
+        }
+        Err(e) => (
+            "502 Bad Gateway",
+            "application/json",
+            json_err(&format!("link start failed: {e}")),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct LinkCompleteReq {
+    code: String,
+}
+
+/// Complete a machine link using a pairing code from another machine. The
+/// dashboard sends `{ "code": "XXXX-XXXX" }` and this proxies the cloud API.
+fn post_link_complete(body: &str) -> (&'static str, &'static str, String) {
+    let req: LinkCompleteReq = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                "400 Bad Request",
+                "application/json",
+                json_err(&format!(
+                    "invalid JSON (expected {{\"code\":\"XXXX-XXXX\"}}): {e}"
+                )),
+            );
+        }
+    };
+
+    match wrapped_publish::link_complete(&req.code) {
+        Ok(()) => {
+            let body = serde_json::json!({ "ok": true, "linked": true }).to_string();
+            ("200 OK", "application/json", body)
+        }
+        Err(e) if e.contains("No published card") => {
+            ("409 Conflict", "application/json", json_err(&e))
+        }
+        Err(e) if e.contains("invalid or expired") => {
+            ("410 Gone", "application/json", json_err(&e))
+        }
+        Err(e) => (
+            "502 Bad Gateway",
+            "application/json",
+            json_err(&format!("link complete failed: {e}")),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +311,30 @@ mod tests {
         assert!(handle("/api/stats", "", "GET", "").is_none());
         assert!(handle("/api/leaderboardx", "", "GET", "").is_none());
         assert!(handle("/", "", "GET", "").is_none());
+    }
+
+    #[test]
+    fn link_start_rejects_get_with_405() {
+        let (status, _mime, body) =
+            handle("/api/leaderboard/link/start", "", "GET", "").expect("route matches");
+        assert_eq!(status, "405 Method Not Allowed");
+        assert!(body.contains("POST"), "405 must hint at POST");
+    }
+
+    #[test]
+    fn link_complete_rejects_get_with_405() {
+        let (status, _mime, _body) =
+            handle("/api/leaderboard/link/complete", "", "GET", "").expect("route matches");
+        assert_eq!(status, "405 Method Not Allowed");
+    }
+
+    #[test]
+    fn link_complete_rejects_invalid_json_with_400() {
+        let (status, _mime, body) =
+            handle("/api/leaderboard/link/complete", "", "POST", "not json")
+                .expect("route matches");
+        assert_eq!(status, "400 Bad Request");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON error");
+        assert!(v["error"].is_string(), "400 must carry an error message");
     }
 }

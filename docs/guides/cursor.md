@@ -220,7 +220,23 @@ lean-ctx watch              # TUI monitor
 
 ### Multi-Agent with Cursor Subagents
 
-When using Cursor's Task tool to spawn subagents:
+**Important: Cursor blocks MCP tools in readonly subagents.**
+
+When spawning subagents that need lean-ctx tools, always set `readonly: false`:
+
+```
+# WRONG — lean-ctx tools will fail:
+Task(subagent_type="explore", ...)  # explore is always readonly
+
+# CORRECT — lean-ctx tools work:
+Task(subagent_type="generalPurpose", readonly=false, prompt="Use ctx_compose to...")
+```
+
+lean-ctx tools declare `readOnlyHint: true` in MCP annotations. When Cursor
+starts respecting this hint (per MCP spec), readonly subagents will gain access
+to read-only lean-ctx tools (ctx_read, ctx_compose, ctx_search, etc.).
+
+Within subagents that have MCP access:
 
 ```
 # Set fresh=true in subagents to bypass cache
@@ -232,6 +248,10 @@ ctx_knowledge(action="remember", category="insight", content="Found the bug in a
 # Main agent sees it
 ctx_knowledge(action="recall", query="auth bug")
 ```
+
+**Fallback for readonly subagents:** If a subagent must be readonly (e.g. for
+safety), lean-ctx hooks still compress native Read/Shell via CLI subprocess.
+The subagent loses session memory and caching but still gets compression.
 
 ## Troubleshooting
 

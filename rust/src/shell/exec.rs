@@ -325,7 +325,21 @@ fn is_heavy_command(command: &str) -> bool {
         "mise ",
         "just ",
     ];
-    HEAVY_PREFIXES.iter().any(|p| lower.starts_with(p))
+
+    let matches_heavy = |s: &str| HEAVY_PREFIXES.iter().any(|p| s.starts_with(p));
+
+    if matches_heavy(&lower) {
+        return true;
+    }
+
+    // Agents often prefix commands with `cd /path && ...` or `cd /path;`.
+    // Extract the final segment after the last `&&` or `;` and check that too.
+    let final_cmd = lower
+        .rsplit_once("&&")
+        .or_else(|| lower.rsplit_once(';'))
+        .map_or("", |(_, rhs)| rhs.trim());
+
+    !final_cmd.is_empty() && matches_heavy(final_cmd)
 }
 
 /// Execute a command from pre-split argv without going through `sh -c`.
@@ -816,7 +830,12 @@ fn exec_buffered(command: &str, shell: &str, shell_flag: &str, cfg: &config::Con
     // from interactive users.
     let isolate = !io::stdin().is_terminal();
     if isolate {
-        cmd.stdin(Stdio::null());
+        // #806: use Stdio::piped() instead of Stdio::null() so callers that
+        // legitimately pipe data (e.g. `printf 'prompt' | lean-ctx -c 'claude
+        // --print'`) can deliver it. A relay thread copies parent stdin →
+        // child stdin and propagates EOF. The #720 hang is still prevented by
+        // wait_with_limits' process-group timeout kill — not by nulling stdin.
+        cmd.stdin(Stdio::piped());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -828,7 +847,7 @@ fn exec_buffered(command: &str, shell: &str, shell_flag: &str, cfg: &config::Con
     super::platform::apply_profile_free_env(&mut cmd);
     let child = cmd.spawn();
 
-    let child = match child {
+    let mut child = match child {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("lean-ctx: failed to execute: {e}");
@@ -839,6 +858,36 @@ fn exec_buffered(command: &str, shell: &str, shell_flag: &str, cfg: &config::Con
             return 127;
         }
     };
+
+    // #806: stdin relay — forward parent stdin to the child's piped stdin.
+    // The thread exits when: (a) parent stdin reaches EOF (pipe closed), or
+    // (b) the child dies and the next write returns BrokenPipe.
+    // No explicit join: wait_with_limits returns → exec_buffered returns →
+    // process exits → OS reaps the relay thread.
+    if isolate && let Some(child_stdin) = child.stdin.take() {
+        std::thread::Builder::new()
+            .name("stdin-relay".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut child_w = child_stdin;
+                let mut parent_r = io::stdin().lock();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match parent_r.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if child_w.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+                drop(child_w);
+            })
+            .ok();
+    }
 
     let (max_bytes, timeout) = exec_limits(command);
     let output = wait_with_limits(child, max_bytes, timeout, isolate);
@@ -1124,6 +1173,62 @@ mod exec_tests {
         assert!(group_gone, "process group {pgid} must be fully reaped");
     }
 
+    /// #806: piped stdin must be forwarded to the child via Stdio::piped()
+    /// + relay, not nulled. Tests the relay pattern: write data to child
+    /// stdin, close it (EOF), child reads and exits.
+    #[cfg(unix)]
+    #[test]
+    fn stdin_relay_forwards_piped_data() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt as _;
+
+        let mut cmd = std::process::Command::new("cat");
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("failed to spawn cat");
+
+        let mut child_stdin = child.stdin.take().unwrap();
+        std::thread::spawn(move || {
+            child_stdin.write_all(b"hello from pipe\n").unwrap();
+            drop(child_stdin);
+        });
+
+        let output = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("hello from pipe"),
+            "#806: piped stdin must reach the child, got: {stdout}"
+        );
+    }
+
+    /// #806: commands that don't read stdin must still work normally
+    /// when no data is piped (relay thread sees immediate EOF from parent).
+    #[cfg(unix)]
+    #[test]
+    fn stdin_relay_no_data_does_not_hang() {
+        let start = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo ok"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        // Close stdin immediately (simulates relay with empty parent pipe)
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must not hang when stdin is closed immediately, took {elapsed:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("ok"), "command output missing: {stdout}");
+    }
+
     #[test]
     fn heavy_commands_get_higher_byte_limits() {
         // exec_limits owns the byte ceiling; timeout resolution is covered by
@@ -1140,6 +1245,11 @@ mod exec_tests {
             // preflight) must not be killed at the default ceiling (#854).
             "git commit --amend --no-edit",
             "git push -u origin HEAD",
+            // Agents prefix with `cd /path && ...` — heavy detection must
+            // look through it to avoid 120s timeout on builds.
+            "cd /some/path && cargo test --lib",
+            "cd /foo/bar && cargo build --release",
+            "cd /workspace; npm ci",
         ] {
             let (bytes, _) = super::exec_limits(cmd);
             assert_eq!(bytes, super::HEAVY_MAX_BYTES, "heavy byte limit for {cmd}");
@@ -1195,6 +1305,19 @@ mod exec_tests {
         );
         assert_eq!(super::shell_timeout("git status"), super::DEFAULT_TIMEOUT);
         assert_eq!(super::shell_timeout("ls -la"), super::DEFAULT_TIMEOUT);
+        // `cd ... && heavy` must resolve to HEAVY so agents don't get killed at 120s.
+        assert_eq!(
+            super::shell_timeout("cd /some/project && cargo test --lib"),
+            super::HEAVY_TIMEOUT
+        );
+        assert_eq!(
+            super::shell_timeout("cd /workspace && cargo build --release"),
+            super::HEAVY_TIMEOUT
+        );
+        assert_eq!(
+            super::shell_timeout("cd /app; npm ci"),
+            super::HEAVY_TIMEOUT
+        );
 
         // Per-tier env overrides win over the built-in constants. (Non-round
         // second values keep the literals clippy-clean and unambiguous.)

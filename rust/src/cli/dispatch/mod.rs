@@ -7,7 +7,7 @@ mod help;
 mod lifecycle;
 mod network;
 mod server;
-mod suggest;
+pub(crate) mod suggest;
 
 #[allow(clippy::wildcard_imports)]
 use analytics::*;
@@ -161,6 +161,10 @@ pub fn run() {
             }
             "embeddings" => {
                 crate::cli::embeddings_cmd::cmd_embeddings(&rest);
+                return;
+            }
+            "enable-gpu" | "gpu" => {
+                core::updater::enable_gpu(&rest);
                 return;
             }
             "rules" => {
@@ -431,6 +435,14 @@ pub fn run() {
                 }
                 return;
             }
+            "wrap" => {
+                crate::wrap::run_wrap(&rest);
+                return;
+            }
+            "unwrap" => {
+                crate::wrap::run_unwrap(&rest);
+                return;
+            }
             "status" => {
                 let code = status::run_cli(&rest);
                 if code != 0 {
@@ -689,6 +701,15 @@ pub fn run() {
                 super::export_rules::run(&rest);
                 return;
             }
+            "completions" => {
+                super::completions::run_completions(&rest);
+                return;
+            }
+            "__complete" => {
+                #[allow(non_snake_case)]
+                super::completions::run___complete(&rest);
+                return;
+            }
             "gotchas" | "bugs" => {
                 super::cloud::cmd_gotchas(&rest);
                 return;
@@ -712,12 +733,13 @@ pub fn run() {
                 // inside the handler (#1035), so they must NOT also carry the
                 // force-exit watchdog (which would `exit(1)` with no decision and
                 // wedge the host). The remaining hooks keep the simple zombie-guard.
-                if !matches!(action, "rewrite" | "redirect") {
+                if !matches!(action, "rewrite" | "redirect" | "deny") {
                     hook_handlers::arm_watchdog(std::time::Duration::from_secs(5));
                 }
                 match action {
                     "rewrite" => hook_handlers::handle_rewrite(),
                     "redirect" => hook_handlers::handle_redirect(),
+                    "deny" => hook_handlers::handle_deny(),
                     "read-dedup" => hook_handlers::handle_read_dedup(),
                     "observe" => hook_handlers::handle_observe(),
                     "copilot" => hook_handlers::handle_copilot(),
@@ -726,7 +748,7 @@ pub fn run() {
                     "rewrite-inline" => hook_handlers::handle_rewrite_inline(),
                     _ => {
                         eprintln!(
-                            "Usage: lean-ctx hook <rewrite|redirect|read-dedup|observe|copilot|codex-pretooluse|codex-session-start|rewrite-inline>"
+                            "Usage: lean-ctx hook <rewrite|redirect|deny|read-dedup|observe|copilot|codex-pretooluse|codex-session-start|rewrite-inline>"
                         );
                         eprintln!(
                             "  Internal commands used by agent hooks (Claude, Cursor, Copilot, etc.)"
@@ -978,10 +1000,7 @@ mod tests {
     #[test]
     fn quickstart_is_short_and_points_to_setup() {
         let q = quickstart_text();
-        assert!(
-            q.contains("lean-ctx onboard"),
-            "quickstart must point to onboard"
-        );
+        assert!(q.contains("lean-ctx wrap"), "quickstart must point to wrap");
         assert!(q.contains("lean-ctx help"), "quickstart must point to help");
         // Must stay a *quickstart*, not the full reference — keep it tight.
         assert!(
@@ -998,7 +1017,7 @@ mod tests {
     #[test]
     fn concise_help_is_short_and_points_to_full() {
         let h = concise_help_text();
-        assert!(h.contains("lean-ctx onboard"), "must lead with onboard");
+        assert!(h.contains("lean-ctx wrap"), "must lead with wrap");
         assert!(
             h.contains("lean-ctx help all"),
             "must point to full reference"

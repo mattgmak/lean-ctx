@@ -3,7 +3,7 @@
 //! An addon's tool result is **untrusted content** that flows straight into the
 //! model context — both an exfiltration surface (the addon could echo back a
 //! secret it read) and a prompt-injection surface. Before the gateway hands a
-//! downstream result to the model ([`crate::core::gateway::proxy`]), it runs the
+//! downstream result to the model ([`crate::core::mcp_catalog::proxy`]), it runs the
 //! output through the same redaction the shell layer uses (single source of
 //! truth: [`crate::core::redaction`] + [`crate::core::secret_detection`]) and
 //! records an audit line tagging the bytes as untrusted, attributed to the

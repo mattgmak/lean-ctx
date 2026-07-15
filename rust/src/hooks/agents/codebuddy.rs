@@ -5,6 +5,59 @@ use super::super::{
 };
 use super::shared::remove_all_blocks;
 
+pub(crate) fn install_codebuddy_permissions_deny_replace(home: &std::path::Path) {
+    let settings_path =
+        crate::core::editor_registry::codebuddy_state_dir(home).join("settings.json");
+
+    let mut json = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            crate::core::jsonc::parse_jsonc(&content).unwrap_or_else(|_| serde_json::json!({}))
+        }
+    } else {
+        let _ = std::fs::create_dir_all(settings_path.parent().unwrap_or(home.as_ref()));
+        serde_json::json!({})
+    };
+
+    let Some(obj) = json.as_object_mut() else {
+        return;
+    };
+
+    let permissions = obj
+        .entry("permissions")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(perm_obj) = permissions.as_object_mut() else {
+        return;
+    };
+    let deny = perm_obj
+        .entry("deny")
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(arr) = deny.as_array_mut() else {
+        return;
+    };
+
+    let deny_tools = ["Read", "Grep", "Glob", "Bash"];
+    let mut changed = false;
+    for tool in deny_tools {
+        let val = serde_json::Value::String(tool.to_string());
+        if !arr.contains(&val) {
+            arr.push(val);
+            changed = true;
+        }
+    }
+
+    if changed {
+        if let Ok(out) = serde_json::to_string_pretty(&json) {
+            let _ = std::fs::write(&settings_path, out);
+        }
+        if !mcp_server_quiet_mode() {
+            eprintln!("  \x1b[32m✓\x1b[0m CodeBuddy permissions.deny installed (Replace mode)");
+        }
+    }
+}
+
 pub(crate) fn install_codebuddy_hook_with_mode(global: bool, mode: HookMode) {
     let Some(home) = crate::core::home::resolve_home_dir() else {
         tracing::error!("Cannot resolve home directory");
@@ -14,8 +67,12 @@ pub(crate) fn install_codebuddy_hook_with_mode(global: bool, mode: HookMode) {
     install_codebuddy_hook_scripts(&home);
     install_codebuddy_hook_config(&home);
 
-    if matches!(mode, HookMode::Hybrid | HookMode::Mcp) {
+    if matches!(mode, HookMode::Hybrid | HookMode::Mcp | HookMode::Replace) {
         install_codebuddy_mcp_server(&home);
+    }
+
+    if mode == HookMode::Replace {
+        install_codebuddy_permissions_deny_replace(&home);
     }
 
     let scope = crate::core::config::Config::load().rules_scope_effective();
@@ -97,6 +154,26 @@ const CODEBUDDY_MD_BLOCK_VERSION: &str = "lean-ctx-codebuddy-v3";
 // v3 (#1008 / GL #1144): anchored editing routes to `ctx_patch` (now advertised
 // in the lazy core for CodeBuddy); `ctx_edit` demoted to a legacy power-profile
 // mention. Native Read → Edit stays fully supported (v2 guard semantics).
+const CODEBUDDY_MD_BLOCK_CONTENT_REPLACE: &str = "\
+<!-- lean-ctx -->
+<!-- lean-ctx-codebuddy-v3 -->
+## lean-ctx — Replace Mode (native tools denied)
+
+Native Read/Grep/Glob/Bash are denied by policy. Use ONLY `ctx_*` MCP tools:
+- `ctx_read` for ALL file reads (cached, 10 modes, re-reads ~13 tokens)
+- `ctx_shell` for ALL shell commands (95+ compression patterns)
+- `ctx_search` instead of Grep/rg (compact results)
+- `ctx_tree` instead of ls/find (compact directory maps)
+- `ctx_glob` instead of Glob (file pattern matching)
+- Edits: `ctx_read(mode=\"anchored\")` → `ctx_patch` (line+hash anchors, never echo old text; `op=create` for new files).
+
+Write and Delete — use native tools normally.
+Do NOT attempt native Read, Grep, Glob, or Bash — they will be denied.
+
+Read modes: anchored (edit), full (verbatim), map (overview), signatures (API), diff (post-edit), lines:N-M (range), auto.
+Details live in the `lean-ctx` skill (loads on demand — keep this file lean).
+<!-- /lean-ctx -->";
+
 const CODEBUDDY_MD_BLOCK_CONTENT_MCP: &str = "\
 <!-- lean-ctx -->
 <!-- lean-ctx-codebuddy-v3 -->
@@ -136,17 +213,18 @@ fn install_codebuddy_global_codebuddy_md_for_mode(home: &std::path::Path, mode: 
 
     let existing = std::fs::read_to_string(&codebuddy_md_path).unwrap_or_default();
     let block = match mode {
+        HookMode::Replace => CODEBUDDY_MD_BLOCK_CONTENT_REPLACE,
         HookMode::Mcp | HookMode::Hybrid => CODEBUDDY_MD_BLOCK_CONTENT_MCP,
     };
-    let block_version = match mode {
-        HookMode::Mcp | HookMode::Hybrid => CODEBUDDY_MD_BLOCK_VERSION,
-    };
+    let block_version = CODEBUDDY_MD_BLOCK_VERSION;
 
-    // A single up-to-date block needs no rewrite. Otherwise — a stale version
-    // *or* duplicate blocks accumulated from the pre-#549 marker mismatch —
-    // collapse every lean-ctx block and write exactly one canonical copy back.
+    // A single up-to-date block needs no rewrite. Check both version tag AND
+    // mode-specific content — the Replace and MCP blocks share the version tag
+    // but have different instructions.
     let block_count = existing.matches(CODEBUDDY_MD_BLOCK_START).count();
-    if block_count == 1 && existing.contains(block_version) {
+    let is_replace_block = existing.contains("denied by policy");
+    let mode_matches = matches!(mode, HookMode::Replace) == is_replace_block;
+    if block_count == 1 && existing.contains(block_version) && mode_matches {
         return;
     }
     let cleaned = remove_all_blocks(&existing, CODEBUDDY_MD_BLOCK_START, CODEBUDDY_MD_BLOCK_END);

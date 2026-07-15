@@ -8,14 +8,23 @@ use super::*;
 use crate::core::config::CompressionLevel;
 use crate::core::rules_canonical::{END_MARK, RULES_VERSION, RulesFile, START_MARK, Wrapper};
 
+fn power() -> crate::core::tool_profiles::ToolProfile {
+    crate::core::tool_profiles::ToolProfile::Power
+}
+
 fn shared_content() -> String {
-    crate::core::rules_canonical::render(false, Wrapper::Shared, CompressionLevel::Off)
+    crate::core::rules_canonical::render(false, Wrapper::Shared, CompressionLevel::Off, &power())
 }
 
 fn dedicated_content_cached() -> &'static str {
     static RULES: OnceLock<String> = OnceLock::new();
     RULES.get_or_init(|| {
-        crate::core::rules_canonical::render(false, Wrapper::Dedicated, CompressionLevel::Off)
+        crate::core::rules_canonical::render(
+            false,
+            Wrapper::Dedicated,
+            CompressionLevel::Off,
+            &power(),
+        )
     })
 }
 
@@ -45,8 +54,12 @@ fn dedicated_rules_have_markers() {
 
 #[test]
 fn shadow_dedicated_omits_mapping() {
-    let rules =
-        crate::core::rules_canonical::render(true, Wrapper::Dedicated, CompressionLevel::Off);
+    let rules = crate::core::rules_canonical::render(
+        true,
+        Wrapper::Dedicated,
+        CompressionLevel::Off,
+        &power(),
+    );
     assert!(
         !rules.contains("MUST USE"),
         "shadow must not include tool mapping"
@@ -61,7 +74,12 @@ fn shadow_dedicated_omits_mapping() {
 
 #[test]
 fn shadow_shared_omits_mapping() {
-    let rules = crate::core::rules_canonical::render(true, Wrapper::Shared, CompressionLevel::Off);
+    let rules = crate::core::rules_canonical::render(
+        true,
+        Wrapper::Shared,
+        CompressionLevel::Off,
+        &power(),
+    );
     assert!(
         !rules.contains("MANDATORY MAPPING"),
         "shadow shared must not include mapping header"
@@ -154,6 +172,7 @@ fn cursor_mdc_has_frontmatter_and_markers() {
         &RulesFormat::CursorMdc,
         CompressionLevel::Off,
         Wrapper::Dedicated,
+        &power(),
     );
     assert!(mdc.contains("alwaysApply: true"));
     assert!(mdc.contains(START_MARK));
@@ -224,7 +243,7 @@ fn inject_cursor_switches_profile_when_hooks_appear() {
     assert!(result.errors.is_empty());
     let after = std::fs::read_to_string(&mdc_path).unwrap();
     assert!(
-        !after.contains("MANDATORY MAPPING") && after.contains("hooks cover this session"),
+        after.contains("ALWAYS prefer lean-ctx") && after.contains("Hooks compress native"),
         "with hooks installed the mdc must carry the HookCovered profile"
     );
     assert!(
@@ -251,7 +270,7 @@ fn rules_file_merged_replaces_section_preserving_user_content() {
     assert_eq!(file.version(), 0);
     assert!(!file.is_current());
 
-    let merged = file.merged(false, Wrapper::Shared, CompressionLevel::Off);
+    let merged = file.merged(false, Wrapper::Shared, CompressionLevel::Off, &power());
     std::fs::write(&path, &merged).unwrap();
 
     let result = std::fs::read_to_string(&path).unwrap();
@@ -272,7 +291,7 @@ fn rules_file_merged_appends_when_no_section() {
     let file = RulesFile::parse(content);
     assert!(!file.has_content());
 
-    let merged = file.merged(false, Wrapper::Shared, CompressionLevel::Off);
+    let merged = file.merged(false, Wrapper::Shared, CompressionLevel::Off, &power());
     assert!(merged.contains("user content only"));
     assert!(merged.contains(START_MARK));
 }

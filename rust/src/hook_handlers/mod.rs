@@ -14,10 +14,12 @@ const HOOK_STDIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// bounded here and FAILS OPEN instead of wedging the host's tool call (#1035).
 const HOOK_GATING_TIMEOUT: Duration = Duration::from_secs(15);
 mod dedup;
+mod deny;
 mod edit_health;
 mod observe;
 mod payload;
 mod read_dedup;
+pub use deny::handle_deny;
 pub use observe::*;
 pub use read_dedup::handle_read_dedup;
 #[cfg(test)]
@@ -184,8 +186,21 @@ fn is_shell_tool(tool_name: &str) -> bool {
             | "bash"
             | "Shell"
             | "shell"
+            | "sh"
             | "runInTerminal"
             | "run_in_terminal"
+            | "run_terminal"
+            | "runterminal"
+            | "run_command"
+            | "run_shell_command"
+            | "execute_command"
+            | "exec_command"
+            | "command_exec"
+            | "run"
+            | "exec"
+            | "execute"
+            | "command"
+            | "cmd"
             | "terminal"
             | "PowerShell"
             | "powershell"
@@ -483,145 +498,11 @@ fn is_outside_project_path(path: &str) -> bool {
     false
 }
 
-/// Rewrites `rg <pattern> [path]` (and PowerShell `Select-String`/`sls`, #561) to
-/// `lean-ctx grep <pattern> [path]` for simple forms.
-fn rewrite_search_command(cmd: &str, binary: &str) -> Option<String> {
-    let parts = shell_tokenize(cmd);
-    match parts.first().map(String::as_str) {
-        Some("rg") => {
-            if parts.len() < 2 || parts.len() > 3 || parts[1].starts_with('-') {
-                return None;
-            }
-            let pattern = &parts[1];
-            match parts.get(2) {
-                Some(p) if p.starts_with('-') => None,
-                Some(p) => Some(format!("{binary} grep {pattern} {}", shell_quote(p))),
-                None => Some(format!("{binary} grep {pattern}")),
-            }
-        }
-        Some("Select-String" | "sls") => rewrite_select_string(&parts, binary),
-        _ => None,
-    }
-}
-
-/// Maps `Select-String`/`sls` to `lean-ctx grep`, honoring `-Pattern` and
-/// `-Path`/`-LiteralPath` plus the positional `<pattern> [path]` form. Patterns are
-/// quoted (PowerShell patterns often contain spaces). Any other flag, a missing
-/// pattern, or extra operands makes it pass through.
-fn rewrite_select_string(parts: &[String], binary: &str) -> Option<String> {
-    let mut pattern: Option<String> = None;
-    let mut path: Option<String> = None;
-    let mut i = 1;
-    while i < parts.len() {
-        if let Some(flag) = parts[i].strip_prefix('-') {
-            let value = parts.get(i + 1);
-            match flag.to_ascii_lowercase().as_str() {
-                "pattern" => pattern = Some(value?.clone()),
-                "path" | "literalpath" => path = Some(value?.clone()),
-                _ => return None,
-            }
-            i += 2;
-        } else if pattern.is_none() {
-            pattern = Some(parts[i].clone());
-            i += 1;
-        } else if path.is_none() {
-            path = Some(parts[i].clone());
-            i += 1;
-        } else {
-            return None;
-        }
-    }
-    let pattern = shell_quote(&pattern?);
-    match path {
-        Some(p) if is_outside_project_path(&p) => None,
-        Some(p) => Some(format!("{binary} grep {pattern} {}", shell_quote(&p))),
-        None => Some(format!("{binary} grep {pattern}")),
-    }
-}
-
-/// Rewrites simple `ls [path]` (and PowerShell `Get-ChildItem`/`gci`, #561) to
-/// `lean-ctx ls [path]`.
-fn rewrite_dir_list_command(cmd: &str, binary: &str) -> Option<String> {
-    let parts = shell_tokenize(cmd);
-    match parts.first().map(String::as_str) {
-        Some("ls") => match parts.len() {
-            1 => Some(format!("{binary} ls")),
-            2 if !parts[1].starts_with('-') => {
-                Some(format!("{binary} ls {}", shell_quote(&parts[1])))
-            }
-            _ => None,
-        },
-        Some("Get-ChildItem" | "gci") => rewrite_get_childitem(&parts, binary),
-        _ => None,
-    }
-}
-
-/// Maps `Get-ChildItem`/`gci` to `lean-ctx ls`, honoring `-Path`/`-LiteralPath` and the
-/// positional path. Other flags (e.g. `-Recurse`, `-Filter`) or extra operands pass
-/// through.
-fn rewrite_get_childitem(parts: &[String], binary: &str) -> Option<String> {
-    let mut path: Option<String> = None;
-    let mut i = 1;
-    while i < parts.len() {
-        if let Some(flag) = parts[i].strip_prefix('-') {
-            let value = parts.get(i + 1);
-            match flag.to_ascii_lowercase().as_str() {
-                "path" | "literalpath" => path = Some(value?.clone()),
-                _ => return None,
-            }
-            i += 2;
-        } else if path.is_none() {
-            path = Some(parts[i].clone());
-            i += 1;
-        } else {
-            return None;
-        }
-    }
-    match path {
-        Some(p) => Some(format!("{binary} ls {}", shell_quote(&p))),
-        None => Some(format!("{binary} ls")),
-    }
-}
-
-/// Tokenize a shell command respecting single/double quotes and backslash escapes.
-pub fn shell_tokenize(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = input.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '\\' if !in_single => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            c if c.is_whitespace() && !in_single && !in_double => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/// Quote a path/arg for shell if it contains spaces or special chars.
-pub fn shell_quote(s: &str) -> String {
-    if s.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == '\\') {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        s.to_string()
-    }
-}
+// Search/dir-list rewriting and shell tokenization extracted to
+// `search_rewrite` submodule (#660 LOC gate).
+mod search_rewrite;
+use search_rewrite::{rewrite_dir_list_command, rewrite_search_command};
+pub use search_rewrite::{shell_quote, shell_tokenize};
 
 fn parse_head_tail_args<'a>(args: &[&'a str]) -> (Option<usize>, Option<&'a str>) {
     let mut n: Option<usize> = None;
@@ -791,14 +672,19 @@ fn produce_redirect_output(kind: RedirectKind, tool_args: Option<&serde_json::Va
 
 /// Argv for the `lean-ctx read` subprocess a redirected native Read runs.
 ///
-/// Pinned to `-m full` (verbatim, edit-ready content). The default `auto`
-/// mode degrades a large file to a structure MAP — signatures, not content —
-/// so the host's native Read would receive the wrong thing and silently
-/// ignore `offset`/`limit` (#1021). With the temp file holding faithful full
-/// content the host applies its own `offset`/`limit` to it, so windowed reads
-/// keep working without lean-ctx having to reimplement them.
-fn redirect_read_args(path: &str) -> [&str; 4] {
-    ["read", path, "-m", "full"]
+/// Smart mode selection: windowed reads (offset/limit) use `full-compact` to
+/// preserve line structure for correct indexing. Full reads use `auto` which
+/// selects the optimal compression mode (signatures, map, etc.) — achieving
+/// 87-97% compression vs ~5% for full-compact. Safe on Cursor because
+/// StrReplace does NOT fire a Read PreToolUse (validated by edit-probe PoC).
+fn redirect_read_args(path: &str, is_windowed: bool) -> Vec<String> {
+    let mode = if is_windowed { "full-compact" } else { "auto" };
+    vec![
+        "read".to_string(),
+        path.to_string(),
+        "-m".to_string(),
+        mode.to_string(),
+    ]
 }
 
 /// Redirect Read through lean-ctx for compression + caching.
@@ -861,27 +747,29 @@ fn redirect_read(tool_input: Option<&serde_json::Value>) -> String {
 
     let binary = resolve_binary();
     let temp_path = redirect_temp_path(&path);
+    let is_windowed =
+        tool_input.is_some_and(|v| v.get("offset").is_some() || v.get("limit").is_some());
+    let args = redirect_read_args(&path, is_windowed);
+    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    if let Some(output) = run_with_timeout(
-        &binary,
-        &redirect_read_args(&path),
-        REDIRECT_SUBPROCESS_TIMEOUT,
-    ) {
+    if let Some(output) = run_with_timeout(&binary, &args_refs, REDIRECT_SUBPROCESS_TIMEOUT) {
         // #1019: never prepend a banner to `output` — it is written to the temp
         // file the host reads *as the file's content*, so an edit would round-trip
         // the banner back into the real file (it corrupted config.toml). The
         // shadow nudge rides the model-visible `additionalContext` side channel
         // instead, and the intercept is still recorded in shadow.log.
         //
-        // Redirect-suffix (post-#1019): when the model hasn't called any ctx_*
-        // tool recently, we append a single-line separator at the end. This is
-        // safe because edits write to the *original* path, not the temp file.
-        let mut final_output = output;
-        if let Ok(data_dir) = crate::core::data_dir::lean_ctx_data_dir()
-            && crate::server::bypass_hint::model_is_drifting(&data_dir)
-        {
-            final_output.extend_from_slice(crate::server::bypass_hint::REDIRECT_SUFFIX.as_bytes());
-        }
+        // #778/#marker-contamination: NEVER append REDIRECT_SUFFIX to the temp
+        // file content. The host reads this file as if it were the real source;
+        // if the agent then copies it back (StrReplace/Edit), the marker leaks
+        // into source code. The nudge now travels via additionalContext (gated
+        // by inject_context) or not at all — the drifting detection still feeds
+        // the radar log and ctx_knowledge for non-destructive recall.
+        let final_output = output;
+        let drifting = matches!(
+            crate::core::data_dir::lean_ctx_data_dir(),
+            Ok(ref d) if crate::server::bypass_hint::model_is_drifting(d)
+        );
         if !final_output.is_empty() && std::fs::write(&temp_path, &final_output).is_ok() {
             let temp_str = temp_path.to_str().unwrap_or("");
             debug_log::log_hook_decision(
@@ -891,13 +779,24 @@ fn redirect_read(tool_input: Option<&serde_json::Value>) -> String {
                 &path,
                 "redirected to ctx_read",
             );
-            let shadow_note = shadow.then(|| {
-                format!(
+            // #778: nudges only via additionalContext when inject_context is opted in
+            let note = if !inject_context_allowed() {
+                None
+            } else if shadow {
+                Some(format!(
                     "lean-ctx shadow mode: this Read was served by ctx_read(\"{path}\", \"full\"). Call ctx_read directly for better performance."
+                ))
+            } else if drifting {
+                Some(
+                    crate::server::bypass_hint::REDIRECT_SUFFIX
+                        .trim()
+                        .to_string(),
                 )
-            });
+            } else {
+                None
+            };
             log_shadow_intercept("Read", &path);
-            return build_redirect_output(tool_input, path_field, temp_str, shadow_note.as_deref());
+            return build_redirect_output(tool_input, path_field, temp_str, note.as_deref());
         }
     }
 
@@ -916,14 +815,20 @@ fn redirect_read(tool_input: Option<&serde_json::Value>) -> String {
 /// only faithful for `output_mode=content` (see [`redirect_grep`]). For
 /// `files_with_matches` the host would report the temp file itself as the match,
 /// and for `count` it would count lines in the temp file — both wrong. The hook
-/// is host-agnostic (Cursor defaults to `content`, Claude Code to
-/// `files_with_matches`), so an absent mode cannot be assumed safe: only an
-/// explicit `content` mode is redirectable. (GH #398 hook follow-up)
+/// Hosts disagree on the Grep default: Cursor defaults to `content`, Claude
+/// Code to `files_with_matches`. An explicit non-content mode (`count`,
+/// `files_with_matches`) must NOT be redirected — the path-swap would surface
+/// the temp file itself. When `output_mode` is absent, Cursor's default is
+/// `content`, so the redirect is safe there. (GH #398 hook follow-up)
 fn grep_content_mode(tool_input: Option<&serde_json::Value>) -> bool {
-    tool_input
-        .and_then(|ti| ti.get("output_mode"))
-        .and_then(|m| m.as_str())
-        == Some("content")
+    let Some(ti) = tool_input else {
+        return false;
+    };
+    match ti.get("output_mode").and_then(|m| m.as_str()) {
+        Some("content") => true,
+        Some(_) => false,
+        None => crate::core::config::read_redirect::hook_host_is_cursor(),
+    }
 }
 
 fn redirect_grep(tool_input: Option<&serde_json::Value>) -> String {
@@ -990,11 +895,16 @@ fn redirect_grep(tool_input: Option<&serde_json::Value>) -> String {
                 &format!("{pattern} in {search_path}"),
                 "redirected to ctx_search",
             );
-            let shadow_note = shadow.then(|| {
-                format!(
-                    "lean-ctx shadow mode: this Grep was served by ctx_search(\"{pattern}\", \"{search_path}\"). Call ctx_search directly for better performance."
-                )
-            });
+            // #778: shadow_note only when inject_context is opted in (cache-safe)
+            let shadow_note = shadow
+                .then(|| {
+                    inject_context_allowed().then(|| {
+                        format!(
+                            "lean-ctx shadow mode: this Grep was served by ctx_search(\"{pattern}\", \"{search_path}\"). Call ctx_search directly for better performance."
+                        )
+                    })
+                })
+                .flatten();
             log_shadow_intercept("Grep", &format!("{pattern} in {search_path}"));
             return build_redirect_output(tool_input, "path", temp_str, shadow_note.as_deref());
         }
@@ -1134,6 +1044,16 @@ fn redirect_temp_path(key: &str) -> std::path::PathBuf {
     temp_dir.join(format!("{hash:016x}.lctx"))
 }
 
+/// #778: Whether `additionalContext` injection is allowed.
+/// Default OFF — prevents prompt-cache invalidation on Anthropic models.
+/// Opt-in via `[code_health] inject_context = true` or `LEAN_CTX_INJECT_CONTEXT=1`.
+fn inject_context_allowed() -> bool {
+    std::env::var("LEAN_CTX_INJECT_CONTEXT").is_ok()
+        || crate::core::config::Config::load()
+            .code_health
+            .inject_context
+}
+
 fn build_redirect_output(
     tool_input: Option<&serde_json::Value>,
     field: &str,
@@ -1225,25 +1145,84 @@ fn codex_rewrite_output(rewritten: &str) -> String {
 
 pub fn handle_codex_pretooluse() {
     if is_disabled() {
+        print!("{}", codex_allow_output());
         return;
     }
     let binary = resolve_binary();
     let Some(input) = read_stdin_with_timeout(HOOK_STDIN_TIMEOUT) else {
+        // #809: always emit valid JSON — empty stdout is invalid for Codex CLI.
+        print!("{}", codex_allow_output());
         return;
     };
 
-    let tool = extract_json_field(&input, "tool_name");
-    if !matches!(tool.as_deref(), Some("Bash" | "bash")) {
+    // #809: use serde_json instead of ad-hoc extract_json_field.
+    // The old find('"field":') scanner could mis-parse deeply nested
+    // or heavily escaped payloads. serde_json handles all edge cases.
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&input) else {
+        print!("{}", codex_allow_output());
+        return;
+    };
+
+    let tool = parsed
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !matches!(tool, "Bash" | "bash") {
+        print!("{}", codex_allow_output());
         return;
     }
 
-    let Some(cmd) = extract_json_field(&input, "command") else {
+    // Codex sends command at top level or inside tool_input.
+    let cmd = parsed
+        .get("command")
+        .or_else(|| parsed.get("tool_input").and_then(|ti| ti.get("command")))
+        .and_then(|v| v.as_str());
+    let Some(cmd) = cmd else {
+        print!("{}", codex_allow_output());
         return;
     };
 
-    if let Some(rewritten) = rewrite_candidate(&cmd, &binary) {
+    if let Some(rewritten) = rewrite_candidate(cmd, &binary) {
         print!("{}", codex_rewrite_output(&rewritten));
+        return;
     }
+
+    // Replace mode: deny non-rewritable Bash calls (agent must use ctx_shell)
+    let mode = crate::hooks::recommend_hook_mode("codex");
+    if mode == crate::hooks::HookMode::Replace {
+        print!("{}", codex_deny_output(cmd));
+    } else {
+        // #809: always emit valid JSON — Codex CLI requires it.
+        print!("{}", codex_allow_output());
+    }
+}
+
+fn codex_deny_output(original_cmd: &str) -> String {
+    let msg = format!(
+        "Use ctx_shell instead — lean-ctx replace mode is active. \
+         Native Bash is denied for: {original_cmd:.80}",
+    );
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "reason": msg
+        }
+    })
+    .to_string()
+}
+
+/// Allow-passthrough output for the Codex PreToolUse hook (#809).
+/// Every code path must emit valid JSON — Codex CLI parses stdout as JSON
+/// and reports "invalid pre-tool-use JSON output" on empty/malformed output.
+fn codex_allow_output() -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow"
+        }
+    })
+    .to_string()
 }
 
 /// Emit SessionStart guidance through Codex's documented hidden-context channel.
@@ -1390,6 +1369,7 @@ fn resolve_binary() -> String {
     crate::core::portable_binary::resolve_portable_binary()
 }
 
+#[cfg(test)]
 fn extract_json_field(input: &str, field: &str) -> Option<String> {
     let key = format!("\"{field}\":");
     let key_pos = input.find(&key)?;
@@ -1415,5 +1395,35 @@ fn extract_json_field(input: &str, field: &str) -> Option<String> {
         return None;
     }
     let raw = &rest[..end];
-    Some(raw.replace("\\\"", "\"").replace("\\\\", "\\"))
+    Some(unescape_json_string(raw))
+}
+
+/// Single-pass JSON string unescaping (#787).
+///
+/// Handles \\, \", \n, \t, \r, \/ — the standard JSON escape sequences
+/// that agents actually emit in hook payloads. \uXXXX is passed through
+/// unchanged (extremely rare in shell commands, not worth the complexity).
+#[cfg(test)]
+fn unescape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('"') => out.push('"'),
+                Some('/') => out.push('/'),
+                Some('\\') | None => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }

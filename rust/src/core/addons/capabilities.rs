@@ -7,7 +7,7 @@
 //! restrictive value (no network, read-only filesystem, scrubbed environment).
 //!
 //! A declared block drives two real, *enforced* controls at the single gateway
-//! spawn point ([`crate::core::gateway::client`]):
+//! spawn point ([`crate::core::mcp_catalog::client`]):
 //!
 //! 1. the per-addon OS sandbox profile ([`super::sandbox`]) — network egress and
 //!    filesystem writes are wrapped via `sandbox-exec` (macOS) / `bwrap` (Linux),

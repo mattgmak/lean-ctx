@@ -31,7 +31,7 @@ fn main() {
     let data_dir = repo_data_dir();
     let mut failed = false;
 
-    let targets: Vec<(&str, fn(&str) -> Result<Snapshot, String>)> = vec![
+    let targets: Vec<(&str, Canonicalize)> = vec![
         ("addon_registry.json", canonical_addon),
         #[cfg(feature = "tree-sitter")]
         ("grammar_registry.json", canonical_grammar),
@@ -84,6 +84,9 @@ fn main() {
 }
 
 use lean_ctx::core::addons::registry_snapshot::{Snapshot, canonical_addon_registry};
+
+/// Canonicalizer for one registry file: raw JSON text -> validated `Snapshot`.
+type Canonicalize = fn(&str) -> Result<Snapshot, String>;
 
 fn canonical_addon(text: &str) -> Result<Snapshot, String> {
     canonical_addon_registry(text)

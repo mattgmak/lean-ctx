@@ -9,7 +9,7 @@ use lean_ctx::core::addons::audit as engine_audit;
 use lean_ctx::core::addons::manifest::AddonManifest;
 use lean_ctx::core::addons::scaffold as engine_scaffold;
 use lean_ctx::core::addons::trust::RiskLevel;
-use lean_ctx::core::gateway::TransportKind;
+use lean_ctx::core::mcp_catalog::TransportKind;
 
 /// Wire protocol an addon's MCP server speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,17 +1,23 @@
-//! Self-hosted org gateway run-mode (`gateway-server` feature).
+//! Self-hosted org gateway — the **Gateway pillar** deployment mode.
 //!
-//! Bundles the proxy (remote bind, enterprise#8), the per-request usage store
-//! (Postgres `usage_events`, enterprise#17/#18) and — in later waves — the
-//! admin usage API (enterprise#20) into one deployable server.
+//! Bundles the LLM proxy (`crate::proxy`), the per-request usage store
+//! (Postgres `usage_events`), and the admin console into one deployable
+//! server process.
 //!
-//! LOCAL_OPTIONAL by classification (`server_capabilities.rs`): compiled in or
-//! out, never gated by account/license/plan — an org can self-host its gateway
-//! with `cargo build --features gateway-server` and full functionality
-//! (Local-Free Invariant; commercial enforcement lives in lean-ctx-enterprise).
+//! # Cross-pillar coupling
 //!
-//! Fail-open is the design rule (enterprise#12): the store subscribes to the
-//! usage stream through `proxy::usage_sink` and persists asynchronously; a slow
-//! or down Postgres degrades metering, never live LLM traffic.
+//! `serve.rs` calls `proxy::start_proxy` to start the LLM proxy and wires
+//! `proxy::usage_sink` for async Postgres persistence. The proxy in turn
+//! mounts `gateway_server::user_api` and `gateway_server::mcp::proxy` routes
+//! (feature-gated). This bidirectional dependency is intentional: the
+//! gateway is a single process, not two services.
+//!
+//! # Invariants
+//!
+//! - **Local-Free**: compiled in or out via `--features gateway-server`,
+//!   never gated by account/license/plan (Local-Free Invariant).
+//! - **Fail-open**: a slow or down Postgres degrades metering, never live
+//!   LLM traffic.
 
 pub mod admin_api;
 pub mod admin_status;

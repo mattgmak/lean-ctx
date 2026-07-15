@@ -879,9 +879,10 @@ pub(super) fn resolve_reformat_scope(
     }
 }
 
-/// Single-Phase reformat: resolve address → scope, jail, require live IDE, run the
-/// IDE reformat, then Single-File evict (spec §5.3). No plan_hash, no preview.
-fn render_reformat(
+/// Jetbrains-arm renderer: run the IDE reformat and Single-File/Multi-File evict
+/// EVERY changed path (spec §5.3). No plan_hash, no preview. Keeping the full
+/// `changed_paths` list — and invalidating all of them — is the B2 contract.
+pub(super) fn render_reformat(
     backend: &mut dyn crate::lsp::backend::LspBackend,
     project_root: &str,
     query: &crate::lsp::backend::ReformatQuery,
@@ -903,6 +904,32 @@ fn render_reformat(
     )
 }
 
+/// Command-arm renderer (e.g. rustfmt, single file): hash the resolved single
+/// file before/after so the report is honest, and only invalidate when the bytes
+/// actually changed. blake3 runs on the resolved file path — NEVER a directory —
+/// so a no-op run reports "unchanged", not a false "changed" (B2).
+fn render_reformat_command(
+    template: &str,
+    abs_path: &str,
+    rel_path: &str,
+    project_root: &str,
+) -> String {
+    let before = crate::lsp::format::blake3_of(abs_path).ok();
+    if let Err(e) = crate::lsp::format::run_command_formatter(template, abs_path, project_root) {
+        return format!("ERROR: {e}");
+    }
+    let after = crate::lsp::format::blake3_of(abs_path).ok();
+    let changed = before.is_some() && before != after;
+    if changed {
+        crate::core::cli_cache::invalidate(abs_path);
+    }
+    let label = crate::lsp::format::command_label(template);
+    format!(
+        "reformat: '{rel_path}' via {label} — {}\n",
+        if changed { "changed" } else { "unchanged" }
+    )
+}
+
 pub(super) fn handle_reformat_refactor(args: &Value, project_root: &str) -> String {
     let (abs_path, rel_path, scope) = match resolve_reformat_scope(args, project_root) {
         Ok(t) => t,
@@ -912,19 +939,28 @@ pub(super) fn handle_reformat_refactor(args: &Value, project_root: &str) -> Stri
     if let Some(e) = deny_if_read_only(&abs_path) {
         return e;
     }
-    let mut backend = match live_jetbrains_backend(project_root) {
-        Ok(b) => b,
-        Err(e) => return format!("ERROR: {e}"),
-    };
-    let optimize_imports = args
-        .get("optimize_imports")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let query = crate::lsp::backend::ReformatQuery {
-        abs_path,
-        rel_path,
-        scope,
-        optimize_imports,
-    };
-    render_reformat(backend.as_mut(), project_root, &query)
+    // T4 formatter routing: an external command (e.g. rustfmt) formats the single
+    // file directly (no IDE needed); otherwise defer to the live JetBrains backend.
+    match crate::lsp::format::resolve_formatter(&abs_path) {
+        crate::lsp::format::Formatter::Command(template) => {
+            render_reformat_command(&template, &abs_path, &rel_path, project_root)
+        }
+        crate::lsp::format::Formatter::Jetbrains => {
+            let mut backend = match live_jetbrains_backend(project_root) {
+                Ok(b) => b,
+                Err(e) => return format!("ERROR: {e}"),
+            };
+            let optimize_imports = args
+                .get("optimize_imports")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let query = crate::lsp::backend::ReformatQuery {
+                abs_path,
+                rel_path,
+                scope,
+                optimize_imports,
+            };
+            render_reformat(backend.as_mut(), project_root, &query)
+        }
+    }
 }

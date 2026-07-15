@@ -247,6 +247,7 @@ pub fn contract_docs() -> Vec<ContractDoc> {
             1,
             Experimental,
         ),
+        doc("pillar-boundaries", "pillar-boundaries-v1.md", 1, Stable),
     ]
 }
 

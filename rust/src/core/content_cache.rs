@@ -237,6 +237,33 @@ pub fn clear() {
     c.total_bytes = 0;
 }
 
+/// Evict the oldest `percent` of entries by LRU clock. Used after index builds
+/// to release file contents that were only needed for chunking/tokenization.
+/// `percent` is clamped to `[0, 100]`.
+pub fn trim_oldest_percent(percent: u8) {
+    if CACHE.get().is_none() {
+        return;
+    }
+    let mut c = lock();
+    if c.map.is_empty() {
+        return;
+    }
+    let pct = (percent.min(100)) as usize;
+    let target_evictions = c.map.len() * pct / 100;
+    for _ in 0..target_evictions {
+        let Some(victim) = c
+            .map
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(p, _)| p.clone())
+        else {
+            break;
+        };
+        c.remove_entry(&victim);
+        c.evictions += 1;
+    }
+}
+
 /// Approximate resident heap used by cached contents, in bytes.
 pub fn memory_usage_bytes() -> usize {
     if CACHE.get().is_none() {

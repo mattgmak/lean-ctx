@@ -1,6 +1,6 @@
 //! Per-addon / per-tool usage metering (P5 — discovery & observability).
 //!
-//! Every gateway proxy call ([`crate::core::gateway::proxy`]) is attributed to
+//! Every gateway proxy call ([`crate::core::mcp_catalog::proxy`]) is attributed to
 //! its owning server and tool, and counted in a local ledger
 //! (`<data_dir>/addons/usage.json`). This is the foundation for marketplace
 //! analytics, builder dashboards and usage-metered billing (Track B) — without

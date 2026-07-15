@@ -7,6 +7,9 @@
 
 use std::path::Path;
 
+use super::addon_deps::{
+    addon_self_ref, install_declared_deps, refresh_pack_dependencies, resolve_declared_deps,
+};
 use crate::core::addons::manifest::AddonManifest;
 use crate::core::addons::revocation::RevocationList;
 use crate::core::addons::store::{ArtifactReceipt, InstalledStore};
@@ -286,7 +289,6 @@ fn cmd_add(target: &str, args: &[String]) {
         || target.starts_with('.')
         || target.starts_with('/')
         || Path::new(target).exists();
-    let mut pack_manifest: Option<crate::core::context_package::PackageManifest> = None;
     let (manifest, source) = if is_local_path {
         match AddonManifest::from_path(Path::new(target)) {
             Ok(m) => (m, "local".to_string()),
@@ -298,10 +300,7 @@ fn cmd_add(target: &str, args: &[String]) {
     } else if let Some(remote_ref) = crate::core::context_package::remote::parse_remote_ref(target)
     {
         match fetch_addon_pack(&remote_ref, flag_value(args, "--registry").as_deref()) {
-            Ok((m, s, pm)) => {
-                pack_manifest = Some(pm);
-                (m, s)
-            }
+            Ok((m, s)) => (m, s),
             Err(e) => {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -358,30 +357,18 @@ fn cmd_add(target: &str, args: &[String]) {
     print_install_preview(&manifest);
 
     // Depth-1 dependency resolution (GH #727): declared deps are part of the
-    // consent surface — resolve before asking, install after wiring succeeds.
-    let registry_base = crate::core::context_package::remote::registry_base(
-        flag_value(args, "--registry").as_deref(),
-    );
-    let reg_token = crate::core::context_package::remote::publish_token(None);
-    let resolved_deps = match pack_manifest.as_ref() {
-        Some(pm) if pm.dependencies.iter().any(|d| !d.optional) => {
-            match crate::core::context_package::deps::resolve_dependencies(
-                pm,
-                &registry_base,
-                reg_token.as_deref(),
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        _ => Vec::new(),
-    };
-    if !resolved_deps.is_empty() {
+    // consent surface — preview before asking, install before wiring. The
+    // dependency list lives in the addon manifest itself, so a local
+    // `lean-ctx-addon.toml` install resolves them the same as a hosted pack
+    // (Finding A).
+    // Self-dependency root: the addon's own scoped `@ns/slug` when the source
+    // names a namespace (hosted pack), else `None` (a local manifest cannot
+    // name itself) — never the bare `addon.name` slug (GH #727, Finding A).
+    let root_ref = addon_self_ref(&source);
+    let preview_deps = resolve_declared_deps(&manifest.dependencies, root_ref.as_deref(), args);
+    if !preview_deps.is_empty() {
         println!("\nDeclared dependencies (installed alongside, depth-1):");
-        for d in &resolved_deps {
+        for d in &preview_deps {
             println!("  + {}@{}", d.name, d.version);
         }
     }
@@ -398,7 +385,17 @@ fn cmd_add(target: &str, args: &[String]) {
         return;
     }
 
-    match provision_and_wire(manifest, &source, force, no_verify, &cfg) {
+    // The slice wired into `[mcp.env]` must be the versions the install step
+    // actually landed (lockfile honoured), never the preview's highest-match
+    // resolution — otherwise `{pack_dir:}` could point at a directory that does
+    // not exist (Finding B).
+    let installed_deps = if preview_deps.is_empty() {
+        Vec::new()
+    } else {
+        install_declared_deps(&manifest.dependencies, root_ref.as_deref(), args)
+    };
+
+    match provision_and_wire(manifest, &source, force, no_verify, &cfg, &installed_deps) {
         Ok((outcome, verified)) => {
             println!(
                 "\n✓ Installed `{}` → gateway server `{}`.",
@@ -409,23 +406,6 @@ fn cmd_add(target: &str, args: &[String]) {
             }
             if let Some(n) = verified {
                 println!("  Verified: {n} tool(s) reachable.");
-            }
-            if let Some(pm) = pack_manifest.as_ref().filter(|_| !resolved_deps.is_empty()) {
-                let project_root = super::common::detect_project_root(args);
-                if let Err(e) = super::pack_remote::install_declared_dependencies(
-                    pm,
-                    &registry_base,
-                    reg_token.as_deref(),
-                    &project_root,
-                    false,
-                ) {
-                    eprintln!("Error: dependency install failed: {e}");
-                    eprintln!(
-                        "  The addon itself is wired; re-run `lean-ctx addon add {}` to retry.",
-                        outcome.name
-                    );
-                    std::process::exit(1);
-                }
             }
             println!(
                 "  Its tools are reachable via `ctx_tools` (find/call). \
@@ -440,16 +420,34 @@ fn cmd_add(target: &str, args: &[String]) {
 }
 
 /// The impure provisioning pipeline `add` and `update` share, run after user
-/// consent: managed artifact (GH #725) → bootstrap (#1105) → health probe
-/// (#1076) → wire. On any error nothing is wired. Returns the install outcome
-/// plus the probed tool count (`None` with `--no-verify`).
+/// consent: pack-env expansion (#727) → managed artifact (GH #725) → bootstrap
+/// (#1105) → health probe (#1076) → wire. On any error nothing is wired.
+/// Returns the install outcome plus the probed tool count (`None` with
+/// `--no-verify`).
 fn provision_and_wire(
     mut manifest: AddonManifest,
     source: &str,
     force: bool,
     no_verify: bool,
     cfg: &crate::core::config::Config,
+    resolved_deps: &[crate::core::context_package::deps::ResolvedDep],
 ) -> Result<(install::InstallOutcome, Option<usize>), String> {
+    // Pack-dir delivery (GH #727): expand `{pack_dir:@ns/name}` in [mcp.env]
+    // against the resolved dependency versions. The caller installed those
+    // dependencies already, so every path burned into the wiring exists. The
+    // parameter *is* the ordering guarantee — this cannot be called before the
+    // deps are resolved.
+    if !manifest.mcp.env.is_empty() {
+        let store_root = crate::core::context_package::LocalRegistry::open()?
+            .root()
+            .to_path_buf();
+        manifest.mcp.env = crate::core::addons::pack_env::expand_pack_env(
+            &manifest.mcp.env,
+            resolved_deps,
+            &store_root,
+        )?;
+    }
+
     // Managed artifact (GH #725, Phase 1): a prebuilt binary for this platform
     // takes precedence over [install]/PATH. It lands in the managed bin dir
     // (never PATH), hash-verified; the gateway command is rewritten to the
@@ -543,14 +541,7 @@ fn provision_and_wire(
 fn fetch_addon_pack(
     remote_ref: &crate::core::context_package::remote::RemoteRef,
     registry_flag: Option<&str>,
-) -> Result<
-    (
-        AddonManifest,
-        String,
-        crate::core::context_package::PackageManifest,
-    ),
-    String,
-> {
+) -> Result<(AddonManifest, String), String> {
     use crate::core::context_package::{remote, verify};
 
     let base = remote::registry_base(registry_flag);
@@ -612,9 +603,11 @@ fn fetch_addon_pack(
     let manifest = AddonManifest::from_toml(&payload.manifest_toml)?;
 
     let source = format!("ctxpkg:@{ns}/{name}@{}", info.version);
-    // The pack manifest rides along for depth-1 dependency resolution
-    // (GH #727): declared skills/context deps install with the addon.
-    Ok((manifest, source, pack_manifest))
+    // Depth-1 dependencies (GH #727) travel inside the addon manifest itself
+    // (`manifest.dependencies`, parsed from the pack's embedded TOML above), so
+    // they resolve the same on every source path — the hosted `pack_manifest`
+    // no longer needs to ride along.
+    Ok((manifest, source))
 }
 
 /// `addon publish [manifest] --namespace <ns>` — build the signed
@@ -740,7 +733,6 @@ fn cmd_update(name: &str, args: &[String]) {
     // Re-resolve from where it came: a hosted ctxpkg pack updates against the
     // registry it was installed from (latest non-yanked version), everything
     // else against the bundled registry snapshot.
-    let mut pack_manifest: Option<crate::core::context_package::PackageManifest> = None;
     let (manifest, update_source) = if let Some(spec) = entry.source.strip_prefix("ctxpkg:") {
         let unpinned = spec.split('@').take(2).collect::<Vec<_>>().join("@");
         let Some(remote_ref) = crate::core::context_package::remote::parse_remote_ref(&unpinned)
@@ -752,10 +744,7 @@ fn cmd_update(name: &str, args: &[String]) {
             std::process::exit(1);
         };
         match fetch_addon_pack(&remote_ref, flag_value(args, "--registry").as_deref()) {
-            Ok((m, s, pm)) => {
-                pack_manifest = Some(pm);
-                (m, s)
-            }
+            Ok((m, s)) => (m, s),
             Err(e) => {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -773,6 +762,11 @@ fn cmd_update(name: &str, args: &[String]) {
 
     let force = args.iter().any(|a| a == "--force" || a == "-f");
     let no_verify = args.iter().any(|a| a == "--no-verify");
+
+    // Self-dependency root: the addon's own scoped `@ns/slug` derived from the
+    // (hosted) update source, else `None` — never the bare `addon.name` slug
+    // (GH #727, Finding A). A `local` source already exited above.
+    let root_ref = addon_self_ref(&update_source);
 
     // Up-to-date check: same version and (for managed binaries) same artifact
     // pin ⇒ nothing to do. `--force` reinstalls anyway.
@@ -796,7 +790,7 @@ fn cmd_update(name: &str, args: &[String]) {
         );
         // A skills/context dependency may have bumped even when the addon
         // itself did not (GH #727) — refresh those without re-wiring.
-        refresh_pack_dependencies(pack_manifest.as_ref(), args);
+        refresh_pack_dependencies(&manifest.dependencies, root_ref.as_deref(), args);
         return;
     }
 
@@ -815,8 +809,26 @@ fn cmd_update(name: &str, args: &[String]) {
         return;
     }
 
+    let preview_deps = resolve_declared_deps(&manifest.dependencies, root_ref.as_deref(), args);
+    // The wiring must expand `{pack_dir:}` against the versions the install step
+    // actually landed (lockfile honoured), not the preview's highest-match
+    // resolution (GH #727, Finding B).
+    let installed_deps = if preview_deps.is_empty() {
+        Vec::new()
+    } else {
+        println!("Installing declared dependencies (depth-1) …");
+        install_declared_deps(&manifest.dependencies, root_ref.as_deref(), args)
+    };
+
     let new_version = manifest.addon.version.clone();
-    match provision_and_wire(manifest, &update_source, force, no_verify, &cfg) {
+    match provision_and_wire(
+        manifest,
+        &update_source,
+        force,
+        no_verify,
+        &cfg,
+        &installed_deps,
+    ) {
         Ok((outcome, verified)) => {
             // The new version is wired and healthy — now prune superseded
             // managed binaries (side-by-side rollback safety until here).
@@ -828,41 +840,12 @@ fn cmd_update(name: &str, args: &[String]) {
             if let Some(n) = verified {
                 println!("  Verified: {n} tool(s) reachable.");
             }
-            refresh_pack_dependencies(pack_manifest.as_ref(), args);
             println!("  Restart your MCP client to pick up the new version.");
         }
         Err(e) => {
             eprintln!("Error: {e}\n  The previous install remains wired.");
             std::process::exit(1);
         }
-    }
-}
-
-/// Re-resolve and install the declared dependencies of an addon's pack
-/// manifest (GH #727) — used on `addon update`, where a dependency can move
-/// forward independently of the addon binary.
-fn refresh_pack_dependencies(
-    pack_manifest: Option<&crate::core::context_package::PackageManifest>,
-    args: &[String],
-) {
-    let Some(pm) = pack_manifest else { return };
-    if pm.dependencies.iter().all(|d| d.optional) {
-        return;
-    }
-    let base = crate::core::context_package::remote::registry_base(
-        flag_value(args, "--registry").as_deref(),
-    );
-    let token = crate::core::context_package::remote::publish_token(None);
-    let project_root = super::common::detect_project_root(args);
-    println!("Refreshing declared dependencies (depth-1) …");
-    if let Err(e) = super::pack_remote::install_declared_dependencies(
-        pm,
-        &base,
-        token.as_deref(),
-        &project_root,
-        true,
-    ) {
-        eprintln!("Warning: dependency refresh failed: {e}\n  The addon update itself succeeded.");
     }
 }
 
@@ -939,7 +922,7 @@ fn cmd_revoke(name: &str, args: &[String]) {
             if InstalledStore::load().get(name).is_some() {
                 println!("  It is still installed — `lean-ctx addon remove {name}` to unwire it.");
             }
-            crate::core::gateway::catalog::invalidate();
+            crate::core::mcp_catalog::catalog::invalidate();
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -966,7 +949,7 @@ fn cmd_unrevoke(name: &str, args: &[String]) {
     match list.save() {
         Ok(()) => {
             println!("✓ Lifted revocation on `{name}`.");
-            crate::core::gateway::catalog::invalidate();
+            crate::core::mcp_catalog::catalog::invalidate();
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1028,7 +1011,7 @@ fn cmd_verify() {
 /// current directory. `--http` for an HTTP addon, `--force` to overwrite.
 fn cmd_init(args: &[String]) {
     use crate::core::addons::scaffold;
-    use crate::core::gateway::TransportKind;
+    use crate::core::mcp_catalog::TransportKind;
 
     let transport = if args.iter().any(|a| a == "--http") {
         TransportKind::Http
@@ -1180,7 +1163,7 @@ fn cmd_audit(target: &str) {
     );
     println!(
         "  binary pin:     {}",
-        if manifest.mcp.transport == crate::core::gateway::TransportKind::Http {
+        if manifest.mcp.transport == crate::core::mcp_catalog::TransportKind::Http {
             "n/a (http transport)"
         } else if report.binary_pinned {
             "pinned (sha256)"
@@ -1249,7 +1232,7 @@ fn cmd_audit(target: &str) {
 }
 
 /// Read the value following `flag` in `args` (e.g. `--reason "text"`).
-fn flag_value(args: &[String], flag: &str) -> Option<String> {
+pub(super) fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
@@ -1265,7 +1248,7 @@ fn print_install_preview(manifest: &AddonManifest) {
     );
     println!("  transport: {}", mcp.transport.as_str());
     match mcp.transport {
-        crate::core::gateway::TransportKind::Stdio => {
+        crate::core::mcp_catalog::TransportKind::Stdio => {
             println!("  command:   {}", mcp.command);
             if !mcp.args.is_empty() {
                 println!("  args:      {}", mcp.args.join(" "));
@@ -1284,7 +1267,7 @@ fn print_install_preview(manifest: &AddonManifest) {
                 );
             }
         }
-        crate::core::gateway::TransportKind::Http => {
+        crate::core::mcp_catalog::TransportKind::Http => {
             println!("  url:       {}", mcp.url);
             if !mcp.headers.is_empty() {
                 let keys: Vec<&str> = mcp.headers.keys().map(String::as_str).collect();
@@ -1359,7 +1342,7 @@ fn print_capabilities(manifest: &AddonManifest) {
             }
         }
         None => {
-            if manifest.mcp.transport == crate::core::gateway::TransportKind::Stdio {
+            if manifest.mcp.transport == crate::core::mcp_catalog::TransportKind::Stdio {
                 println!(
                     "\n  Capabilities: none declared — governed by `addons.sandbox` \
                      (set a [capabilities] block for a per-addon sandbox)."

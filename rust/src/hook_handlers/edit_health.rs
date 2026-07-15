@@ -34,14 +34,72 @@ struct Replacement {
 
 /// Parse, evaluate, and print a PostToolUse code-health notice for a native edit.
 /// No-op for non-edit events, non-source files, or sub-threshold edits.
+///
+/// #778: By default, notices route to `ctx_knowledge` + dashboard (non-destructive)
+/// instead of `additionalContext` stdout (which causes prompt-cache invalidation).
+/// Set `[code_health] inject_context = true` to opt into the old stdout behavior.
 pub(super) fn maybe_emit(input: &str) {
     let Ok(v) = serde_json::from_str::<Value>(input) else {
         return;
     };
     let root = resolve_root(&v);
     if let Some(notice) = edit_health_notice(&v, &root) {
-        emit_post_tool_use_context(&notice);
+        // Always persist to non-destructive channels (#778)
+        persist_notice_to_knowledge(&notice, &v, &root);
+
+        // Only inject additionalContext when explicitly opted in (cache-destructive)
+        if inject_context_enabled() {
+            emit_post_tool_use_context(&notice);
+        }
     }
+}
+
+/// Check if `additionalContext` injection is enabled (opt-in, default off).
+/// Env `LEAN_CTX_INJECT_CONTEXT=1` force-enables for debugging.
+fn inject_context_enabled() -> bool {
+    std::env::var("LEAN_CTX_INJECT_CONTEXT").is_ok() || Config::load().code_health.inject_context
+}
+
+/// Persist a health notice to `ctx_knowledge` so the agent sees it on the next
+/// `ctx_compose` call, and emit a ContextBus event so the dashboard shows the
+/// alert in real-time. Fire-and-forget: never blocks the hook, never panics.
+fn persist_notice_to_knowledge(notice: &str, payload: &Value, root: &str) {
+    let session_id = payload
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+
+    let file_path = super::payload::resolve_path_field(
+        super::payload::resolve_tool_args(payload).as_ref(),
+        super::payload::READ_PATH_FIELDS,
+    )
+    .map(|(_, p)| p)
+    .unwrap_or_default();
+
+    let key = if file_path.is_empty() {
+        "edit_regression".to_string()
+    } else {
+        format!("edit_regression:{file_path}")
+    };
+
+    let policy = crate::core::memory_policy::MemoryPolicy::default();
+    let _ = crate::core::knowledge::ProjectKnowledge::mutate_locked(root, |pk| {
+        pk.remember("code_health", &key, notice, session_id, 0.9, &policy);
+    });
+
+    // Emit ContextBus event so dashboard + subscribers see it in real-time
+    crate::core::context_os::emit_event(
+        root,
+        "code_health",
+        &crate::core::context_os::ContextEventKindV1::KnowledgeRemembered,
+        Some("edit_health_hook"),
+        serde_json::json!({
+            "category": "code_health",
+            "key": key,
+            "notice": notice,
+            "file": file_path,
+        }),
+    );
 }
 
 /// Project root for path resolution: the payload `cwd` (every Claude/Cursor hook
@@ -302,5 +360,22 @@ mod tests {
     fn no_notice_for_non_edit_event() {
         let v = json!({ "tool_name": "Read", "tool_input": { "file_path": "f.rs" } });
         assert!(notice_with(&v, "/tmp", GateMode::Warn, 15).is_none());
+    }
+
+    #[test]
+    fn inject_context_disabled_by_default() {
+        // #778: with default config, inject_context is false → no stdout emission
+        let _lock = crate::core::data_dir::test_env_lock();
+        crate::test_env::remove_var("LEAN_CTX_INJECT_CONTEXT");
+        assert!(!inject_context_enabled());
+    }
+
+    #[test]
+    fn inject_context_enabled_via_env() {
+        // #778: env override forces injection (for debugging/opt-in)
+        let _lock = crate::core::data_dir::test_env_lock();
+        crate::test_env::set_var("LEAN_CTX_INJECT_CONTEXT", "1");
+        assert!(inject_context_enabled());
+        crate::test_env::remove_var("LEAN_CTX_INJECT_CONTEXT");
     }
 }

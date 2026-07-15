@@ -54,6 +54,9 @@ pub fn classify_tool_name(name: &str) -> ToolResultKind {
         "read_many", // Gemini CLI `read_many_files`
         "read_files",
         "str_replace_editor", // view sub-mode returns file content
+        "ctx_patch",          // #818: diff previews are code — never abbreviate
+        "ctx_refactor",       // symbol edits return code diffs
+        "ctx_callgraph",      // callers/callees contain source snippets
     ];
     if FILE_READ.iter().any(|k| n.contains(k)) {
         return ToolResultKind::FileRead;
@@ -505,5 +508,33 @@ mod tests {
             WARN  slow response (842ms) from upstream\n\
             done in 3.2s (0 errors)\n";
         assert!(!looks_like_source_code(log));
+    }
+
+    /// #818: ctx_patch and ctx_refactor must be classified as FileRead
+    /// so their diff previews are never abbreviation-compressed.
+    #[test]
+    fn ctx_patch_and_refactor_classified_as_file_read() {
+        assert_eq!(classify_tool_name("ctx_patch"), ToolResultKind::FileRead);
+        assert_eq!(classify_tool_name("ctx_refactor"), ToolResultKind::FileRead);
+        assert_eq!(
+            classify_tool_name("ctx_callgraph"),
+            ToolResultKind::FileRead
+        );
+    }
+
+    /// #818: diff preview with - /+ prefixes must be protected.
+    #[test]
+    fn diff_preview_is_protected_when_kind_is_file_read() {
+        let diff = "--- src/main.rs\n\
+            - fn check_all_segments(command: &str, allowlist: &[String]) -> Result<(), ShellError> {\n\
+            -     if allowlist.is_empty() {\n\
+            -         return Ok(());\n\
+            + fn check_all_segments(cmd: &str, list: &[String]) -> Result<(), ShellError> {\n\
+            +     if list.is_empty() {\n\
+            +         return Ok(());\n";
+        assert!(
+            should_protect(ToolResultKind::FileRead, diff),
+            "diff preview must be protected when kind is FileRead"
+        );
     }
 }

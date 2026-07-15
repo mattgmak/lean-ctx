@@ -4,7 +4,7 @@
 //! [`lean-ctx-addon.toml`](manifest) manifest, so a third-party tool plugs into
 //! lean-ctx's MCP gateway with a single `lean-ctx addon add` — no fork, no
 //! recompile. Addons are user-global and reuse the gateway trust model
-//! (`[gateway]` is global-only and opt-in; see [`crate::core::gateway`]).
+//! (`[gateway]` is global-only and opt-in; see [`crate::core::mcp_catalog`]).
 //!
 //! Layers:
 //! - [`manifest`] — the `lean-ctx-addon.toml` contract (also the registry entry shape).
@@ -14,6 +14,8 @@
 //! - [`bootstrap`] — `[install]` block executor: provisions an addon's upstream
 //!   package via a pinned package manager (uv/pip/cargo/npm/brew/dotnet) on `add`,
 //!   uninstalls it on `remove` (#1105, Phase 2). Never goes through a shell.
+//! - [`pack_env`] — expands `{pack_dir:@ns/name}` in an addon's `[mcp.env]`
+//!   to the on-disk location of a declared `kind=skills` dependency (#727).
 //! - [`scaffold`] — `addon init` starter manifest generator (DX, P4).
 //!
 //! Security (#863, P1):
@@ -72,6 +74,7 @@ pub mod integrity;
 pub mod manifest;
 pub mod meter;
 pub mod ort_provision;
+pub mod pack_env;
 pub mod policy;
 pub mod publish;
 pub mod registry;

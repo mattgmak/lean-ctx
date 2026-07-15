@@ -170,7 +170,9 @@ fn current_extra_from_global() -> Vec<String> {
 
 /// Persists the extra list via the schema-validated setter (minimal-config round-trip).
 fn write_extra(extra: &[String]) -> Result<(), String> {
-    config::setter::set_by_key("shell_allowlist_extra", &extra.join(",")).map(|_| ())
+    config::setter::set_by_key("shell_allowlist_extra", &extra.join(","))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn print_usage() {

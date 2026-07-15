@@ -200,7 +200,10 @@ pub fn capture() {
 
 /// Load captured agent runtime variables, honoring the freshness TTL.
 ///
-/// Returns an empty map when no capture exists or it has expired.
+/// When no valid capture exists, falls back to probing the parent process's
+/// environment (#800). This covers the case where the lean-ctx MCP server was
+/// spawned by an agent that sets runtime vars only in native shell commands
+/// (e.g. Codex with CODEX_THREAD_ID) without going through `lean-ctx -c` first.
 #[must_use]
 pub fn load() -> BTreeMap<String, String> {
     let Some(path) = store_path() else {
@@ -208,7 +211,12 @@ pub fn load() -> BTreeMap<String, String> {
     };
     migrate_legacy_key_file(&path);
     let Some((vars, captured_at)) = read_store(&path) else {
-        return BTreeMap::new();
+        // No capture file — try probing the parent process environment (#800).
+        let probed = probe_parent_env();
+        if !probed.is_empty() {
+            persist_probed_vars(&path, &probed);
+        }
+        return probed;
     };
     if now_secs().saturating_sub(captured_at) > TTL_SECS {
         return BTreeMap::new();
@@ -226,6 +234,96 @@ pub fn load() -> BTreeMap<String, String> {
         scrub_store(&path, &cleaned, captured_at);
     }
     cleaned
+}
+
+/// Probe the parent process's environment for forwardable agent runtime
+/// variables (#800). On Linux reads `/proc/<ppid>/environ`; on macOS uses
+/// `ps eww`. Returns only non-credential forwardable vars.
+fn probe_parent_env() -> BTreeMap<String, String> {
+    let ppid = parent_pid();
+    if ppid == 0 {
+        return BTreeMap::new();
+    }
+    let raw_env = read_parent_environ(ppid);
+    raw_env
+        .into_iter()
+        .filter(|(key, _)| is_forwardable(key))
+        .collect()
+}
+
+fn parent_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: getppid() is always safe — it reads the kernel's ppid for
+        // the calling process, has no side effects, and cannot fail.
+        unsafe { libc::getppid() as u32 }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Read environment variables from a process. On Linux, reads
+/// `/proc/<pid>/environ` (NUL-separated key=value pairs). On macOS, falls
+/// back to parsing `ps eww <pid>` output.
+fn read_parent_environ(pid: u32) -> BTreeMap<String, String> {
+    // Linux: /proc/<pid>/environ is most reliable
+    #[cfg(target_os = "linux")]
+    if let Ok(data) = std::fs::read(format!("/proc/{pid}/environ")) {
+        return parse_null_separated_env(&data);
+    }
+
+    // macOS/fallback: ps eww gives env in a less structured format
+    #[cfg(target_os = "macos")]
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["eww", "-o", "command", "-p", &pid.to_string()])
+        .output()
+        && output.status.success()
+    {
+        return parse_ps_environ(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    let _ = pid;
+    BTreeMap::new()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_null_separated_env(data: &[u8]) -> BTreeMap<String, String> {
+    data.split(|&b| b == 0)
+        .filter_map(|entry| {
+            let s = std::str::from_utf8(entry).ok()?;
+            let (key, val) = s.split_once('=')?;
+            Some((key.to_string(), val.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ps_environ(output: &str) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    for line in output.lines().skip(1) {
+        for token in line.split_whitespace() {
+            if let Some((key, val)) = token.split_once('=')
+                && FORWARD_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            {
+                result.insert(key.to_string(), val.to_string());
+            }
+        }
+    }
+    result
+}
+
+fn persist_probed_vars(path: &Path, vars: &BTreeMap<String, String>) {
+    let payload = serde_json::json!({ "vars": vars, "captured_at": now_secs() });
+    if let Ok(json) = serde_json::to_string_pretty(&payload) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = crate::config_io::write_atomic(path, &json);
+    }
 }
 
 /// Rewrite the capture file with `vars` (preserving `captured_at`), or remove it

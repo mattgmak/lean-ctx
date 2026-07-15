@@ -447,6 +447,26 @@ impl ServerHandler for LeanCtxServer {
                 }
             };
 
+            // #1008: When ctx_patch is hidden for this client, scrub references
+            // from other tools' descriptions so the LLM never sees the name and
+            // won't attempt to call it. Replace with ctx_edit (visible alternative).
+            let tools = if quirks.hide_ctx_patch {
+                tools
+                    .into_iter()
+                    .map(|mut t| {
+                        if let Some(ref desc) = t.description
+                            && desc.contains("ctx_patch")
+                        {
+                            t.description =
+                                Some(desc.replace("ctx_patch", "ctx_edit").into());
+                        }
+                        t
+                    })
+                    .collect()
+            } else {
+                tools
+            };
+
             Ok(ListToolsResult {
                 tools,
                 ..Default::default()

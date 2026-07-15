@@ -90,7 +90,8 @@ pub(crate) fn single_dir_override() -> Option<PathBuf> {
     }
     let home = dirs::home_dir()?;
     let xdg_config_base = xdg_base("XDG_CONFIG_HOME", ".config").ok()?;
-    single_dir_override_fs(&home, &xdg_config_base)
+    let xdg_data_base = xdg_base("XDG_DATA_HOME", ".local/share").ok();
+    single_dir_override_fs(&home, &xdg_config_base, xdg_data_base.as_deref())
 }
 
 /// True when `p` is exactly the standard XDG data dir (`$XDG_DATA_HOME/lean-ctx`,
@@ -114,7 +115,11 @@ pub(crate) fn data_pin_diverges_config(pin: &Path) -> bool {
 }
 
 /// Filesystem half of [`single_dir_override`], parameterized for hermetic tests.
-fn single_dir_override_fs(home: &Path, xdg_config_base: &Path) -> Option<PathBuf> {
+fn single_dir_override_fs(
+    home: &Path,
+    xdg_config_base: &Path,
+    xdg_data_base: Option<&Path>,
+) -> Option<PathBuf> {
     // A committed XDG install is the single source of truth: never re-collapse
     // it onto a stray legacy/mixed data marker (GL #623). The pin lives next to
     // the mixed probe below, so the two reads always agree on `xdg_config_base`.
@@ -127,6 +132,17 @@ fn single_dir_override_fs(home: &Path, xdg_config_base: &Path) -> Option<PathBuf
     }
     let mixed = xdg_config_base.join("lean-ctx");
     if mixed.exists() && has_data_files(&mixed) {
+        // GL #623 follow-up: an already-split XDG install (real data under
+        // `$XDG_DATA_HOME/lean-ctx`) must NOT re-collapse config/state/cache/data
+        // onto the *config* dir just because a stray data marker leaked there
+        // (e.g. during an upgrade, before the layout pin is written). That would
+        // scatter stats/events/journal/sessions into `$XDG_CONFIG_HOME` and split
+        // history across two trees.
+        if let Some(data_base) = xdg_data_base
+            && has_data_files(&data_base.join("lean-ctx"))
+        {
+            return None;
+        }
         return Some(mixed);
     }
     None
@@ -347,7 +363,7 @@ mod tests {
         std::fs::write(legacy.join("stats.json"), "{}").unwrap();
 
         assert_eq!(
-            single_dir_override_fs(home.path(), xdg.path()),
+            single_dir_override_fs(home.path(), xdg.path(), None),
             Some(legacy)
         );
     }
@@ -362,7 +378,10 @@ mod tests {
         // lives alone in the config dir and must not trigger single-dir mode.
         std::fs::write(mixed.join("stats.json"), "{}").unwrap();
 
-        assert_eq!(single_dir_override_fs(home.path(), xdg.path()), Some(mixed));
+        assert_eq!(
+            single_dir_override_fs(home.path(), xdg.path(), None),
+            Some(mixed)
+        );
     }
 
     #[test]
@@ -376,7 +395,7 @@ mod tests {
         std::fs::write(mixed.join("config.toml"), "").unwrap();
         std::fs::write(mixed.join("shell-hook.zsh"), "").unwrap();
 
-        assert_eq!(single_dir_override_fs(home.path(), xdg.path()), None);
+        assert_eq!(single_dir_override_fs(home.path(), xdg.path(), None), None);
     }
 
     #[test]
@@ -391,7 +410,7 @@ mod tests {
         std::fs::write(mixed.join("stats.json"), "{}").unwrap();
 
         assert_eq!(
-            single_dir_override_fs(home.path(), xdg.path()),
+            single_dir_override_fs(home.path(), xdg.path(), None),
             Some(legacy)
         );
     }
@@ -409,7 +428,7 @@ mod tests {
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("stats.json"), "{}").unwrap();
 
-        assert_eq!(single_dir_override_fs(home.path(), xdg.path()), None);
+        assert_eq!(single_dir_override_fs(home.path(), xdg.path(), None), None);
     }
 
     #[test]
@@ -423,7 +442,42 @@ mod tests {
         let mixed = xdg.path().join("lean-ctx");
         std::fs::write(mixed.join("stats.json"), "{}").unwrap();
 
-        assert_eq!(single_dir_override_fs(home.path(), xdg.path()), None);
+        assert_eq!(single_dir_override_fs(home.path(), xdg.path(), None), None);
+    }
+
+    #[test]
+    fn split_install_ignores_stray_mixed_marker_when_xdg_data_present() {
+        // Regression: an XDG-split install with real data under
+        // `$XDG_DATA_HOME/lean-ctx` must not re-collapse onto the config dir just
+        // because a stray marker leaked into `$XDG_CONFIG_HOME/lean-ctx` before
+        // the layout pin was written (the upgrade window). Without the guard this
+        // scattered stats/events/journal/sessions into the config dir and split
+        // history across two trees.
+        let home = tempfile::tempdir().unwrap();
+        let xdg_config = tempfile::tempdir().unwrap();
+        let xdg_data = tempfile::tempdir().unwrap();
+
+        let mixed = xdg_config.path().join("lean-ctx");
+        std::fs::create_dir_all(&mixed).unwrap();
+        std::fs::write(mixed.join("stats.json"), "{}").unwrap();
+
+        let data = xdg_data.path().join("lean-ctx");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("stats.json"), "{}").unwrap();
+
+        assert_eq!(
+            single_dir_override_fs(home.path(), xdg_config.path(), Some(xdg_data.path())),
+            None,
+            "a populated XDG data dir must keep the config dir from collapsing"
+        );
+
+        // With no real data dir the stray marker still collapses (legacy
+        // single-dir semantics preserved).
+        let empty_data = tempfile::tempdir().unwrap();
+        assert_eq!(
+            single_dir_override_fs(home.path(), xdg_config.path(), Some(empty_data.path())),
+            Some(mixed)
+        );
     }
 
     #[test]
@@ -433,7 +487,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".lean-ctx")).unwrap();
         std::fs::create_dir_all(xdg.path().join("lean-ctx")).unwrap();
 
-        assert_eq!(single_dir_override_fs(home.path(), xdg.path()), None);
+        assert_eq!(single_dir_override_fs(home.path(), xdg.path(), None), None);
     }
 
     #[test]
@@ -444,7 +498,7 @@ mod tests {
         std::fs::create_dir_all(&mixed).unwrap();
         std::fs::write(mixed.join("random.txt"), "x").unwrap();
 
-        assert_eq!(single_dir_override_fs(home.path(), xdg.path()), None);
+        assert_eq!(single_dir_override_fs(home.path(), xdg.path(), None), None);
     }
 
     #[test]

@@ -56,7 +56,7 @@ pub fn compress(text: &str, level: &CompressionLevel) -> EngineResult {
         return result;
     }
 
-    if *level == CompressionLevel::Max {
+    if matches!(level, CompressionLevel::Max | CompressionLevel::Raw) {
         let fallback = compress_at_level(text, tokens_before, &CompressionLevel::Standard);
         if fallback.quality.passed {
             return fallback;
@@ -79,7 +79,7 @@ fn compress_at_level(text: &str, tokens_before: u32, level: &CompressionLevel) -
     let lines_total = lines.len();
 
     let threshold = match level {
-        CompressionLevel::Max => MAX_SCORE_THRESHOLD,
+        CompressionLevel::Max | CompressionLevel::Raw => MAX_SCORE_THRESHOLD,
         CompressionLevel::Standard => STANDARD_SCORE_THRESHOLD,
         CompressionLevel::Lite | CompressionLevel::Off => LOW_SCORE_THRESHOLD,
     };
@@ -116,7 +116,7 @@ fn compress_at_level(text: &str, tokens_before: u32, level: &CompressionLevel) -
     let filtered = kept_lines.join("\n");
 
     let quality_config = match level {
-        CompressionLevel::Max => QualityConfig {
+        CompressionLevel::Max | CompressionLevel::Raw => QualityConfig {
             min_identifier_preservation: 0.80,
             ..QualityConfig::default()
         },
@@ -144,7 +144,9 @@ fn compress_at_level(text: &str, tokens_before: u32, level: &CompressionLevel) -
     }
 
     let dict_level = match level {
-        CompressionLevel::Max | CompressionLevel::Standard => DictLevel::Full,
+        CompressionLevel::Max | CompressionLevel::Raw | CompressionLevel::Standard => {
+            DictLevel::Full
+        }
         CompressionLevel::Lite | CompressionLevel::Off => DictLevel::General,
     };
     let compressed = dictionaries::apply_dictionaries(&filtered, dict_level);

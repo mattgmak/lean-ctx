@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use crate::core::gateway::{GatewayServer, client};
+use crate::core::mcp_catalog::{GatewayServer, client};
 
 /// What a successful [`probe`] found on the downstream server.
 #[derive(Debug, Clone)]
@@ -45,7 +45,7 @@ pub fn probe(server: &GatewayServer, timeout: Duration) -> Result<ProbeReport, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::gateway::TransportKind;
+    use crate::core::mcp_catalog::TransportKind;
 
     #[test]
     fn probe_reports_a_clear_error_for_a_missing_binary() {

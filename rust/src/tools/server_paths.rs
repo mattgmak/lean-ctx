@@ -136,15 +136,16 @@ impl LeanCtxServer {
                                 &resolved,
                                 &new_root,
                                 &extra_roots,
-                            )?
+                            )
+                            .map_err(|e| e.to_string())?
                         } else {
-                            return Err(e);
+                            return Err(e.to_string());
                         }
                     } else {
-                        return Err(e);
+                        return Err(e.to_string());
                     }
                 } else {
-                    return Err(e);
+                    return Err(e.to_string());
                 }
             }
         };

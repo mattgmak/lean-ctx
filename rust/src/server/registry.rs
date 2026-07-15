@@ -49,10 +49,12 @@ impl ToolRegistry {
 
     /// Returns MCP Tool definitions for all registered tools.
     /// Used by `list_tools` to expose schemas to clients.
+    /// Applies MCP `ToolAnnotations` (readOnlyHint, destructiveHint) so clients
+    /// can make informed decisions about tool usage in restricted contexts.
     pub fn tool_defs(&self) -> Vec<Tool> {
         let mut defs: Vec<Tool> = self.tools.values().map(|t| t.tool_def()).collect();
         defs.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
-        defs
+        crate::tool_defs::apply_tool_annotations(defs)
     }
 
     /// Returns tool definitions filtered by the dynamic tool state.
@@ -69,7 +71,7 @@ impl ToolRegistry {
             .map(|t| t.tool_def())
             .collect();
         defs.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
-        defs
+        crate::tool_defs::apply_tool_annotations(defs)
     }
 
     /// Returns tool definitions filtered by a tool profile.
@@ -85,7 +87,7 @@ impl ToolRegistry {
             .map(|t| t.tool_def())
             .collect();
         defs.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
-        defs
+        crate::tool_defs::apply_tool_annotations(defs)
     }
 
     pub fn len(&self) -> usize {

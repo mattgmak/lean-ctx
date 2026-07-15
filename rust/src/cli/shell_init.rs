@@ -585,13 +585,18 @@ lean-ctx-status() {{
 }}
 
 if [ -n "${{ZSH_VERSION:-}}" ]; then
-    _lean_ctx_comp() {{
-        shift words
-        (( CURRENT-- ))
-        _normal
+    _lean-ctx() {{
+        local -a completions
+        local IFS=$'\n'
+        completions=(${{(f)"$(lean-ctx __complete zsh -- "${{words[@]:1}}")" }})
+        if (( ${{#completions}} )); then
+            _describe -t commands 'lean-ctx' completions
+        fi
     }}
-    compdef _lean_ctx_comp _lc 2>/dev/null
-    compdef _lean_ctx_comp _lc_compress 2>/dev/null
+    compdef _lean-ctx lean-ctx 2>/dev/null
+    compdef _lean-ctx lctx 2>/dev/null
+    compdef _lean-ctx _lc 2>/dev/null
+    compdef _lean-ctx _lc_compress 2>/dev/null
 fi
 
 _lean_ctx_should_activate() {{

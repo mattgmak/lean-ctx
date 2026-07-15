@@ -1,8 +1,7 @@
-//! MCP Tool-Catalog Gateway (#210).
+//! MCP Tool-Catalog Federation (#210) — **Engine pillar**.
 //!
-//! Turns lean-ctx into a gateway in front of any number of downstream MCP
-//! servers. Instead of injecting every downstream tool schema into the system
-//! prompt (the "more tools → less adoption" tax), the gateway:
+//! Federates downstream MCP servers into lean-ctx's tool surface. Instead of injecting every downstream tool schema into the system
+//! prompt (the "more tools → less adoption" tax), the catalog:
 //!
 //! 1. aggregates the downstream catalogs ([`catalog`]) behind a TTL cache,
 //! 2. ranks them per query with BM25 ([`router`]) into a top-N **ChoiceCard**
@@ -10,7 +9,7 @@
 //! 3. proxies the actual call to the owning server ([`client`]).
 //!
 //! Net effect: unlimited downstream tools at (roughly) constant context cost.
-//! Fully no-op until `gateway.enabled = true`.
+//! Fully no-op until `[mcp_catalog] enabled = true` in config.
 
 pub mod adapters;
 pub mod catalog;
@@ -182,7 +181,7 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::gateway::catalog::CatalogEntry;
+    use crate::core::mcp_catalog::catalog::CatalogEntry;
 
     fn outcome() -> FindOutcome {
         FindOutcome {

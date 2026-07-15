@@ -83,7 +83,7 @@ pub const COMPRESSION_BLOCK_END: &str = "<!-- /lean-ctx-compression -->";
 /// exploration on hook-covered hosts (Cursor).
 /// Bumping it forces every committed `LEAN-CTX.md` artifact to be regenerated
 /// (see `tests/rules_drift.rs`) and every injected user file to resync.
-pub const RULES_VERSION: usize = 6;
+pub const RULES_VERSION: usize = 8;
 
 /// Banner placed at the top of dedicated rule files (non-shadow only).
 pub const CRITICAL: &str = "CRITICAL: ALWAYS use lean-ctx ctx_* tools instead of native equivalents. \
@@ -124,7 +124,7 @@ pub const INTENT: &str = "\
 Tool selection by intent:\n\
 • Orient / understand code (call FIRST) -> ctx_compose\n\
 • Read a file -> ctx_read(path, mode=signatures|map|full); edit after reading -> ctx_patch\n\
-• Exact symbol -> ctx_symbol; pattern -> ctx_search; by meaning -> ctx_semantic_search\n\
+• Exact symbol -> ctx_search(action=symbol); pattern -> ctx_search; by meaning -> ctx_search(action=semantic)\n\
 • Files by glob -> ctx_glob; structure -> ctx_tree; callers/impact -> ctx_callgraph\n\
 • Verify after edits -> ctx_shell(test/build); memory -> ctx_session / ctx_knowledge\n\
 Semantic questions -> search tools, not whole-file reads: reading more ≠ understanding more.";
@@ -132,7 +132,7 @@ Semantic questions -> search tools, not whole-file reads: reading more ≠ under
 /// Anti-patterns that waste tokens and round-trips.
 pub const ANTI: &str = "\
 Anti-patterns — do NOT:\n\
-• Chain ctx_search -> ctx_read -> ctx_symbol — one ctx_compose replaces all three\n\
+• Chain ctx_search -> ctx_read -> ctx_search(action=symbol) — one ctx_compose replaces all three\n\
 • Use ctx_read(mode=full) for orientation — use mode=signatures\n\
 • Use ctx_callgraph/ctx_graph for const/static/variable refs — they track call\n\
   edges and file deps only; use ctx_search instead";
@@ -149,7 +149,7 @@ multiple lookups into one call.";
 pub const AGENT_LOOP: &str = "\
 AGENT LOOP (phase -> tool):\n\
 • Orient — understand before acting -> ctx_compose\n\
-• Find — exact symbol by name -> ctx_symbol\n\
+• Find — exact symbol by name -> ctx_search(action=symbol)\n\
 • Read — a file, structurally -> ctx_read(mode=signatures|map)\n\
 • Locate — a pattern across files -> ctx_search\n\
 • Trace — callers / callees / blast radius -> ctx_callgraph\n\
@@ -161,7 +161,7 @@ AGENT LOOP (phase -> tool):\n\
 /// `INTENT` carries the one-line thesis in the injected profiles.
 pub const NAV_PARADOX: &str = "\
 NAVIGATION PARADOX: reading more ≠ understanding more.\n\
-• Semantic question (\"where/how is X handled?\") -> ctx_search (BM25) + ctx_semantic_search (meaning), not whole-file reads\n\
+• Semantic question (\"where/how is X handled?\") -> ctx_search (BM25) + ctx_search(action=semantic) (meaning), not whole-file reads\n\
 • Hidden architectural deps (who calls this, what breaks) -> ctx_callgraph / ctx_graph — for these only\n\
 • Navigate structure (signatures, symbols) before reading entire files";
 
@@ -210,7 +210,7 @@ pub const LITM_END: &str = "TOOL PREFERENCE (END): ctx_compose>chain ctx_read>Re
 /// tools that have *no* native trigger to intercept still need advertising.
 pub const SHADOW_MINIMAL: &str = "\
 lean-ctx shadow mode: native file/search/shell calls auto-route to ctx_* — no tool-mapping needed.\n\
-Exclusive tools (no native trigger): ctx_compose (understand code, call first), ctx_symbol (exact symbol), ctx_callgraph (callers), ctx_semantic_search (by meaning), ctx_knowledge / ctx_session (memory).";
+Exclusive tools (no native trigger): ctx_compose (understand code, call first), ctx_search(action=symbol) (exact symbol), ctx_callgraph (callers), ctx_search(action=semantic) (by meaning), ctx_knowledge / ctx_session (memory).";
 
 /// Hook-covered header (GL #1153): the honest replacement for the
 /// `CRITICAL`/`BULLETS`/`NEVER` mapping on hosts whose *installed hooks*
@@ -220,18 +220,23 @@ Exclusive tools (no native trigger): ctx_compose (understand code, call first), 
 /// native tools anyway and the hooks compress them transparently. Saying so
 /// removes the instruction dissonance instead of losing the battle silently.
 pub const HOOK_COVERED_HEADER: &str = "\
-lean-ctx hooks cover this session: native Shell, Read and Grep are compressed \
-transparently (PreToolUse rewrite/redirect) — using them is fine for single known files.\n\
-CRITICAL: ALWAYS call ctx_compose FIRST to orient before scattering individual \
-Read/Grep calls. ACTUALLY EMIT the call — describing it is not calling it.";
+CRITICAL: ALWAYS prefer lean-ctx ctx_* tools over native equivalents — ctx_* tools \
+provide superior caching, compression, and session memory. Hooks compress native \
+Shell/Read/Grep as fallback, but direct ctx_* calls are the primary path.\n\
+ACTUALLY EMIT the ctx_* tool call (ctx_compose first) — describing a tool is not calling it.\n\
+WHY ctx_read > native Read: ctx_read picks the optimal mode (map/signatures/terse) \
+per file, caches for instant re-reads (~13 tokens), and compresses 26-92%. Native \
+Read through hook redirect is limited to verbatim pass-through (~5% savings).";
 
 /// The tools worth an explicit MCP call on a hook-covered host: capabilities
 /// with *no* native equivalent the hooks could intercept. Kept in sync with
 /// [`SHADOW_MINIMAL`]'s exclusive-tools line (same rationale, different cause).
 pub const HOOK_COVERED_TOOLS: &str = "\
-MANDATORY ctx_* tools (no native equivalent):\n\
+MANDATORY MAPPING (always use ctx_* instead of native):\n\
+• Read/cat -> ctx_read(path, mode) — cached, 10 modes, re-reads ~13 tokens\n\
+• Grep/search -> ctx_search(pattern, path) — also action=symbol|semantic for definitions/meaning\n\
+• Shell/bash -> ctx_shell(command) — 95+ compression patterns\n\
 • ctx_compose — orient in code FIRST (bundles search + read + symbols) — call before editing/debugging\n\
-• ctx_search(action=symbol|semantic) — exact definitions or search by meaning, not pattern\n\
 • ctx_callgraph — callers, callees, blast radius — use instead of manual file reading\n\
 • ctx_session / ctx_knowledge — persistent memory — record decisions & progress after milestones\n\
 • ctx_expand — recover full text from [Archived]/compressed output";
@@ -266,6 +271,18 @@ OUTPUT STYLE: expert-terse
 - Zero narration, zero filler
 - BUDGET: ≤100 tokens per non-code response";
 
+/// Raw compression — densest possible output. Bullet points only, zero prose,
+/// diff-style facts, no intro/outro. Tighter than Max (#795).
+pub const RAW_PROMPT: &str = "\
+OUTPUT STYLE: raw-dense
+- Bullet points ONLY, zero prose, no intro, no outro, no greetings
+- Diff-style facts: +added, -removed, ~changed, !breaking
+- One fact per line, max 60 chars
+- Symbolic: → ∵ ∴ ⊕ ⊖ Δ ≈ ≠ ∈ ∅ ✓ ✗ (same as expert-terse)
+- Code blocks: untouched
+- BUDGET: ≤50 tokens per non-code response
+- NEVER explain what you did — show only the result";
+
 /// Return the compression prompt text for a given level (empty string for Off).
 pub fn compression_text(level: CompressionLevel) -> &'static str {
     match level {
@@ -273,79 +290,110 @@ pub fn compression_text(level: CompressionLevel) -> &'static str {
         CompressionLevel::Lite => LITE_PROMPT,
         CompressionLevel::Standard => STANDARD_PROMPT,
         CompressionLevel::Max => MAX_PROMPT,
+        CompressionLevel::Raw => RAW_PROMPT,
     }
 }
 
-/// The verbose teaching profile — only the on-demand project `LEAN-CTX.md`
-/// carries it (#578). Keeps every section, including the ones the injected
-/// profiles fold away (loop taxonomy, navigation paradox, verbose recovery,
-/// CEP protocol).
-const LONGFORM_NON_SHADOW: &[&str] = &[
-    CRITICAL,
-    MUST_INVOKE,
-    BULLETS,
-    NEVER,
-    INTENT,
-    AGENT_LOOP,
-    ANTI,
-    NAV_PARADOX,
-    PARALLEL,
-    AUTO,
-    RECOVER,
-    CEP,
-    INTELLIGENCE,
-    LITM_END,
-];
+// The verbose teaching profile — only the on-demand project `LEAN-CTX.md`
+// Static profile arrays removed (#756): replaced by the profile-aware
+// section-builder functions below (longform_non_shadow_sections, etc.).
 
-/// The injected dedicated-file profile. Billed on every session, so v5 (#578)
-/// keeps it at ~470 tokens: INTENT absorbs loop + paradox, RECOVER_COMPACT
-/// replaces the verbose block, CEP moves to LONGFORM.
-const FULL_NON_SHADOW: &[&str] = &[
-    CRITICAL,
-    MUST_INVOKE,
-    BULLETS,
-    NEVER,
-    INTENT,
-    ANTI,
-    PARALLEL,
-    AUTO,
-    RECOVER_COMPACT,
-    INTELLIGENCE,
-    LITM_END,
-];
+// ── Profile-aware section assembly (#756) ──────────────────────
+//
+// Each function returns Vec<String> with the same section ordering as the
+// static arrays above, but replaces tool-referencing constants with their
+// dynamic equivalents from `rules_sections`.
 
-// #963: shadow profiles collapse to the irreducible minimum. Every routing
-// section (INTENT/ANTI/PARALLEL/AUTO/CEP/LITM_END) is redundant once native
-// calls are intercepted; only SHADOW_MINIMAL (exclusive tools) plus the output
-// style survive. Footprint reduction is provable via the #959 delta harness.
-const FULL_SHADOW: &[&str] = &[SHADOW_MINIMAL, INTELLIGENCE];
+fn s(c: &str) -> String {
+    c.to_string()
+}
 
-// GL #1153: the hook-covered profile — for hosts whose installed lean-ctx
-// hooks already compress the native tools (Cursor). Like shadow, the
-// tool-mapping ("NEVER use native …") is dropped: it is unenforceable against
-// the host's own tool guidance and the hooks make it unnecessary. Unlike
-// shadow, the coverage is partial (hooks see Shell/Read/Grep but not e.g.
-// semantic questions), so the exclusive-capability advert is a full section
-// and the recovery line stays.
-const HOOK_COVERED_NON_SHADOW: &[&str] = &[
-    HOOK_COVERED_HEADER,
-    HOOK_COVERED_TOOLS,
-    PARALLEL,
-    RECOVER_COMPACT,
-    INTELLIGENCE,
-];
+fn longform_non_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<String> {
+    use super::rules_sections as rs;
+    let mut v = vec![
+        s(CRITICAL),
+        s(MUST_INVOKE),
+        s(BULLETS),
+        s(NEVER),
+        rs::intent_section(p),
+        s(AGENT_LOOP), // verbose teaching — LONGFORM only
+        rs::anti_section(p),
+        s(NAV_PARADOX), // verbose teaching — LONGFORM only
+        s(PARALLEL),
+        s(AUTO),
+        s(RECOVER),
+        s(CEP),
+        s(INTELLIGENCE),
+        rs::litm_end_section(p),
+    ];
+    if let Some(fb) = rs::ctx_call_fallback(p) {
+        v.push(fb);
+    }
+    v
+}
 
-const COMPACT_NON_SHADOW: &[&str] = &[
-    CRITICAL,
-    BULLETS,
-    NEVER,
-    INTENT,
-    ANTI,
-    PARALLEL,
-    RECOVER_COMPACT,
-];
+fn full_non_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<String> {
+    use super::rules_sections as rs;
+    let mut v = vec![
+        s(CRITICAL),
+        s(MUST_INVOKE),
+        s(BULLETS),
+        s(NEVER),
+        rs::intent_section(p),
+        rs::anti_section(p),
+        s(PARALLEL),
+        s(AUTO),
+        s(RECOVER_COMPACT),
+        s(INTELLIGENCE),
+        rs::litm_end_section(p),
+    ];
+    if let Some(fb) = rs::ctx_call_fallback(p) {
+        v.push(fb);
+    }
+    v
+}
 
-const COMPACT_SHADOW: &[&str] = &[SHADOW_MINIMAL];
+fn full_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<String> {
+    use super::rules_sections as rs;
+    vec![rs::shadow_minimal_section(p), s(INTELLIGENCE)]
+}
+
+fn hook_covered_non_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<String> {
+    use super::rules_sections as rs;
+    let mut v = vec![
+        s(HOOK_COVERED_HEADER),
+        rs::hook_covered_tools_section(p),
+        s(PARALLEL),
+        s(RECOVER_COMPACT),
+        s(INTELLIGENCE),
+    ];
+    if let Some(fb) = rs::ctx_call_fallback(p) {
+        v.push(fb);
+    }
+    v
+}
+
+fn compact_non_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<String> {
+    use super::rules_sections as rs;
+    let mut v = vec![
+        s(CRITICAL),
+        s(BULLETS),
+        s(NEVER),
+        rs::intent_section(p),
+        rs::anti_section(p),
+        s(PARALLEL),
+        s(RECOVER_COMPACT),
+    ];
+    if let Some(fb) = rs::ctx_call_fallback(p) {
+        v.push(fb);
+    }
+    v
+}
+
+fn compact_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<String> {
+    use super::rules_sections as rs;
+    vec![rs::shadow_minimal_section(p)]
+}
 
 /// Selects the profile (LONGFORM / FULL / COMPACT) and the wrapping style
 /// (markers, headers, footers) for `render()`.
@@ -381,26 +429,43 @@ pub enum Wrapper {
     HookCovered,
 }
 
-/// Render lean-ctx rules for a given wrapper, shadow mode, and compression level.
+/// Render lean-ctx rules for a given wrapper, shadow mode, compression level,
+/// and tool profile (#756).
 ///
 /// * `shadow` — when true, tool-mapping sections (BULLETS, NEVER,
 ///   CRITICAL banner, "## Tool Mapping" header) are omitted.
 /// * `wrapper` — selects the profile (FULL / COMPACT) and wrapping style.
 /// * `level` — selects the output-style compression prompt (Lite / Standard /
 ///   Max) which is appended to the body. `Off` omits it.
-pub fn render(shadow: bool, wrapper: Wrapper, level: CompressionLevel) -> String {
-    let profile = match (wrapper, shadow) {
-        (Wrapper::Longform, false) => LONGFORM_NON_SHADOW,
-        // Shadow collapses Longform + Dedicated + HookCovered to the same
-        // minimal profile (interception supersedes hook coverage).
-        (Wrapper::Longform | Wrapper::Dedicated | Wrapper::HookCovered, true) => FULL_SHADOW,
-        (Wrapper::Dedicated, false) => FULL_NON_SHADOW,
-        (Wrapper::HookCovered, false) => HOOK_COVERED_NON_SHADOW,
-        (_, false) => COMPACT_NON_SHADOW,
-        (_, true) => COMPACT_SHADOW,
+/// * `tool_profile` — filters tool references in dynamic sections so agents
+///   only see tools they can actually call.
+pub fn render(
+    shadow: bool,
+    wrapper: Wrapper,
+    level: CompressionLevel,
+    tool_profile: &super::tool_profiles::ToolProfile,
+) -> String {
+    use super::rules_sections as rs;
+
+    let sections: Vec<String> = match (wrapper, shadow) {
+        (Wrapper::Longform, false) => longform_non_shadow_sections(tool_profile),
+        (Wrapper::Longform | Wrapper::Dedicated | Wrapper::HookCovered, true) => {
+            full_shadow_sections(tool_profile)
+        }
+        (Wrapper::Dedicated, false) => full_non_shadow_sections(tool_profile),
+        (Wrapper::HookCovered, false) => hook_covered_non_shadow_sections(tool_profile),
+        (_, false) => compact_non_shadow_sections(tool_profile),
+        (_, true) => compact_shadow_sections(tool_profile),
     };
 
-    let mut body = profile.join("\n\n");
+    // Suppress empty sections (a section builder may return "" when the
+    // profile hides all tools it would mention).
+    let mut body: String = sections
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let _ = rs::intent_section; // anchor — ensures the module is linked
 
     // Append the compression / output-style prompt for active levels. Persistent
     // carriers (Dedicated, Shared) wrap it in the canonical COMPRESSION_BLOCK
@@ -435,11 +500,20 @@ pub fn render(shadow: bool, wrapper: Wrapper, level: CompressionLevel) -> String
 /// per-session channels are governed by carrier coverage, so markers would be
 /// noise (see [`COMPRESSION_BLOCK_START`]). Shadow collapses to the regular
 /// bare shadow profile (interception supersedes hook coverage).
-pub fn render_hook_covered_bare(shadow: bool, level: CompressionLevel) -> String {
+pub fn render_hook_covered_bare(
+    shadow: bool,
+    level: CompressionLevel,
+    tool_profile: &super::tool_profiles::ToolProfile,
+) -> String {
     if shadow {
-        return render(true, Wrapper::Bare, level);
+        return render(true, Wrapper::Bare, level, tool_profile);
     }
-    let mut body = HOOK_COVERED_NON_SHADOW.join("\n\n");
+    let sections = hook_covered_non_shadow_sections(tool_profile);
+    let mut body: String = sections
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let compression = compression_text(level);
     if !compression.is_empty() {
         body.push('\n');
@@ -550,9 +624,10 @@ impl<'a> RulesFile<'a> {
         shadow: bool,
         wrapper: Wrapper,
         level: CompressionLevel,
+        tool_profile: &super::tool_profiles::ToolProfile,
     ) -> bool {
         match self.block() {
-            Some(block) => block.trim() == render(shadow, wrapper, level).trim(),
+            Some(block) => block.trim() == render(shadow, wrapper, level, tool_profile).trim(),
             None => false,
         }
     }
@@ -562,8 +637,14 @@ impl<'a> RulesFile<'a> {
     /// * If a lean-ctx section exists → replaces content between `START_MARK`
     ///   and `END_MARK`, preserving user content before/after.
     /// * If no section exists → appends fresh content at the end.
-    pub fn merged(&self, shadow: bool, wrapper: Wrapper, level: CompressionLevel) -> String {
-        let fresh = render(shadow, wrapper, level);
+    pub fn merged(
+        &self,
+        shadow: bool,
+        wrapper: Wrapper,
+        level: CompressionLevel,
+        tool_profile: &super::tool_profiles::ToolProfile,
+    ) -> String {
+        let fresh = render(shadow, wrapper, level, tool_profile);
         if self.start.is_some() {
             let before = self.prefix();
             let after = self.suffix();
@@ -597,8 +678,13 @@ impl<'a> RulesFile<'a> {
     }
 
     /// Create initial rules content (no existing section to merge with).
-    pub fn initial(shadow: bool, wrapper: Wrapper, level: CompressionLevel) -> String {
-        render(shadow, wrapper, level)
+    pub fn initial(
+        shadow: bool,
+        wrapper: Wrapper,
+        level: CompressionLevel,
+        tool_profile: &super::tool_profiles::ToolProfile,
+    ) -> String {
+        render(shadow, wrapper, level, tool_profile)
     }
 
     // ── Delete ─────────────────────────────────────────────────
@@ -627,6 +713,10 @@ impl<'a> RulesFile<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tp() -> super::super::tool_profiles::ToolProfile {
+        super::super::tool_profiles::ToolProfile::Power
+    }
 
     // --- Constants ---
 
@@ -679,8 +769,8 @@ mod tests {
     #[test]
     fn nav_paradox_steers_semantic_vs_graph() {
         assert!(
-            NAV_PARADOX.contains("ctx_semantic_search"),
-            "semantic route"
+            NAV_PARADOX.contains("ctx_search(action=semantic)"),
+            "semantic route must use folded action (#509)"
         );
         assert!(NAV_PARADOX.contains("ctx_callgraph"), "graph route");
         assert!(
@@ -694,7 +784,7 @@ mod tests {
         // v5 (#578): the verbose teaching sections live only in the on-demand
         // LEAN-CTX.md (Longform); the injected dedicated files fold the loop
         // phases + paradox thesis into INTENT.
-        let long = render(false, Wrapper::Longform, CompressionLevel::Off);
+        let long = render(false, Wrapper::Longform, CompressionLevel::Off, &tp());
         assert!(
             long.contains("AGENT LOOP"),
             "LONGFORM must carry AGENT_LOOP"
@@ -705,7 +795,7 @@ mod tests {
         );
         assert!(long.contains(CEP), "LONGFORM must carry CEP");
 
-        let full = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let full = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         assert!(
             !full.contains("AGENT LOOP (phase -> tool):"),
             "injected FULL must not inline the multi-line AGENT_LOOP block"
@@ -718,7 +808,13 @@ mod tests {
             full.contains('≠'),
             "INTENT must keep the reading≠understanding thesis in FULL"
         );
-        for phase_tool in ["ctx_compose", "ctx_symbol", "ctx_search", "ctx_callgraph"] {
+        // #509: ctx_symbol folded into ctx_search(action=symbol)
+        for phase_tool in [
+            "ctx_compose",
+            "ctx_search(action=symbol)",
+            "ctx_search",
+            "ctx_callgraph",
+        ] {
             assert!(
                 full.contains(phase_tool),
                 "FULL keeps the loop tools via INTENT: {phase_tool}"
@@ -731,28 +827,28 @@ mod tests {
         // The whole point of v5 (#578): injected files bill every session.
         // chars/4 ≈ tokens — the dedicated body must stay around ~470 tok and
         // the Longform must be a strict superset.
-        let full = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let full = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         eprintln!(
             "rules footprint: dedicated={} chars (~{} tok), longform={} chars, bare={} chars",
             full.len(),
             full.len() / 4,
-            render(false, Wrapper::Longform, CompressionLevel::Off).len(),
-            render(false, Wrapper::Bare, CompressionLevel::Off).len(),
+            render(false, Wrapper::Longform, CompressionLevel::Off, &tp()).len(),
+            render(false, Wrapper::Bare, CompressionLevel::Off, &tp()).len(),
         );
         assert!(
-            full.len() <= 2100,
-            "injected dedicated rules must stay ≤2100 chars (~525 tok), got {} chars (~{} tok)",
+            full.len() <= 2400,
+            "injected dedicated rules must stay ≤2400 chars (~600 tok), got {} chars (~{} tok)",
             full.len(),
             full.len() / 4
         );
-        let long = render(false, Wrapper::Longform, CompressionLevel::Off);
+        let long = render(false, Wrapper::Longform, CompressionLevel::Off, &tp());
         assert!(
             long.len() > full.len(),
             "Longform ({}) must carry more than the injected profile ({})",
             long.len(),
             full.len()
         );
-        let compact = render(false, Wrapper::Bare, CompressionLevel::Off);
+        let compact = render(false, Wrapper::Bare, CompressionLevel::Off, &tp());
         assert!(
             compact.len() < full.len(),
             "COMPACT/Bare ({}) must stay below the dedicated profile ({})",
@@ -765,7 +861,7 @@ mod tests {
     fn compact_profile_has_no_multiline_teaching_sections() {
         // COMPACT (shared + Bare) keeps the per-session channel lean: no
         // multi-line AGENT_LOOP/NAV_PARADOX blocks; INTENT carries the thesis.
-        let out = render(false, Wrapper::Shared, CompressionLevel::Off);
+        let out = render(false, Wrapper::Shared, CompressionLevel::Off, &tp());
         assert!(
             !out.contains("AGENT LOOP (phase -> tool):"),
             "COMPACT must not inline the multi-line AGENT_LOOP block"
@@ -785,7 +881,7 @@ mod tests {
         // #963: shadow collapses to the irreducible minimum — the routing
         // taxonomy is redundant once native calls are intercepted.
         for wrapper in [Wrapper::Longform, Wrapper::Dedicated, Wrapper::Shared] {
-            let out = render(true, wrapper, CompressionLevel::Off);
+            let out = render(true, wrapper, CompressionLevel::Off, &tp());
             assert!(!out.contains("AGENT LOOP"), "{wrapper:?} shadow drops loop");
             assert!(
                 !out.contains("NAVIGATION PARADOX"),
@@ -802,13 +898,13 @@ mod tests {
         // v5 (#578): only Longform carries the verbose RECOVER; every injected
         // profile (Dedicated FULL + Shared/Bare COMPACT) carries the terse
         // RECOVER_COMPACT one-liner.
-        let long = render(false, Wrapper::Longform, CompressionLevel::Off);
+        let long = render(false, Wrapper::Longform, CompressionLevel::Off, &tp());
         assert!(
             long.contains(RECOVER),
             "Longform must carry the verbose RECOVER verbatim"
         );
         for wrapper in [Wrapper::Dedicated, Wrapper::Shared, Wrapper::Bare] {
-            let out = render(false, wrapper, CompressionLevel::Off);
+            let out = render(false, wrapper, CompressionLevel::Off, &tp());
             assert!(
                 out.contains(RECOVER_COMPACT),
                 "{wrapper:?} must carry RECOVER_COMPACT verbatim"
@@ -825,13 +921,12 @@ mod tests {
             Wrapper::Bare,
         ] {
             assert!(
-                render(false, wrapper, CompressionLevel::Off).contains("(no MCP)"),
+                render(false, wrapper, CompressionLevel::Off, &tp()).contains("(no MCP)"),
                 "{wrapper:?} recovery line must keep the MCP-free path"
             );
         }
-        // Shadow stays minimal; the reactive footers still cover recovery there.
         for wrapper in [Wrapper::Dedicated, Wrapper::Shared] {
-            let out = render(true, wrapper, CompressionLevel::Off);
+            let out = render(true, wrapper, CompressionLevel::Off, &tp());
             assert!(
                 !out.contains(RECOVER) && !out.contains(RECOVER_COMPACT),
                 "{wrapper:?} shadow drops all RECOVER guidance"
@@ -843,7 +938,7 @@ mod tests {
 
     #[test]
     fn dedicated_has_markers_and_version() {
-        let out = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let out = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         assert!(out.contains(START_MARK));
         assert!(out.contains(&format!("<!-- version: {RULES_VERSION} -->")));
         assert!(out.contains(END_MARK));
@@ -857,7 +952,7 @@ mod tests {
         // #963: shadow drops the whole tool-mapping AND routing playbook —
         // interception makes them redundant. Only the exclusive-tool advert and
         // the output style remain.
-        let out = render(true, Wrapper::Dedicated, CompressionLevel::Off);
+        let out = render(true, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         assert!(out.contains(START_MARK));
         assert!(!out.contains("MANDATORY MAPPING"), "no BULLETS in shadow");
         assert!(!out.contains(NEVER), "no NEVER in shadow");
@@ -880,8 +975,8 @@ mod tests {
     #[test]
     fn shadow_is_smaller_than_non_shadow() {
         // The whole point of #963: the shadow body must be a strict reduction.
-        let shadow = render(true, Wrapper::Dedicated, CompressionLevel::Off);
-        let full = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let shadow = render(true, Wrapper::Dedicated, CompressionLevel::Off, &tp());
+        let full = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         assert!(
             shadow.len() < full.len(),
             "shadow ({}) must be smaller than non-shadow ({})",
@@ -892,7 +987,7 @@ mod tests {
 
     #[test]
     fn dedicated_litm_structure() {
-        let out = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let out = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         let lines: Vec<&str> = out.lines().collect();
         let first_5 = lines[..5.min(lines.len())].join("\n");
         assert!(
@@ -913,17 +1008,17 @@ mod tests {
         // rule file (Windsurf, Cursor, Claude, …) in non-shadow mode, and must be
         // absent where it is dead weight: shadow mode (call-layer routing) and the
         // Bare/instructions channel (separately capped).
-        let dedicated = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let dedicated = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         assert!(
             dedicated.contains(MUST_INVOKE),
             "dedicated non-shadow rules must carry the MUST_INVOKE nudge"
         );
         assert!(
-            !render(true, Wrapper::Dedicated, CompressionLevel::Off).contains(MUST_INVOKE),
+            !render(true, Wrapper::Dedicated, CompressionLevel::Off, &tp()).contains(MUST_INVOKE),
             "shadow mode must not carry the nudge (routing is enforced at the call layer)"
         );
         assert!(
-            !render(false, Wrapper::Bare, CompressionLevel::Off).contains(MUST_INVOKE),
+            !render(false, Wrapper::Bare, CompressionLevel::Off, &tp()).contains(MUST_INVOKE),
             "Bare/instructions channel is capped separately and carries no copy"
         );
     }
@@ -932,7 +1027,7 @@ mod tests {
 
     #[test]
     fn shared_has_markers_and_header() {
-        let out = render(false, Wrapper::Shared, CompressionLevel::Off);
+        let out = render(false, Wrapper::Shared, CompressionLevel::Off, &tp());
         assert!(out.contains(START_MARK));
         assert!(out.contains(END_MARK));
         assert!(out.contains("MANDATORY MAPPING"));
@@ -941,7 +1036,7 @@ mod tests {
 
     #[test]
     fn shared_shadow_omits_mapping() {
-        let out = render(true, Wrapper::Shared, CompressionLevel::Off);
+        let out = render(true, Wrapper::Shared, CompressionLevel::Off, &tp());
         assert!(out.contains(START_MARK));
         assert!(
             !out.contains("MANDATORY MAPPING"),
@@ -957,7 +1052,7 @@ mod tests {
 
     #[test]
     fn bare_has_no_markers() {
-        let out = render(false, Wrapper::Bare, CompressionLevel::Off);
+        let out = render(false, Wrapper::Bare, CompressionLevel::Off, &tp());
         assert!(!out.contains(START_MARK), "Bare must not have START_MARK");
         assert!(!out.contains(END_MARK), "Bare must not have END_MARK");
         assert!(!out.contains("<!-- version:"), "Bare must not have version");
@@ -967,7 +1062,7 @@ mod tests {
 
     #[test]
     fn bare_shadow_only_read_modes() {
-        let out = render(true, Wrapper::Bare, CompressionLevel::Off);
+        let out = render(true, Wrapper::Bare, CompressionLevel::Off, &tp());
         assert!(!out.contains(NEVER), "shadow Bare must not have NEVER");
         assert!(
             !out.contains("MANDATORY MAPPING"),
@@ -979,28 +1074,28 @@ mod tests {
 
     #[test]
     fn render_includes_lite_prompt() {
-        let out = render(false, Wrapper::Bare, CompressionLevel::Lite);
+        let out = render(false, Wrapper::Bare, CompressionLevel::Lite, &tp());
         assert!(out.contains("OUTPUT STYLE: concise"));
         assert!(out.contains("Bullet points"));
     }
 
     #[test]
     fn render_includes_standard_prompt() {
-        let out = render(false, Wrapper::Bare, CompressionLevel::Standard);
+        let out = render(false, Wrapper::Bare, CompressionLevel::Standard, &tp());
         assert!(out.contains("OUTPUT STYLE: dense"));
         assert!(out.contains("atomic fact"));
     }
 
     #[test]
     fn render_includes_max_prompt() {
-        let out = render(false, Wrapper::Bare, CompressionLevel::Max);
+        let out = render(false, Wrapper::Bare, CompressionLevel::Max, &tp());
         assert!(out.contains("OUTPUT STYLE: expert-terse"));
         assert!(out.contains("Telegraph"));
     }
 
     #[test]
     fn render_off_excludes_compression() {
-        let out = render(false, Wrapper::Bare, CompressionLevel::Off);
+        let out = render(false, Wrapper::Bare, CompressionLevel::Off, &tp());
         assert!(!out.contains("OUTPUT STYLE:"));
     }
 
@@ -1019,7 +1114,7 @@ mod tests {
         // Persistent carriers must delimit the compression payload so coverage
         // and dedup can detect/thin it (#684/#548).
         for wrapper in [Wrapper::Longform, Wrapper::Dedicated, Wrapper::Shared] {
-            let out = render(false, wrapper, CompressionLevel::Standard);
+            let out = render(false, wrapper, CompressionLevel::Standard, &tp());
             assert!(
                 out.contains(COMPRESSION_BLOCK_START) && out.contains(COMPRESSION_BLOCK_END),
                 "{wrapper:?} must wrap compression in COMPRESSION_BLOCK markers"
@@ -1036,7 +1131,7 @@ mod tests {
     fn bare_wrapper_emits_compression_without_markers() {
         // The ephemeral MCP channel keeps the payload unmarked — its inclusion is
         // governed by carrier coverage, so per-session markers would be noise.
-        let out = render(false, Wrapper::Bare, CompressionLevel::Standard);
+        let out = render(false, Wrapper::Bare, CompressionLevel::Standard, &tp());
         assert!(out.contains("OUTPUT STYLE: dense"));
         assert!(!out.contains(COMPRESSION_BLOCK_START));
         assert!(!out.contains(COMPRESSION_BLOCK_END));
@@ -1050,7 +1145,7 @@ mod tests {
             Wrapper::Shared,
             Wrapper::Bare,
         ] {
-            let out = render(false, wrapper, CompressionLevel::Off);
+            let out = render(false, wrapper, CompressionLevel::Off, &tp());
             assert!(
                 !out.contains(COMPRESSION_BLOCK_START) && !out.contains(COMPRESSION_BLOCK_END),
                 "{wrapper:?}: Off must emit no compression markers"
@@ -1062,7 +1157,7 @@ mod tests {
     fn rendered_carrier_block_is_seen_as_carrying_compression() {
         // The detection helper that coverage/dedup rely on must agree with the
         // writer's output (the bug this slice fixes: it previously never did).
-        let dedicated = render(false, Wrapper::Dedicated, CompressionLevel::Lite);
+        let dedicated = render(false, Wrapper::Dedicated, CompressionLevel::Lite, &tp());
         assert!(crate::core::rules_channel::carries_full_rules(&dedicated));
         assert!(dedicated.contains(COMPRESSION_BLOCK_START));
     }
@@ -1078,7 +1173,7 @@ mod tests {
                 Wrapper::Shared,
                 Wrapper::Bare,
             ] {
-                let out = render(shadow, wrapper, CompressionLevel::Off);
+                let out = render(shadow, wrapper, CompressionLevel::Off, &tp());
                 assert!(!out.is_empty(), "{wrapper:?} shadow={shadow} is empty");
             }
         }
@@ -1117,12 +1212,12 @@ mod tests {
 
     #[test]
     fn block_matches_render_true_for_fresh_render() {
-        let fresh = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let fresh = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         let content = format!("user before\n{fresh}\nuser after");
         let f = RulesFile::parse(&content);
         assert!(f.is_current(), "fresh render carries the current version");
         assert!(
-            f.block_matches_render(false, Wrapper::Dedicated, CompressionLevel::Off),
+            f.block_matches_render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp()),
             "an unchanged block must compare equal to a fresh render"
         );
     }
@@ -1131,21 +1226,21 @@ mod tests {
     fn block_matches_render_false_on_compression_change() {
         // Body rendered at Off, then asked whether it matches a Max render:
         // the version is identical but the compression payload differs (#548).
-        let content = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let content = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         let f = RulesFile::parse(&content);
         assert!(f.is_current());
         assert!(
-            !f.block_matches_render(false, Wrapper::Dedicated, CompressionLevel::Max),
+            !f.block_matches_render(false, Wrapper::Dedicated, CompressionLevel::Max, &tp()),
             "a compression-level change must be detected as drift"
         );
     }
 
     #[test]
     fn block_matches_render_false_on_shadow_change() {
-        let content = render(false, Wrapper::Dedicated, CompressionLevel::Lite);
+        let content = render(false, Wrapper::Dedicated, CompressionLevel::Lite, &tp());
         let f = RulesFile::parse(&content);
         assert!(
-            !f.block_matches_render(true, Wrapper::Dedicated, CompressionLevel::Lite),
+            !f.block_matches_render(true, Wrapper::Dedicated, CompressionLevel::Lite, &tp()),
             "a shadow-mode toggle must be detected as drift"
         );
     }
@@ -1153,7 +1248,7 @@ mod tests {
     #[test]
     fn block_matches_render_false_without_block() {
         let f = RulesFile::parse("plain user content, no markers");
-        assert!(!f.block_matches_render(false, Wrapper::Dedicated, CompressionLevel::Off));
+        assert!(!f.block_matches_render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp()));
     }
 
     #[test]
@@ -1161,7 +1256,7 @@ mod tests {
         let content =
             format!("before\n{START_MARK}\n<!-- version: 1 -->\n\nold\n{END_MARK}\nafter");
         let f = RulesFile::parse(&content);
-        let merged = f.merged(false, Wrapper::Shared, CompressionLevel::Off);
+        let merged = f.merged(false, Wrapper::Shared, CompressionLevel::Off, &tp());
         assert!(merged.contains("before"), "prefix preserved");
         assert!(merged.contains("after"), "suffix preserved");
         assert!(!merged.contains("old"), "old content replaced");
@@ -1173,7 +1268,7 @@ mod tests {
         let content = "user content";
         let f = RulesFile::parse(content);
         assert!(!f.has_content());
-        let merged = f.merged(false, Wrapper::Bare, CompressionLevel::Off);
+        let merged = f.merged(false, Wrapper::Bare, CompressionLevel::Off, &tp());
         assert!(merged.contains("user content"));
         assert!(merged.contains(BULLETS));
     }
@@ -1239,22 +1334,27 @@ mod tests {
     // --- HookCovered profile (GL #1153) ---
 
     #[test]
-    fn hook_covered_drops_unenforceable_mapping() {
-        // The whole point: on a hook-covered host the "NEVER use native"
-        // mapping fights the host's own tool guidance. The profile must
-        // acknowledge the hooks instead of demanding the impossible.
-        let out = render(false, Wrapper::HookCovered, CompressionLevel::Off);
+    fn hook_covered_carries_strict_mapping() {
+        // v8: HookCovered is strict — always prefer ctx_* over native tools.
+        // The MANDATORY MAPPING replaces the old "no native equivalent" list.
+        let out = render(false, Wrapper::HookCovered, CompressionLevel::Off, &tp());
         assert!(
-            !out.contains("MANDATORY MAPPING") && !out.contains(NEVER) && !out.contains(CRITICAL),
-            "HookCovered must not carry the native-tool prohibition"
+            !out.contains(NEVER),
+            "HookCovered uses its own strict header, not the NEVER constant"
         );
         assert!(
             out.contains(HOOK_COVERED_HEADER),
-            "must state that hooks compress native tools"
+            "must carry the strict preference header"
+        );
+        assert!(
+            out.contains("MANDATORY MAPPING")
+                && out.contains("ctx_read")
+                && out.contains("ctx_search"),
+            "must carry the full mandatory mapping"
         );
         assert!(
             out.contains("ctx_compose") && out.contains("action=symbol|semantic"),
-            "must advertise the exclusive capabilities"
+            "must advertise the search capabilities"
         );
     }
 
@@ -1263,7 +1363,7 @@ mod tests {
         // Coverage detection (rules_channel::carries_full_rules /
         // client_autoloads_rules) and the injector's drift check both key on
         // the canonical markers — HookCovered must stay a first-class carrier.
-        let out = render(false, Wrapper::HookCovered, CompressionLevel::Off);
+        let out = render(false, Wrapper::HookCovered, CompressionLevel::Off, &tp());
         assert!(out.contains(START_MARK) && out.contains(END_MARK));
         assert!(out.contains(&format!("<!-- version: {RULES_VERSION} -->")));
         assert!(out.contains(RECOVER_COMPACT), "recovery line must survive");
@@ -1272,8 +1372,8 @@ mod tests {
 
     #[test]
     fn hook_covered_is_leaner_than_full() {
-        let covered = render(false, Wrapper::HookCovered, CompressionLevel::Off);
-        let full = render(false, Wrapper::Dedicated, CompressionLevel::Off);
+        let covered = render(false, Wrapper::HookCovered, CompressionLevel::Off, &tp());
+        let full = render(false, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         assert!(
             covered.len() < full.len(),
             "HookCovered ({}) must be a strict reduction of FULL ({})",
@@ -1286,17 +1386,147 @@ mod tests {
     fn hook_covered_shadow_collapses_to_minimal() {
         // Interception supersedes hook coverage — same minimal profile as
         // Dedicated shadow.
-        let covered_shadow = render(true, Wrapper::HookCovered, CompressionLevel::Off);
-        let dedicated_shadow = render(true, Wrapper::Dedicated, CompressionLevel::Off);
+        let covered_shadow = render(true, Wrapper::HookCovered, CompressionLevel::Off, &tp());
+        let dedicated_shadow = render(true, Wrapper::Dedicated, CompressionLevel::Off, &tp());
         assert_eq!(covered_shadow, dedicated_shadow);
     }
 
     #[test]
     fn hook_covered_wraps_compression_in_markers() {
-        // The compression payload keeps the carrier markers so cross-channel
-        // dedup (cursor_compression_covered) recognises the mdc as covered.
-        let out = render(false, Wrapper::HookCovered, CompressionLevel::Standard);
+        let out = render(
+            false,
+            Wrapper::HookCovered,
+            CompressionLevel::Standard,
+            &tp(),
+        );
         assert!(out.contains(COMPRESSION_BLOCK_START) && out.contains(COMPRESSION_BLOCK_END));
         assert!(out.contains("OUTPUT STYLE: dense"));
+    }
+
+    // --- Profile-aware rules (#756) ---
+
+    #[test]
+    fn rules_only_mention_enabled_tools() {
+        use super::super::rules_sections;
+        use super::super::tool_profiles::ToolProfile;
+        let exclusive_tools = ["ctx_compose", "ctx_callgraph", "ctx_patch"];
+        for profile in [ToolProfile::Minimal, ToolProfile::Standard] {
+            let mut sections = vec![
+                rules_sections::intent_section(&profile),
+                rules_sections::hook_covered_tools_section(&profile),
+                rules_sections::shadow_minimal_section(&profile),
+                rules_sections::anti_section(&profile),
+                rules_sections::litm_end_section(&profile),
+            ];
+            if let Some(fb) = rules_sections::ctx_call_fallback(&profile) {
+                sections.push(fb);
+            }
+            for tool in &exclusive_tools {
+                if !profile.is_tool_enabled(tool) {
+                    for section in &sections {
+                        assert!(
+                            !section.contains(tool),
+                            "profile {:?} dynamic section must not mention disabled tool {tool}",
+                            profile.as_str()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn minimal_rules_shorter_than_standard() {
+        use super::super::tool_profiles::ToolProfile;
+        let min = render(
+            false,
+            Wrapper::Dedicated,
+            CompressionLevel::Off,
+            &ToolProfile::Minimal,
+        );
+        let std = render(
+            false,
+            Wrapper::Dedicated,
+            CompressionLevel::Off,
+            &ToolProfile::Standard,
+        );
+        assert!(
+            min.len() < std.len(),
+            "minimal ({}) must be shorter than standard ({})",
+            min.len(),
+            std.len()
+        );
+    }
+
+    #[test]
+    fn power_profile_output_identical_to_default() {
+        use super::super::tool_profiles::ToolProfile;
+        let power = render(
+            false,
+            Wrapper::Dedicated,
+            CompressionLevel::Off,
+            &ToolProfile::Power,
+        );
+        assert!(
+            power.contains("ctx_compose"),
+            "Power must include all tools"
+        );
+        assert!(
+            power.contains("ctx_callgraph"),
+            "Power must include all tools"
+        );
+        assert!(
+            power.contains("ctx_session"),
+            "Power must include all tools"
+        );
+    }
+
+    #[test]
+    fn render_is_deterministic_across_profiles() {
+        use super::super::tool_profiles::ToolProfile;
+        for profile in [
+            ToolProfile::Minimal,
+            ToolProfile::Standard,
+            ToolProfile::Power,
+        ] {
+            let a = render(false, Wrapper::Dedicated, CompressionLevel::Off, &profile);
+            let b = render(false, Wrapper::Dedicated, CompressionLevel::Off, &profile);
+            assert_eq!(
+                a,
+                b,
+                "render must be deterministic for {:?}",
+                profile.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn minimal_has_ctx_call_fallback() {
+        use super::super::tool_profiles::ToolProfile;
+        let rules = render(
+            false,
+            Wrapper::Dedicated,
+            CompressionLevel::Off,
+            &ToolProfile::Minimal,
+        );
+        assert!(
+            rules.contains("ctx_call"),
+            "minimal profile must include ctx_call gateway hint"
+        );
+    }
+
+    #[test]
+    fn power_has_no_ctx_call_fallback() {
+        use super::super::tool_profiles::ToolProfile;
+        let rules = render(
+            false,
+            Wrapper::Dedicated,
+            CompressionLevel::Off,
+            &ToolProfile::Power,
+        );
+        assert!(
+            !rules.contains("ctx_call(tool="),
+            "power profile must not include ctx_call gateway hint"
+        );
     }
 }

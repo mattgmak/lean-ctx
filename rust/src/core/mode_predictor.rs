@@ -170,7 +170,7 @@ impl ModePredictor {
     }
 
     fn predict_from_bandit(&self, sig: &FileSignature) -> Option<String> {
-        let key = format!("{}_feedback", sig.ext);
+        let key = crate::core::bandit::bandit_key("feedback", &sig.ext, None);
         let store =
             crate::core::bandit::BanditStore::load(self.project_root.as_deref().unwrap_or("."));
         let bandit = store.bandits.get(&key)?;
@@ -466,7 +466,7 @@ mod tests {
         let root = project.path().to_string_lossy().to_string();
 
         let mut store = crate::core::bandit::BanditStore::default();
-        let bandit = store.get_or_create("rs_feedback");
+        let bandit = store.get_or_create(&crate::core::bandit::bandit_key("feedback", "rs", None));
         bandit.total_pulls = 10;
         for _ in 0..5 {
             bandit.update("conservative", true);

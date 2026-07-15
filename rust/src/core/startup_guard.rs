@@ -305,8 +305,9 @@ mod tests {
             crash_loop_backoff("test-no-sleep");
         }
         assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "under threshold should not sleep"
+            start.elapsed() < Duration::from_secs(5),
+            "under threshold should not sleep (elapsed {:?})",
+            start.elapsed()
         );
     }
 

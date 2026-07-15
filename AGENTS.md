@@ -2,18 +2,30 @@
 
 lean-ctx optimizes LLM context by compressing file reads, shell output, and search results.
 
-## Integration Mode: Hybrid
+## Integration Mode: Replace
 
-- **Reads/Search** → MCP tools (`ctx_read`, `ctx_search`) for caching + compression
-- **Shell commands** → run the command normally in agent shells; the shell/tool
-  wrapper may already compress output. Use `lean-ctx -c "…"` only when the user
-  explicitly requests it or task setup/docs explicitly say the shell is not
-  wrapped. Do not probe env vars just to decide; users may forbid env access.
+Native Read/Grep/Glob/Shell are **denied by policy**. lean-ctx MCP tools are the
+only path for reading files and running commands:
+
+- **Reads/Search** → `ctx_read`, `ctx_search`, `ctx_compose` (cached, 10 modes)
+- **Shell commands** → `ctx_shell` (95+ compression patterns)
 - **File editing** → native Edit/StrReplace (lean-ctx only handles READ operations)
+- **File finding** → `ctx_glob`, `ctx_tree`
 
-The canonical tool-mapping table is auto-injected per session via
-`~/.cursor/rules/lean-ctx.mdc` (see the `<!-- lean-ctx -->` block below) — it is
-deliberately not duplicated here.
+Native tools will return a deny error with instructions to use ctx_* equivalents.
+Override: set `hook_mode = "hybrid"` in `~/.config/lean-ctx/config.toml`.
+
+## Subagent Compatibility (Cursor / Claude Code)
+
+Cursor blocks MCP tools in `readonly: true` subagents (Task tool).
+lean-ctx tools are MCP tools → they WILL FAIL in readonly subagents.
+
+**Rules for spawning subagents:**
+- Always set `readonly: false` when the subagent needs ctx_* tools
+- Use `subagent_type: "generalPurpose"` — NOT `"explore"` (always readonly)
+- lean-ctx tools declare `readOnlyHint: true` in MCP annotations
+
+**Fallback (MCP unavailable):** deny hook detects MCP-down and allows native tools.
 
 ## CLI commands (optimized shell, lower overhead)
 

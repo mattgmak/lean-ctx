@@ -33,7 +33,7 @@ jobs:
         run: python3 scripts/check-package-versions.py
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.artifact || matrix.target }}
     needs: sdk-gate
     runs-on: ${{ matrix.os }}
     strategy:
@@ -42,6 +42,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+          - target: x86_64-unknown-linux-gnu
+            artifact: x86_64-unknown-linux-gnu-cuda
+            os: ubuntu-22.04
+            cargo_features: ort-cuda
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             cross: true
@@ -147,37 +151,43 @@ jobs:
         working-directory: rust
         shell: bash
         run: |
+          features="${{ matrix.cargo_features }}"
+          feature_args=()
+          if [[ -n "$features" ]]; then
+            feature_args+=(--features "$features")
+          fi
           if [[ "${{ matrix.zig }}" == "true" ]]; then
-            cargo zigbuild --release --locked --target ${{ matrix.target }}
+            cargo zigbuild --release --locked --target ${{ matrix.target }} "${feature_args[@]}"
           elif [[ "${{ matrix.jemalloc }}" == "true" ]]; then
             JEMALLOC_OVERRIDE="${{ steps.jemalloc.outputs.jemalloc-override }}" \
               CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L ${{ steps.jemalloc.outputs.dummy-dir }}" \
-              cargo build --release --locked --target ${{ matrix.target }}
+              cargo build --release --locked --target ${{ matrix.target }} "${feature_args[@]}"
           else
-            cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --release --locked --target ${{ matrix.target }} "${feature_args[@]}"
           fi
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          artifact="${{ matrix.artifact || matrix.target }}"
           cd rust/target/${{ matrix.target }}/release
-          tar czf ../../../../lean-ctx-${{ matrix.target }}.tar.gz lean-ctx
+          tar czf ../../../../lean-ctx-${artifact}.tar.gz lean-ctx
           cd ../../../..
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "rust/target/${{ matrix.target }}/release/lean-ctx.exe" -DestinationPath "lean-ctx-${{ matrix.target }}.zip"
+          Compress-Archive -Path "rust/target/${{ matrix.target }}/release/lean-ctx.exe" -DestinationPath "lean-ctx-${{ matrix.artifact || matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: lean-ctx-${{ matrix.target }}
+          name: lean-ctx-${{ matrix.artifact || matrix.target }}
           path: |
-            lean-ctx-${{ matrix.target }}.tar.gz
-            lean-ctx-${{ matrix.target }}.zip
+            lean-ctx-${{ matrix.artifact || matrix.target }}.tar.gz
+            lean-ctx-${{ matrix.artifact || matrix.target }}.zip
 
   release:
     name: Create Release
@@ -308,7 +318,10 @@ jobs:
             echo "crates.io already has lean-ctx ${CRATE_VERSION} — skipping publish."
             exit 0
           fi
-          cargo publish --allow-dirty --token "${CARGO_REGISTRY_TOKEN}"
+          # --no-verify: rmcp 2.2.0 on crates.io has a compile bug (from_bytes_stream
+          # vs from_byte_stream); our [patch.crates-io] fixes it but is stripped by
+          # cargo package. Binary builds use --locked and are unaffected.
+          cargo publish --allow-dirty --no-verify --token "${CARGO_REGISTRY_TOKEN}"
 
   publish-npm:
     name: Publish to npm
@@ -371,10 +384,10 @@ jobs:
           gh release download "${GITHUB_REF_NAME}" \
             --repo yvgude/lean-ctx --pattern "SHA256SUMS" --dir .
 
-          AARCH64_DARWIN=$(grep "aarch64-apple-darwin" SHA256SUMS | awk '{print $1}')
-          X86_64_DARWIN=$(grep "x86_64-apple-darwin" SHA256SUMS | awk '{print $1}')
-          AARCH64_LINUX_GNU=$(grep "aarch64-unknown-linux-gnu" SHA256SUMS | awk '{print $1}')
-          X86_64_LINUX_GNU=$(grep "x86_64-unknown-linux-gnu" SHA256SUMS | awk '{print $1}')
+          AARCH64_DARWIN=$(grep "aarch64-apple-darwin\.tar\.gz" SHA256SUMS | awk '{print $1}')
+          X86_64_DARWIN=$(grep "x86_64-apple-darwin\.tar\.gz" SHA256SUMS | awk '{print $1}')
+          AARCH64_LINUX_GNU=$(grep "aarch64-unknown-linux-gnu\.tar\.gz" SHA256SUMS | awk '{print $1}')
+          X86_64_LINUX_GNU=$(grep "x86_64-unknown-linux-gnu\.tar\.gz" SHA256SUMS | awk '{print $1}')
 
           echo "aarch64_darwin_sha=${AARCH64_DARWIN}" >> "$GITHUB_OUTPUT"
           echo "x86_64_darwin_sha=${X86_64_DARWIN}" >> "$GITHUB_OUTPUT"

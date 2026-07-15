@@ -463,6 +463,35 @@ fn codex_rewrite_output_uses_native_updated_input_contract() {
     );
 }
 
+/// #809: codex_allow_output produces valid JSON with allow decision.
+#[test]
+fn codex_allow_output_is_valid_json() {
+    let output = codex_allow_output();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&output).expect("codex_allow_output must be valid JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// #809: codex_deny_output with heavily escaped content is valid JSON.
+#[test]
+fn codex_deny_output_with_nested_quotes_is_valid_json() {
+    let complex_cmd = r#"lean-ctx raw 'cat file; printf "
+---
+"; sed -n "55,145p" file2'"#;
+    let output = codex_deny_output(complex_cmd);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&output).expect("codex_deny_output must be valid JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = parsed["hookSpecificOutput"]["reason"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        reason.contains("lean-ctx raw"),
+        "deny reason must contain the command: {reason}"
+    );
+}
+
 #[test]
 fn dual_rewrite_output_carries_claude_cursor_and_copilot_fields() {
     // #551: one JSON object must satisfy Claude (hookSpecificOutput.updatedInput),
@@ -722,11 +751,53 @@ fn extract_field_handles_escaped_backslash() {
 
 #[test]
 fn extract_field_handles_complex_curl() {
-    let input = r#"{"tool_name":"Bash","command":"curl -H \"Authorization: Bearer token\" https://api.com"}"#;
+    let input = r#"{"tool_name":"Bash","command":"curl -H \"Authorization: Bearer [REDACTED:Authorization header] https://api.com"}"#;
     assert_eq!(
         extract_json_field(input, "command"),
-        Some(r#"curl -H "Authorization: Bearer token" https://api.com"#.to_string())
+        Some(
+            r#"curl -H "Authorization: Bearer [REDACTED:Authorization header] https://api.com"#
+                .to_string()
+        )
     );
+}
+
+#[test]
+fn extract_field_decodes_json_newlines() {
+    let input = r#"{"tool_name":"Bash","command":"git add .\ngit commit -m \"done\""}"#;
+    assert_eq!(
+        extract_json_field(input, "command"),
+        Some("git add .\ngit commit -m \"done\"".to_string())
+    );
+}
+
+#[test]
+fn extract_field_decodes_json_tab_and_cr() {
+    let input = r#"{"command":"echo\t\"hello\"\r\n"}"#;
+    assert_eq!(
+        extract_json_field(input, "command"),
+        Some("echo\t\"hello\"\r\n".to_string())
+    );
+}
+
+#[test]
+fn extract_field_preserves_escaped_backslash_before_n() {
+    let input = r#"{"command":"echo \\n"}"#;
+    assert_eq!(
+        extract_json_field(input, "command"),
+        Some("echo \\n".to_string())
+    );
+}
+
+#[test]
+fn unescape_json_string_roundtrips() {
+    assert_eq!(super::unescape_json_string(r"a\nb"), "a\nb");
+    assert_eq!(super::unescape_json_string(r"a\tb"), "a\tb");
+    assert_eq!(super::unescape_json_string(r"a\\b"), "a\\b");
+    assert_eq!(super::unescape_json_string(r#"a\"b"#), "a\"b");
+    assert_eq!(super::unescape_json_string(r"a\/b"), "a/b");
+    assert_eq!(super::unescape_json_string(r"a\r\nb"), "a\r\nb");
+    assert_eq!(super::unescape_json_string(r"\\n"), "\\n");
+    assert_eq!(super::unescape_json_string("plain"), "plain");
 }
 
 #[test]
@@ -931,17 +1002,18 @@ fn classify_redirect_covers_copilot_view_and_rg() {
 
 #[test]
 fn grep_content_mode_only_redirects_explicit_content() {
-    // GH #398 hook follow-up: the path-swap redirect is faithful only for
-    // `output_mode=content`. files_with_matches/count would surface the temp
-    // file itself, and an absent mode is host-dependent (Cursor=content,
-    // Claude Code=files_with_matches), so it must not be redirected blindly.
+    // Explicit modes are authoritative on all hosts.
     let mode = |m: &str| serde_json::json!({ "pattern": "x", "output_mode": m });
     assert!(grep_content_mode(Some(&mode("content"))));
     assert!(!grep_content_mode(Some(&mode("files_with_matches"))));
     assert!(!grep_content_mode(Some(&mode("count"))));
-    assert!(!grep_content_mode(Some(
-        &serde_json::json!({ "pattern": "x" })
-    )));
+    // Absent output_mode defaults to host-dependent: Cursor defaults to
+    // `content` (safe to redirect), Claude Code to `files_with_matches`
+    // (unsafe). `hook_host_is_cursor()` gates the absent case.
+    let absent = serde_json::json!({ "pattern": "x" });
+    let absent_result = grep_content_mode(Some(&absent));
+    let on_cursor = crate::core::config::read_redirect::hook_host_is_cursor();
+    assert_eq!(absent_result, on_cursor);
     assert!(!grep_content_mode(None));
 }
 
@@ -977,15 +1049,18 @@ fn classify_redirect_passes_through_shell_and_unknown() {
 }
 
 #[test]
-fn redirect_read_args_pin_full_mode_never_auto() {
-    // #1021: a redirected native Read must fetch verbatim content. `auto`
-    // degrades large files to a structure MAP (signatures), which is the wrong
-    // payload for a Read and silently drops offset/limit. The host windows the
-    // faithful full content itself.
-    let args = redirect_read_args("/repo/src/main.rs");
-    assert_eq!(args, ["read", "/repo/src/main.rs", "-m", "full"]);
-    assert!(args.contains(&"full"));
-    assert!(!args.contains(&"auto"));
+fn redirect_read_args_smart_mode_selection() {
+    // Windowed reads (offset/limit) use full-compact to preserve line structure.
+    let windowed = redirect_read_args("/repo/src/main.rs", true);
+    assert_eq!(
+        windowed,
+        ["read", "/repo/src/main.rs", "-m", "full-compact"]
+    );
+
+    // Full reads use auto for smart compression (87-97% savings).
+    // Safe on Cursor: StrReplace does NOT fire Read PreToolUse (edit-probe PoC).
+    let full = redirect_read_args("/repo/src/main.rs", false);
+    assert_eq!(full, ["read", "/repo/src/main.rs", "-m", "auto"]);
 }
 
 #[test]
@@ -1106,3 +1181,251 @@ fn gating_decision_fails_open_on_timeout() {
         "fail-open must not wait for the hung work"
     );
 }
+
+// --- GH #760: non-allowlisted binaries must pass through, not block ---
+
+#[test]
+fn gh760_non_rewritable_command_not_wrapped() {
+    assert_eq!(
+        rewrite_candidate("mvnw clean package", "lean-ctx"),
+        None,
+        "mvnw is not in REWRITE_COMMANDS — hook must not wrap it"
+    );
+    assert_eq!(
+        rewrite_candidate("md5sum file.txt", "lean-ctx"),
+        None,
+        "md5sum is not rewritable — must pass through raw"
+    );
+    assert_eq!(
+        rewrite_candidate("update-alternatives --list java", "lean-ctx"),
+        None,
+        "update-alternatives is not rewritable — must pass through raw"
+    );
+}
+
+#[test]
+fn gh760_pipeline_with_path_segments_wraps_when_gate_clean() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "find,tr");
+    let cmd = "find target/quarkus-app/lib -name \"*.jar\" | tr '\\n' ':'";
+    let result = rewrite_candidate(cmd, "lean-ctx");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert_eq!(
+        result,
+        Some(expect_wrapped(cmd, "lean-ctx")),
+        "gate-clean pipeline must be wrapped whole; path segment 'lib' must not interfere"
+    );
+}
+
+#[test]
+fn gh760_pipeline_with_non_allowed_sink_left_raw() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "find");
+    let cmd = "find . -name '*.jar' | custom-tool";
+    let result = rewrite_candidate(cmd, "lean-ctx");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert_eq!(
+        result, None,
+        "non-allowlisted sink must not be wrapped (passes through raw)"
+    );
+}
+
+// --- grep/egrep rewrite (conservative: only safe patterns + flags) ---
+
+#[test]
+fn grep_simple_pattern_rewrites() {
+    assert_eq!(
+        rewrite_candidate("grep pattern src/", "lean-ctx"),
+        Some("lean-ctx grep pattern src/".to_string())
+    );
+}
+
+#[test]
+fn grep_pattern_with_pipe_is_quoted() {
+    assert_eq!(
+        rewrite_candidate("grep -r \"TODO|FIXME\" .", "lean-ctx"),
+        Some("lean-ctx grep \"TODO|FIXME\" .".to_string())
+    );
+}
+
+#[test]
+fn grep_pattern_with_dollar_is_quoted() {
+    assert_eq!(
+        rewrite_candidate("grep -rn \"$HOME\" src/", "lean-ctx"),
+        Some("lean-ctx grep \"$HOME\" src/".to_string())
+    );
+}
+
+#[test]
+fn grep_pattern_with_parens_is_quoted() {
+    assert_eq!(
+        rewrite_candidate("grep -n \"func()\" file.rs", "lean-ctx"),
+        Some("lean-ctx grep \"func()\" file.rs".to_string())
+    );
+}
+
+#[test]
+fn grep_pattern_with_star_is_quoted() {
+    assert_eq!(
+        rewrite_candidate("grep \"func.*Handler\" src/", "lean-ctx"),
+        Some("lean-ctx grep \"func.*Handler\" src/".to_string())
+    );
+}
+
+#[test]
+fn grep_n_flag_stripped() {
+    assert_eq!(
+        rewrite_candidate("grep -n pattern file.rs", "lean-ctx"),
+        Some("lean-ctx grep pattern file.rs".to_string())
+    );
+}
+
+#[test]
+fn grep_rn_combined_safe_flags() {
+    assert_eq!(
+        rewrite_candidate("grep -rn pattern src/", "lean-ctx"),
+        Some("lean-ctx grep pattern src/".to_string())
+    );
+}
+
+#[test]
+fn grep_rni_falls_through_because_i_semantic() {
+    assert_eq!(
+        rewrite_candidate("grep -rni pattern src/", "lean-ctx"),
+        Some(expect_wrapped("grep -rni pattern src/", "lean-ctx"))
+    );
+}
+
+#[test]
+fn grep_no_path_rewrites() {
+    assert_eq!(
+        rewrite_candidate("grep -rn pattern", "lean-ctx"),
+        Some("lean-ctx grep pattern".to_string())
+    );
+}
+
+#[test]
+fn egrep_rewrites_with_quoted_pattern() {
+    assert_eq!(
+        rewrite_candidate("egrep \"func|struct|impl\" src/", "lean-ctx"),
+        Some("lean-ctx grep \"func|struct|impl\" src/".to_string())
+    );
+}
+
+#[test]
+fn fgrep_always_falls_through() {
+    assert_eq!(
+        rewrite_candidate("fgrep literal_string file.rs", "lean-ctx"),
+        Some(expect_wrapped("fgrep literal_string file.rs", "lean-ctx"))
+    );
+}
+
+#[test]
+fn grep_i_falls_through() {
+    assert_eq!(
+        rewrite_candidate("grep -i pattern file.rs", "lean-ctx"),
+        Some(expect_wrapped("grep -i pattern file.rs", "lean-ctx"))
+    );
+}
+
+#[test]
+fn grep_w_falls_through() {
+    assert_eq!(
+        rewrite_candidate("grep -w pattern file.rs", "lean-ctx"),
+        Some(expect_wrapped("grep -w pattern file.rs", "lean-ctx"))
+    );
+}
+
+#[test]
+fn grep_l_falls_through() {
+    assert_eq!(
+        rewrite_candidate("grep -l pattern src/", "lean-ctx"),
+        Some(expect_wrapped("grep -l pattern src/", "lean-ctx"))
+    );
+}
+
+#[test]
+fn grep_include_falls_through() {
+    assert_eq!(
+        rewrite_candidate("grep -rn --include=*.rs pattern src/", "lean-ctx"),
+        Some(expect_wrapped(
+            "grep -rn --include=*.rs pattern src/",
+            "lean-ctx"
+        ))
+    );
+}
+
+#[test]
+fn grep_context_flags_fall_through() {
+    assert_eq!(
+        rewrite_candidate("grep -A5 pattern file.rs", "lean-ctx"),
+        Some(expect_wrapped("grep -A5 pattern file.rs", "lean-ctx"))
+    );
+}
+
+#[test]
+fn grep_multiple_paths_falls_through() {
+    assert_eq!(
+        rewrite_candidate("grep -n pattern file1.rs file2.rs", "lean-ctx"),
+        Some(expect_wrapped(
+            "grep -n pattern file1.rs file2.rs",
+            "lean-ctx"
+        ))
+    );
+}
+
+#[test]
+fn grep_outside_project_falls_through() {
+    assert_eq!(
+        rewrite_candidate("grep pattern ~/Library/something", "lean-ctx"),
+        Some(expect_wrapped(
+            "grep pattern ~/Library/something",
+            "lean-ctx"
+        ))
+    );
+}
+
+// --- rg: safe flags rewrite, semantic flags fall through ---
+
+#[test]
+fn rg_simple_rewrites() {
+    assert_eq!(
+        rewrite_candidate("rg pattern", "lean-ctx"),
+        Some("lean-ctx grep pattern".to_string())
+    );
+    assert_eq!(
+        rewrite_candidate("rg pattern src/", "lean-ctx"),
+        Some("lean-ctx grep pattern src/".to_string())
+    );
+}
+
+#[test]
+fn rg_n_flag_rewrites() {
+    assert_eq!(
+        rewrite_candidate("rg -n pattern src/", "lean-ctx"),
+        Some("lean-ctx grep pattern src/".to_string())
+    );
+}
+
+#[test]
+fn rg_hidden_flag_rewrites() {
+    assert_eq!(
+        rewrite_candidate("rg --hidden pattern src/", "lean-ctx"),
+        Some("lean-ctx grep pattern src/".to_string())
+    );
+}
+
+#[test]
+fn rg_i_falls_through() {
+    assert_eq!(
+        rewrite_candidate("rg -i pattern src/", "lean-ctx"),
+        Some(expect_wrapped("rg -i pattern src/", "lean-ctx"))
+    );
+    assert_eq!(
+        rewrite_candidate("rg --ignore-case pattern src/", "lean-ctx"),
+        Some(expect_wrapped("rg --ignore-case pattern src/", "lean-ctx"))
+    );
+}
+
+#[path = "tests_rewrite_extras.rs"]
+mod rewrite_extras;

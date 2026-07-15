@@ -492,7 +492,7 @@ fn cmd_tool_profile_switch(name: &str) {
         println!("Tool profile set to: lean (default)");
         println!("  Tools advertised: {lazy_count} (lazy core)");
         println!("  All other tools stay callable via ctx_call.");
-        println!("\n  Restart your AI tool / IDE for changes to take effect.");
+        println!("\n  Changes take effect on the next tool call (auto-detected).");
         return;
     }
 
@@ -526,7 +526,7 @@ fn cmd_tool_profile_switch(name: &str) {
         }
     }
 
-    println!("\n  Restart your AI tool / IDE for changes to take effect.");
+    println!("\n  Changes take effect on the next tool call (auto-detected).");
 }
 
 fn print_profile_help() {

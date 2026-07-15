@@ -45,13 +45,26 @@ pub(crate) fn cmd_embeddings(rest: &[String]) {
             if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
                 println!("ORT_DYLIB_PATH override active: {p}");
             }
+            #[cfg(feature = "embeddings")]
+            println!(
+                "{}",
+                crate::core::ort_execution_providers::execution_provider_status()
+            );
+            #[cfg(feature = "embeddings")]
+            println!(
+                "{}",
+                crate::core::ort_execution_providers::execution_provider_help()
+            );
         }
         Some(other) => {
             eprintln!(
                 "Unknown subcommand `{other}`.\n\n\
                  Usage:\n  \
                  lean-ctx embeddings status              Show the managed ONNX Runtime state\n  \
-                 lean-ctx embeddings provision [--force] Download the official CPU runtime (sha256-pinned)"
+                                 lean-ctx embeddings provision [--force] Download the official CPU runtime (sha256-pinned)
+
+                                 GPU opt-in:
+                                     LEAN_CTX_ORT_EXECUTION_PROVIDER=gpu|auto"
             );
             std::process::exit(1);
         }

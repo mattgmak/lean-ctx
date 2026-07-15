@@ -1,15 +1,29 @@
 use super::super::{HookMode, install_project_rules, resolve_binary_path};
 
+const HERMES_BLOCK_START: &str = "<!-- lean-ctx -->";
+const HERMES_BLOCK_END: &str = "<!-- /lean-ctx -->";
+
+fn hermes_marked_block(mode: HookMode) -> String {
+    let body = if mode == HookMode::Replace {
+        hermes_replace_rules_content()
+    } else {
+        hermes_rules_content()
+    };
+    format!("{HERMES_BLOCK_START}\n{body}{HERMES_BLOCK_END}")
+}
+
 /// Produce Hermes rules content: canonical shared rules followed by
 /// Hermes-specific extras (available tools, multi-agent notes).
 /// The canonical section uses markers so the injection layer can update it;
 /// Hermes extras sit after END_MARK and are preserved as user content.
 pub(super) fn hermes_rules_content() -> String {
-    let shadow = crate::core::config::Config::load().shadow_mode;
+    let cfg = crate::core::config::Config::load();
+    let profile = crate::core::tool_profiles::ToolProfile::from_config(&cfg);
     let base = crate::core::rules_canonical::render(
-        shadow,
+        cfg.shadow_mode,
         crate::core::rules_canonical::Wrapper::Shared,
         crate::core::config::CompressionLevel::Off,
+        &profile,
     );
     format!(
         "{base}\n\
@@ -42,7 +56,7 @@ pub(crate) fn install_hermes_hook_with_mode(global: bool, mode: HookMode) {
         .setup
         .should_update_mcp();
     match mode {
-        HookMode::Mcp | HookMode::Hybrid if update_mcp => {
+        HookMode::Mcp | HookMode::Hybrid | HookMode::Replace if update_mcp => {
             match crate::core::editor_registry::write_config_with_options(
                 &target,
                 &binary,
@@ -97,55 +111,54 @@ pub(crate) fn install_hermes_hook_with_mode(global: bool, mode: HookMode) {
     }
 }
 
-fn install_hermes_rules(home: &std::path::Path, _mode: HookMode) {
+fn install_hermes_rules(home: &std::path::Path, mode: HookMode) {
     let rules_path = home.join(".hermes/HERMES.md");
-    let content = hermes_rules_content();
-
-    if rules_path.exists() {
-        let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
-        if existing.contains("lean-ctx") {
-            eprintln!("  Hermes rules already present in ~/.hermes/HERMES.md");
-            return;
-        }
-        let mut updated = existing;
-        if !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push('\n');
-        updated.push_str(&content);
-        let _ = std::fs::write(&rules_path, updated);
-        eprintln!("  \x1b[32m✓\x1b[0m Appended lean-ctx rules to ~/.hermes/HERMES.md");
-    } else {
-        if let Some(parent) = rules_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&rules_path, &content);
-        eprintln!("  \x1b[32m✓\x1b[0m Created ~/.hermes/HERMES.md with lean-ctx rules");
+    if let Some(parent) = rules_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let block = hermes_marked_block(mode);
+    crate::marked_block::upsert(
+        &rules_path,
+        HERMES_BLOCK_START,
+        HERMES_BLOCK_END,
+        &block,
+        false,
+        "lean-ctx rules in ~/.hermes/HERMES.md",
+    );
 }
 
-fn install_project_hermes_rules(_mode: HookMode) {
+fn hermes_replace_rules_content() -> String {
+    let cfg = crate::core::config::Config::load();
+    let profile = crate::core::tool_profiles::ToolProfile::from_config(&cfg);
+    let base = crate::core::rules_canonical::render(
+        cfg.shadow_mode,
+        crate::core::rules_canonical::Wrapper::Shared,
+        crate::core::config::CompressionLevel::Off,
+        &profile,
+    );
+    format!(
+        "{base}\n\
+         ## Replace Mode — native tools denied\n\
+         Native Read/Grep/Glob/Bash are denied. Use ONLY ctx_* MCP tools.\n\
+         Available tools: ctx_overview, ctx_preload, ctx_dedup, ctx_compress, \
+         ctx_session, ctx_knowledge, ctx_semantic_search.\n\
+         Multi-agent: ctx_agent(action=handoff|sync). \
+         Diary: ctx_agent(action=diary, category=discovery|decision|blocker|progress|insight).\n"
+    )
+}
+
+fn install_project_hermes_rules(mode: HookMode) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
     let rules_path = cwd.join(".hermes.md");
-    let content = hermes_rules_content();
-    if rules_path.exists() {
-        let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
-        if existing.contains("lean-ctx") {
-            eprintln!("  .hermes.md already contains lean-ctx rules");
-            return;
-        }
-        let mut updated = existing;
-        if !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push('\n');
-        updated.push_str(&content);
-        let _ = std::fs::write(&rules_path, updated);
-        eprintln!("  \x1b[32m✓\x1b[0m Appended lean-ctx rules to .hermes.md");
-    } else {
-        let _ = std::fs::write(&rules_path, &content);
-        eprintln!("  \x1b[32m✓\x1b[0m Created .hermes.md with lean-ctx rules");
-    }
+    let block = hermes_marked_block(mode);
+    crate::marked_block::upsert(
+        &rules_path,
+        HERMES_BLOCK_START,
+        HERMES_BLOCK_END,
+        &block,
+        false,
+        "lean-ctx rules in .hermes.md",
+    );
 }

@@ -54,6 +54,49 @@ impl ToolProfile {
         }
     }
 
+    /// Returns a profile that behaves identically except `tool_name` reports as
+    /// disabled. Used to align rules-injection with the effective tool visibility
+    /// for native-editor clients that hide specific tools (#1008).
+    #[must_use]
+    pub fn without_tool(&self, tool_name: &str) -> Self {
+        if !self.is_tool_enabled(tool_name) {
+            return self.clone();
+        }
+        match self {
+            Self::Power => Self::Custom(
+                crate::tool_defs::CORE_TOOL_NAMES
+                    .iter()
+                    .chain(STANDARD_TOOLS.iter())
+                    .copied()
+                    .filter(|t| *t != tool_name)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            ),
+            Self::Standard => Self::Custom(
+                STANDARD_TOOLS
+                    .iter()
+                    .filter(|t| **t != tool_name)
+                    .map(|t| String::from(*t))
+                    .collect(),
+            ),
+            Self::Minimal => Self::Custom(
+                MINIMAL_TOOLS
+                    .iter()
+                    .filter(|t| **t != tool_name)
+                    .map(|t| String::from(*t))
+                    .collect(),
+            ),
+            Self::Custom(list) => Self::Custom(
+                list.iter()
+                    .filter(|t| t.as_str() != tool_name)
+                    .cloned()
+                    .collect(),
+            ),
+        }
+    }
+
     pub fn is_tool_enabled(&self, tool_name: &str) -> bool {
         match self {
             Self::Power => true,
@@ -170,6 +213,7 @@ const STANDARD_TOOLS: &[&str] = &[
     "ctx_compose",
     "ctx_explore",
     "ctx_knowledge",
+    "ctx_session",
     "ctx_callgraph",
     "ctx_graph",
     "ctx_delta",
@@ -198,8 +242,8 @@ pub fn list_profiles() -> Vec<ProfileInfo> {
         },
         ProfileInfo {
             name: "standard",
-            tool_count: "16",
-            description: "Balanced set — adds compose, explore, callgraph, patch, execute, more",
+            tool_count: "17",
+            description: "Balanced set — adds compose, knowledge, session, callgraph, patch, more",
         },
         ProfileInfo {
             name: "power",
@@ -334,6 +378,7 @@ mod tests {
         assert!(profile.is_tool_enabled("ctx_glob"));
         assert!(profile.is_tool_enabled("ctx_callgraph"));
         assert!(profile.is_tool_enabled("ctx_graph"));
+        assert!(profile.is_tool_enabled("ctx_session"));
         assert!(profile.is_tool_enabled("ctx_delta"));
         assert!(profile.is_tool_enabled("ctx_expand"));
         assert!(profile.is_tool_enabled("ctx_execute"));
@@ -567,5 +612,28 @@ mod tests {
     fn clear_profile_on_missing_config_is_ok() {
         let _iso = crate::core::data_dir::isolated_data_dir();
         clear_profile_in_config().unwrap();
+    }
+
+    #[test]
+    fn without_tool_removes_from_power() {
+        let filtered = ToolProfile::Power.without_tool("ctx_patch");
+        assert!(!filtered.is_tool_enabled("ctx_patch"));
+        assert!(filtered.is_tool_enabled("ctx_read"));
+        assert!(filtered.is_tool_enabled("ctx_search"));
+    }
+
+    #[test]
+    fn without_tool_removes_from_standard() {
+        let filtered = ToolProfile::Standard.without_tool("ctx_patch");
+        assert!(!filtered.is_tool_enabled("ctx_patch"));
+        assert!(filtered.is_tool_enabled("ctx_read"));
+        assert!(filtered.is_tool_enabled("ctx_compose"));
+    }
+
+    #[test]
+    fn without_tool_noop_for_already_missing() {
+        let filtered = ToolProfile::Minimal.without_tool("ctx_patch");
+        assert!(!filtered.is_tool_enabled("ctx_patch"));
+        assert!(filtered.is_tool_enabled("ctx_read"));
     }
 }

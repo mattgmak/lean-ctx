@@ -65,9 +65,14 @@ impl fmt::Display for LineRange {
 pub(crate) enum ReadMode {
     /// Verbatim, edit-ready (framed) — `"full"`.
     Full,
+    /// Headerless, trailing-whitespace-stripped verbatim — `"full-compact"`.
+    /// Used by the Read redirect to produce temp files faithful to the
+    /// original line structure while saving framing overhead.
+    FullCompact,
     /// Verbatim + per-line `N:hh|` hash anchors, edit-ready for `ctx_patch`
-    /// (epic #1008) — `"anchored"`. Lossless (a strict superset of `full`).
-    Anchored,
+    /// (epic #1008) — `"anchored"`, or windowed as `"anchored:N-M"` (#811) so a
+    /// bounded anchored read never has to materialize/anchor the whole file.
+    Anchored(Option<LineRange>),
     /// Exact bytes, no framing — `"raw"`.
     Raw,
     /// API surface — `"signatures"`.
@@ -133,7 +138,8 @@ impl FromStr for ReadMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "full" => ReadMode::Full,
-            "anchored" => ReadMode::Anchored,
+            "full-compact" => ReadMode::FullCompact,
+            "anchored" => ReadMode::Anchored(None),
             "raw" => ReadMode::Raw,
             "signatures" => ReadMode::Signatures,
             "map" => ReadMode::Map,
@@ -146,6 +152,8 @@ impl FromStr for ReadMode {
             other => {
                 if let Some(payload) = other.strip_prefix("lines:") {
                     ReadMode::Lines(parse_line_range(payload)?)
+                } else if let Some(payload) = other.strip_prefix("anchored:") {
+                    ReadMode::Anchored(Some(parse_line_range(payload)?))
                 } else if let Some(payload) = other.strip_prefix("density:") {
                     let target = payload
                         .trim()
@@ -164,7 +172,7 @@ impl fmt::Display for ReadMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let keyword = match self {
             ReadMode::Full => "full",
-            ReadMode::Anchored => "anchored",
+            ReadMode::FullCompact => "full-compact",
             ReadMode::Raw => "raw",
             ReadMode::Signatures => "signatures",
             ReadMode::Map => "map",
@@ -174,6 +182,8 @@ impl fmt::Display for ReadMode {
             ReadMode::Reference => "reference",
             ReadMode::Auto => "auto",
             ReadMode::Diff => "diff",
+            ReadMode::Anchored(None) => "anchored",
+            ReadMode::Anchored(Some(range)) => return write!(f, "anchored:{range}"),
             ReadMode::Lines(range) => return write!(f, "lines:{range}"),
             // Matches the handler's historical `format!("density:{:.2}", …)`.
             ReadMode::Density(target) => return write!(f, "density:{target:.2}"),
@@ -204,7 +214,7 @@ impl ReadMode {
                 // Anchored carries per-line anchors the agent edits against;
                 // collapsing to bare bytes on a small file would strip them and
                 // defeat the mode, so it opts out of the #361 raw cap.
-                | ReadMode::Anchored
+                | ReadMode::Anchored(_)
         )
     }
 
@@ -232,7 +242,11 @@ impl ReadMode {
     pub(crate) fn counts_as_compressed(&self) -> bool {
         // `anchored` is lossless (verbatim + anchors), so like `full` it must not
         // count as a "compressed" read for bounce/quality tracking.
-        !matches!(self, ReadMode::Full | ReadMode::Diff | ReadMode::Anchored)
+        // `full-compact` only strips trailing whitespace — functionally verbatim.
+        !matches!(
+            self,
+            ReadMode::Full | ReadMode::FullCompact | ReadMode::Diff | ReadMode::Anchored(_)
+        )
     }
 }
 
@@ -243,6 +257,7 @@ mod tests {
     /// Every canonical mode string the handler/`render.rs` produce or accept.
     const CANONICAL: &[&str] = &[
         "full",
+        "full-compact",
         "anchored",
         "raw",
         "signatures",
@@ -277,7 +292,10 @@ mod tests {
     }
 
     fn legacy_counts_as_compressed(mode: &str) -> bool {
-        !matches!(mode, "full" | "diff" | "lines" | "anchored")
+        !matches!(
+            mode,
+            "full" | "full-compact" | "diff" | "lines" | "anchored"
+        )
     }
 
     #[test]
@@ -367,6 +385,29 @@ mod tests {
     #[test]
     fn line_range_clamps_start_to_one() {
         assert_eq!(LineRange::new(0, 10).start, 1);
+    }
+
+    #[test]
+    fn anchored_window_parses_and_displays() {
+        assert_eq!(
+            "anchored:5-10".parse::<ReadMode>().unwrap(),
+            ReadMode::Anchored(Some(LineRange::new(5, 10)))
+        );
+        assert_eq!(
+            "anchored:5-10".parse::<ReadMode>().unwrap().to_string(),
+            "anchored:5-10"
+        );
+        assert_eq!(
+            "anchored".parse::<ReadMode>().unwrap(),
+            ReadMode::Anchored(None)
+        );
+    }
+
+    #[test]
+    fn anchored_window_opts_out_of_raw_cap_and_compressed_count() {
+        let windowed: ReadMode = "anchored:5-10".parse().unwrap();
+        assert!(!windowed.allows_raw_cap());
+        assert!(!windowed.counts_as_compressed());
     }
 
     #[test]

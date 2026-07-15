@@ -26,7 +26,12 @@ pub fn canonical_body() -> String {
     format!(
         "{}\n{}\n",
         rules_canonical::PROJECT_LEAN_CTX_OWNED_MARKER,
-        rules_canonical::render(false, Wrapper::Longform, CompressionLevel::Off)
+        rules_canonical::render(
+            false,
+            Wrapper::Longform,
+            CompressionLevel::Off,
+            &super::tool_profiles::ToolProfile::Power,
+        )
     )
 }
 

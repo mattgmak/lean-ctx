@@ -1,6 +1,6 @@
 <!-- lean-ctx-owned: PROJECT-LEAN-CTX.md v1 -->
 <!-- lean-ctx-rules -->
-<!-- version: 6 -->
+<!-- version: 8 -->
 
 CRITICAL: ALWAYS use lean-ctx ctx_* tools instead of native equivalents. This is NOT optional.
 
@@ -18,27 +18,26 @@ NEVER use native Read/Grep/Shell/Glob when a ctx_* equivalent exists. SELF-CORRE
 Tool selection by intent:
 • Orient / understand code (call FIRST) -> ctx_compose
 • Read a file -> ctx_read(path, mode=signatures|map|full); edit after reading -> ctx_patch
-• Exact symbol -> ctx_symbol; pattern -> ctx_search; by meaning -> ctx_semantic_search
+• Exact symbol -> ctx_search(action=symbol); pattern -> ctx_search; by meaning -> ctx_search(action=semantic)
 • Files by glob -> ctx_glob; structure -> ctx_tree; callers/impact -> ctx_callgraph
 • Verify after edits -> ctx_shell(test/build); memory -> ctx_session / ctx_knowledge
 Semantic questions -> search tools, not whole-file reads: reading more ≠ understanding more.
 
 AGENT LOOP (phase -> tool):
 • Orient — understand before acting -> ctx_compose
-• Find — exact symbol by name -> ctx_symbol
+• Find — exact symbol by name -> ctx_search(action=symbol)
 • Read — a file, structurally -> ctx_read(mode=signatures|map)
 • Locate — a pattern across files -> ctx_search
 • Trace — callers / callees / blast radius -> ctx_callgraph
 • Verify — after an edit -> ctx_shell(test/build) + native lints
 
 Anti-patterns — do NOT:
-• Chain ctx_search -> ctx_read -> ctx_symbol — one ctx_compose replaces all three
+• Chain ctx_search -> ctx_read -> ctx_search(action=symbol) — one ctx_compose replaces all three
 • Use ctx_read(mode=full) for orientation — use mode=signatures
-• Use ctx_callgraph/ctx_graph for const/static/variable refs — they track call
-edges and file deps only; use ctx_search instead
+• Use ctx_callgraph/ctx_graph for const/static/variable refs — they track call edges and file deps only; use ctx_search instead
 
 NAVIGATION PARADOX: reading more ≠ understanding more.
-• Semantic question ("where/how is X handled?") -> ctx_search (BM25) + ctx_semantic_search (meaning), not whole-file reads
+• Semantic question ("where/how is X handled?") -> ctx_search (BM25) + ctx_search(action=semantic) (meaning), not whole-file reads
 • Hidden architectural deps (who calls this, what breaks) -> ctx_callgraph / ctx_graph — for these only
 • Navigate structure (signatures, symbols) before reading entire files
 

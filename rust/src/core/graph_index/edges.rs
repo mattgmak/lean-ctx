@@ -39,13 +39,28 @@ fn build_edges_with_cache(index: &mut ProjectIndex, content_cache: &HashMap<Stri
     let resolver_ctx =
         import_resolver::ResolverContext::new(root_path, file_paths.clone(), content_cache);
 
-    // #934: the per-file deep analysis (a second tree-sitter parse) dominates the
-    // edge-build cost and is pure + thread-safe (thread_local parser, read-only
-    // resolver context). Fan it out, collecting in file order; the sequential
-    // branch keeps the memory-pressure early-break. Edges are sorted + deduped
-    // below, so per-file insertion order never affects the result.
-    let per_file: Vec<FileEdges> = if crate::core::memory_guard::is_under_pressure() {
-        let mut acc = Vec::with_capacity(file_paths.len());
+    // #934 + #790: fan out in 500-file batches with memory pressure checks
+    // between them. Under pressure, fall back to sequential with 1000-file checks.
+    const EDGE_BATCH_SIZE: usize = 500;
+    // #790: flush edges into index.edges after each batch instead of
+    // accumulating all FileEdges in a Vec. Only type_inputs (C#/Java/Go/Kotlin)
+    // are retained across batches for the cross-file type_ref pass.
+    let mut type_inputs: Vec<(String, String, crate::core::deep_queries::DeepAnalysis)> =
+        Vec::new();
+
+    let flush_batch =
+        |results: Vec<FileEdges>,
+         index: &mut ProjectIndex,
+         type_inputs: &mut Vec<(String, String, crate::core::deep_queries::DeepAnalysis)>| {
+            for fe in results {
+                index.edges.extend(fe.edges);
+                if let Some(ti) = fe.type_input {
+                    type_inputs.push(ti);
+                }
+            }
+        };
+
+    if crate::core::memory_guard::is_under_pressure() {
         for (i, rel_path) in file_paths.iter().enumerate() {
             if i.is_multiple_of(1000) && crate::core::memory_guard::is_under_pressure() {
                 tracing::warn!(
@@ -54,31 +69,33 @@ fn build_edges_with_cache(index: &mut ProjectIndex, content_cache: &HashMap<Stri
                 );
                 break;
             }
-            acc.push(resolve_file_edges(
-                rel_path,
-                content_cache,
-                &resolver_ctx,
-                root_path,
-            ));
+            let fe = resolve_file_edges(rel_path, content_cache, &resolver_ctx, root_path);
+            index.edges.extend(fe.edges);
+            if let Some(ti) = fe.type_input {
+                type_inputs.push(ti);
+            }
         }
-        acc
     } else {
-        file_paths
-            .par_iter()
-            .map(|rel_path| resolve_file_edges(rel_path, content_cache, &resolver_ctx, root_path))
-            .collect()
-    };
-
-    // Full analyses of C#/Java/Go/Kotlin files, kept to derive cross-file
-    // type_ref edges after the import pass (GH #398). Those languages resolve
-    // same-namespace/package types without an import, so the import list alone
-    // is not enough.
-    let mut type_inputs: Vec<(String, String, crate::core::deep_queries::DeepAnalysis)> =
-        Vec::new();
-    for fe in per_file {
-        index.edges.extend(fe.edges);
-        if let Some(ti) = fe.type_input {
-            type_inputs.push(ti);
+        for (batch_no, batch) in file_paths.chunks(EDGE_BATCH_SIZE).enumerate() {
+            if crate::core::memory_guard::abort_requested() {
+                tracing::warn!(
+                    "[graph_index: aborting edge-building at batch {batch_no} due to critical memory pressure]",
+                );
+                break;
+            }
+            if crate::core::memory_guard::is_under_pressure() {
+                tracing::warn!(
+                    "[graph_index: stopping edge-building at batch {batch_no} due to memory pressure]",
+                );
+                break;
+            }
+            let batch_results: Vec<FileEdges> = batch
+                .par_iter()
+                .map(|rel_path| {
+                    resolve_file_edges(rel_path, content_cache, &resolver_ctx, root_path)
+                })
+                .collect();
+            flush_batch(batch_results, index, &mut type_inputs);
         }
     }
 

@@ -4,4 +4,3 @@ use lean_ctx::cloud_server;
 async fn main() -> anyhow::Result<()> {
     cloud_server::run().await
 }
-

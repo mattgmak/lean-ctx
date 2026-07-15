@@ -289,7 +289,7 @@ impl CtxReadTool {
         let mut delta_explicit_note: Option<String> = None;
         if !fresh
             && explicit_mode
-            && (mode == "full" || mode.starts_with("lines:"))
+            && (mode == "full" || mode == "full-compact" || mode.starts_with("lines:"))
             && crate::core::config::Config::load().delta_explicit_effective()
             && let Ok(cache) = cache_lock.try_read()
         {
@@ -320,7 +320,9 @@ impl CtxReadTool {
             {
                 let msg = format!(
                     "File too large ({} bytes, limit {} bytes via LCTX_MAX_READ_BYTES). \
-                         Use mode=\"lines:1-100\" for partial reads or increase the limit.",
+                     Use mode=\"lines:1-100\" or start_line+limit for partial reads, \
+                     mode=\"anchored\" with start_line+limit for edit-ready windows, \
+                     or increase the limit.",
                     meta.len(),
                     cap
                 );
@@ -363,7 +365,7 @@ impl CtxReadTool {
                 // Phase 2. When aggressiveness is set `mode` was already rewritten
                 // to `density:` upstream, so it never reaches this `auto` branch.
                 if !fresh
-                    && (mode == "full" || mode == "auto")
+                    && (mode == "full" || mode == "full-compact" || mode == "auto")
                     && let Ok(cache) = cache_lock.try_read()
                     && let Some(read_output) =
                         crate::tools::ctx_read::try_stub_hit_readonly(&cache, path)
@@ -466,7 +468,7 @@ impl CtxReadTool {
                     // missing in the slow path, forcing every slow-path call into
                     // the expensive write-lock branch.
                     if !fresh
-                        && (mode == "full" || mode == "auto")
+                        && (mode == "full" || mode == "full-compact" || mode == "auto")
                         && let Ok(cache) = cache_lock.try_read()
                         && let Some(read_output) =
                             crate::tools::ctx_read::try_stub_hit_readonly(&cache, &path_owned)
@@ -489,79 +491,374 @@ impl CtxReadTool {
                         return;
                     }
 
-                    // Phase 2b: brief cache write-lock — compute + store.
-                    let mut cache = {
+                    // ── Phase 2b: Three-sub-phase read (#807) ──────────
+                    //
+                    // Previously held the global cache write-lock for the
+                    // entire computation (tree-sitter, entropy compression).
+                    // For large files this caused 30+ second lock holds and
+                    // cascading timeouts for all concurrent tool calls.
+                    //
+                    // New: prepare (brief lock) → compute (no lock) → store (brief lock).
+
+                    let task_ref = task_owned.as_deref();
+                    let tuning =
+                        crate::tools::ctx_read::ReadTuning::resolve(aggressiveness, &protect_owned);
+
+                    // Helper: acquire write lock with deadline.
+                    macro_rules! acquire_write {
+                        ($deadline_secs:expr, $label:expr) => {{
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_secs($deadline_secs);
+                            loop {
+                                if cancel_flag.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                if let Ok(guard) = cache_lock.try_write() {
+                                    break guard;
+                                }
+                                if std::time::Instant::now() >= deadline {
+                                    tracing::error!(
+                                        "ctx_read: cache write-lock timeout ({}) for {path_owned}",
+                                        $label,
+                                    );
+                                    let _ = tx.send((
+                                        format!(
+                                            "cache lock contention for {path_owned} — retry in a moment"
+                                        ),
+                                        "error".into(),
+                                        0,
+                                        false,
+                                        None,
+                                        (0, 0),
+                                    ));
+                                    return;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                        }};
+                    }
+
+                    // 2b-i: Brief write lock — prepare cache state, resolve
+                    // mode, check for hits. Sub-millisecond: HashMap lookups,
+                    // staleness checks, raw-content storage for new files.
+                    #[allow(clippy::large_enum_variant)]
+                    enum PrepareOutcome {
+                        Hit(String, String, usize, bool, Option<String>, (u64, u64)),
+                        Compute {
+                            file_ref: String,
+                            resolved_mode: String,
+                            content: String,
+                            original_tokens: usize,
+                        },
+                    }
+
+                    let outcome = {
+                        let mut cache = acquire_write!(10, "prepare 10s");
+
+                        if crate::core::plugins::PluginManager::has_listener("pre_read") {
+                            crate::core::plugins::PluginManager::fire_hook_background(
+                                crate::core::plugins::executor::HookPoint::PreRead {
+                                    path: path_owned.clone(),
+                                },
+                            );
+                        }
+                        if let Ok(mut bt) = crate::core::bounce_tracker::global().lock() {
+                            bt.next_seq();
+                        }
+
+                        let file_ref = cache.get_file_ref(&path_owned);
+
+                        let effective_fresh = fresh
+                            || crate::tools::ctx_read::force_fresh_env()
+                            || (crate::tools::ctx_read::is_subagent_context()
+                                && !crate::core::conversation::scope_enabled());
+
+                        let mode_eff = if mode != "raw"
+                            && !mode.starts_with("lines:")
+                            && crate::core::config::Config::load()
+                                .proxy
+                                .is_path_compress_protected(&path_owned)
+                        {
+                            "full".to_string()
+                        } else {
+                            mode.clone()
+                        };
+
+                        if effective_fresh {
+                            cache.invalidate(&path_owned);
+                        }
+
+                        if !effective_fresh {
+                            let stale = cache.get(&path_owned).is_some_and(|e| {
+                                crate::core::cache::is_cache_entry_stale_verified(
+                                    &path_owned,
+                                    e.stored_mtime,
+                                    &e.hash,
+                                )
+                            });
+                            if stale {
+                                cache.invalidate(&path_owned);
+                            }
+                        }
+
+                        let snap = cache
+                            .get(&path_owned)
+                            .map(|e| (e.original_tokens, e.content()));
+
+                        if let Some((orig_tok, content_opt)) = snap {
+                            let resolved = if mode_eff == "auto" {
+                                tuning.auto_density_mode().unwrap_or_else(|| {
+                                    crate::tools::ctx_read::resolve_auto_mode(
+                                        Some(&cache),
+                                        &path_owned,
+                                        orig_tok,
+                                        task_ref,
+                                    )
+                                })
+                            } else {
+                                mode_eff
+                            };
+
+                            if (resolved == "full" || resolved == "full-compact")
+                                && let Some(out) = crate::tools::ctx_read::try_stub_hit_readonly(
+                                    &cache,
+                                    &path_owned,
+                                )
+                            {
+                                let orig = cache.get(&path_owned).map_or(0, |e| e.original_tokens);
+                                let fref = cache.file_ref_map().get(path_owned.as_str()).cloned();
+                                let s = cache.get_stats();
+                                PrepareOutcome::Hit(
+                                    out.content,
+                                    out.resolved_mode,
+                                    orig,
+                                    true,
+                                    fref,
+                                    (s.total_reads(), s.cache_hits()),
+                                )
+                            } else if crate::tools::ctx_read::is_cacheable_mode(&resolved) {
+                                let ck = crate::tools::ctx_read::compressed_cache_key(
+                                    &resolved,
+                                    crp_mode,
+                                    task_ref,
+                                    tuning.aggressiveness,
+                                    tuning.protect,
+                                );
+                                if let Some(hit) = cache.get_compressed(&path_owned, &ck).cloned() {
+                                    let hit = crate::core::redaction::redact_text_if_enabled(&hit);
+                                    let orig =
+                                        cache.get(&path_owned).map_or(0, |e| e.original_tokens);
+                                    let fref =
+                                        cache.file_ref_map().get(path_owned.as_str()).cloned();
+                                    let s = cache.get_stats();
+                                    PrepareOutcome::Hit(
+                                        hit,
+                                        resolved,
+                                        orig,
+                                        true,
+                                        fref,
+                                        (s.total_reads(), s.cache_hits()),
+                                    )
+                                } else {
+                                    let c = content_opt
+                                        .or_else(|| preread.as_deref().map(String::from));
+                                    PrepareOutcome::Compute {
+                                        file_ref,
+                                        resolved_mode: resolved,
+                                        content: c.unwrap_or_default(),
+                                        original_tokens: orig_tok,
+                                    }
+                                }
+                            } else {
+                                let c =
+                                    content_opt.or_else(|| preread.as_deref().map(String::from));
+                                PrepareOutcome::Compute {
+                                    file_ref,
+                                    resolved_mode: resolved,
+                                    content: c.unwrap_or_default(),
+                                    original_tokens: orig_tok,
+                                }
+                            }
+                        } else {
+                            let raw = preread.unwrap_or_else(|| {
+                                crate::tools::ctx_read::read_file_lossy(&path_owned)
+                                    .unwrap_or_default()
+                            });
+                            let sr = cache.store(&path_owned, &raw);
+                            let resolved = if mode_eff == "auto" {
+                                tuning.auto_density_mode().unwrap_or_else(|| {
+                                    crate::tools::ctx_read::resolve_auto_mode(
+                                        None,
+                                        &path_owned,
+                                        sr.original_tokens,
+                                        task_ref,
+                                    )
+                                })
+                            } else {
+                                mode_eff
+                            };
+                            PrepareOutcome::Compute {
+                                file_ref,
+                                resolved_mode: resolved,
+                                content: raw,
+                                original_tokens: sr.original_tokens,
+                            }
+                        }
+                    }; // write lock released
+
+                    if let PrepareOutcome::Hit(c, rm, orig, hit, fref, ss) = outcome {
+                        let _ = tx.send((c, rm, orig, hit, fref, ss));
+                        return;
+                    }
+                    let PrepareOutcome::Compute {
+                        file_ref,
+                        resolved_mode,
+                        content: compute_content,
+                        original_tokens,
+                    } = outcome
+                    else {
+                        unreachable!()
+                    };
+
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    // 2b-ii: Heavy computation WITHOUT cache lock.
+                    // Tree-sitter, entropy compression, mode rendering all
+                    // run under the per-file mutex only (serializes same-file
+                    // reads, but does not block other files or tool calls).
+                    let short = crate::core::protocol::shorten_path(&path_owned);
+                    let ext_s = std::path::Path::new(&*path_owned)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+
+                    let (mut computed, rmode) = if resolved_mode == "full"
+                        || resolved_mode == "full-compact"
+                    {
+                        if resolved_mode == "full-compact" {
+                            let (out, _) = crate::tools::ctx_read::format_full_compact_output(
+                                &compute_content,
+                            );
+                            (out, "full-compact".to_string())
+                        } else {
+                            let lc = compute_content.lines().count();
+                            let (out, _) = crate::tools::ctx_read::format_full_output(
+                                &file_ref,
+                                &short,
+                                ext_s,
+                                &compute_content,
+                                original_tokens,
+                                lc,
+                                task_ref,
+                            );
+                            let ft = crate::core::tokens::count_tokens(&out);
+                            let out = crate::tools::ctx_read::cap_to_raw(
+                                out,
+                                ft,
+                                &compute_content,
+                                original_tokens,
+                            );
+                            (out, "full".to_string())
+                        }
+                    } else {
+                        let (out, _) = crate::tools::ctx_read::process_mode_tuned(
+                            &compute_content,
+                            &resolved_mode,
+                            &file_ref,
+                            &short,
+                            ext_s,
+                            original_tokens,
+                            crp_mode,
+                            &path_owned,
+                            task_ref,
+                            tuning,
+                        );
+                        let out = if crate::tools::ctx_read::mode_allows_raw_cap(&resolved_mode) {
+                            let ft = crate::core::tokens::count_tokens(&out);
+                            crate::tools::ctx_read::cap_to_raw(
+                                out,
+                                ft,
+                                &compute_content,
+                                original_tokens,
+                            )
+                        } else {
+                            out
+                        };
+                        (out, resolved_mode)
+                    };
+
+                    computed = crate::core::redaction::redact_text_if_enabled(&computed);
+
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    // 2b-iii: Brief write lock — store result + metadata.
+                    // Sub-millisecond: HashMap insert + stats snapshot.
+                    // Graceful degradation: if the lock cannot be acquired
+                    // within 5s, return the result without caching it.
+                    {
                         let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(25);
-                        loop {
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        let cache_guard = loop {
                             if cancel_flag.load(Ordering::Relaxed) {
                                 return;
                             }
-                            if let Ok(guard) = cache_lock.try_write() {
-                                break guard;
+                            if let Ok(g) = cache_lock.try_write() {
+                                break Some(g);
                             }
                             if std::time::Instant::now() >= deadline {
-                                tracing::error!(
-                                    "ctx_read: cache write-lock timeout after 25s for {path_owned}"
+                                tracing::warn!(
+                                    "ctx_read: store-lock timeout (5s) for {path_owned},                                      returning without caching"
                                 );
-                                let _ = tx.send((
-                                    format!(
-                                        "cache lock contention for {path_owned} — retry in a moment"
-                                    ),
-                                    "error".to_string(),
-                                    0,
-                                    false,
-                                    None,
-                                    (0, 0),
-                                ));
-                                return;
+                                break None;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
-                    };
+                        };
 
-                    let task_ref = task_owned.as_deref();
-                    let read_output = if let Some(content) = preread {
-                        crate::tools::ctx_read::handle_with_preread(
-                            &mut cache,
-                            &path_owned,
-                            &mode,
-                            fresh,
-                            crp_mode,
-                            task_ref,
-                            aggressiveness,
-                            &protect_owned,
-                            content,
-                        )
-                    } else if fresh {
-                        crate::tools::ctx_read::handle_fresh_with_task_resolved_tuned(
-                            &mut cache,
-                            &path_owned,
-                            &mode,
-                            crp_mode,
-                            task_ref,
-                            aggressiveness,
-                            &protect_owned,
-                        )
-                    } else {
-                        crate::tools::ctx_read::handle_with_task_resolved_tuned(
-                            &mut cache,
-                            &path_owned,
-                            &mode,
-                            crp_mode,
-                            task_ref,
-                            aggressiveness,
-                            &protect_owned,
-                        )
-                    };
-                    let content = read_output.content;
-                    let rmode = read_output.resolved_mode;
-                    let orig = cache.get(&path_owned).map_or(0, |e| e.original_tokens);
-                    let hit = content.contains(" cached ");
-                    let fref = cache.file_ref_map().get(path_owned.as_str()).cloned();
-                    let stats = cache.get_stats();
-                    let stats_snapshot = (stats.total_reads(), stats.cache_hits());
-                    let _ = tx.send((content, rmode, orig, hit, fref, stats_snapshot));
+                        if let Some(mut cache) = cache_guard {
+                            if crate::tools::ctx_read::is_cacheable_mode(&rmode) {
+                                let ck = crate::tools::ctx_read::compressed_cache_key(
+                                    &rmode,
+                                    crp_mode,
+                                    task_ref,
+                                    tuning.aggressiveness,
+                                    tuning.protect,
+                                );
+                                cache.set_compressed(&path_owned, &ck, computed.clone());
+                            }
+                            if rmode == "full" || rmode == "full-compact" {
+                                cache.mark_full_delivered(&path_owned);
+                            }
+                            if let Some(entry) = cache.get_mut(&path_owned) {
+                                entry.last_mode.clone_from(&rmode);
+                            }
+                            if let Ok(mut bt) = crate::core::bounce_tracker::global().lock() {
+                                bt.record_read(
+                                    &path_owned,
+                                    &rmode,
+                                    crate::core::tokens::count_tokens(&computed),
+                                    original_tokens,
+                                );
+                            }
+                            let orig = cache.get(&path_owned).map_or(0, |e| e.original_tokens);
+                            let fref = cache.file_ref_map().get(path_owned.as_str()).cloned();
+                            let s = cache.get_stats();
+                            let _ = tx.send((
+                                computed,
+                                rmode,
+                                orig,
+                                false,
+                                fref,
+                                (s.total_reads(), s.cache_hits()),
+                            ));
+                        } else {
+                            let _ =
+                                tx.send((computed, rmode, original_tokens, false, None, (0, 0)));
+                        }
+                    }
                 });
                 if let Ok(result) = rx.recv_timeout(read_timeout) {
                     result
@@ -871,13 +1168,27 @@ fn lines_mode(start: i64, limit: Option<i64>) -> String {
     }
 }
 
+/// Build the `anchored:N-M` mode string for a resolved window (#811) — mirrors
+/// `lines_mode`, keeping the `anchored:` prefix so the render path re-attaches
+/// hash anchors to the window instead of falling back to plain numbered lines.
+fn anchored_lines_mode(start: i64, limit: Option<i64>) -> String {
+    match limit {
+        Some(l) => format!("anchored:{start}-{}", start + l - 1),
+        None => format!("anchored:{start}-999999"),
+    }
+}
+
 /// Apply a resolved line window to `mode`/`fresh`. An explicit non-lines mode
 /// (map/signatures/…) is never clobbered (#259), and `start_line=1` with no
-/// limit is a no-op so it cannot disturb an auto/explicit read (#253).
+/// limit is a no-op so it cannot disturb an auto/explicit read (#253). An
+/// explicit `anchored` mode is windowed in place (`anchored:N-M`, #811)
+/// instead of being collapsed to `lines:N-M` — that would silently drop the
+/// hash anchors the caller asked for, and previously let a bounded anchored
+/// read fall through to rendering (and erroring on) the whole file.
 fn apply_line_window(
     mode: &mut String,
     fresh: &mut bool,
-    explicit_mode: bool,
+    _explicit_mode: bool,
     start_line: Option<i64>,
     offset: Option<i64>,
     limit: Option<i64>,
@@ -889,7 +1200,12 @@ fn apply_line_window(
         return;
     }
     *fresh = true;
-    if !explicit_mode || mode.starts_with("lines") {
+    // #811: anchored gets its own windowed variant (preserves hashes for
+    // ctx_patch); every other mode switches to lines:N-M to prevent
+    // full-file materialization on large files.
+    if mode == "anchored" {
+        *mode = anchored_lines_mode(start, limit);
+    } else {
         *mode = lines_mode(start, limit);
     }
 }
@@ -972,520 +1288,10 @@ fn extract_file_summary(output: &str, path: &str) -> String {
     }
 }
 
+// #660 LOC gate: inline tests split out to keep this file under the line cap.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn raw_alias_forces_raw_mode_over_explicit_mode() {
-        // #513: raw=true is the verbatim escape hatch and must win over any
-        // mode arg an agent also happened to pass.
-        assert_eq!(
-            resolve_raw_alias(true, Some("signatures".to_string())),
-            Some("raw".to_string())
-        );
-        assert_eq!(resolve_raw_alias(true, None), Some("raw".to_string()));
-    }
-
-    #[test]
-    fn raw_alias_absent_passes_mode_through() {
-        // Without raw=true the caller's mode is untouched (including None, which
-        // lets the auto/policy/profile resolution downstream pick the mode).
-        assert_eq!(
-            resolve_raw_alias(false, Some("full".to_string())),
-            Some("full".to_string())
-        );
-        assert_eq!(resolve_raw_alias(false, None), None);
-    }
-
-    #[test]
-    fn per_file_lock_same_path_returns_same_mutex() {
-        let lock_a1 = per_file_lock("/tmp/test_same_path.txt");
-        let lock_a2 = per_file_lock("/tmp/test_same_path.txt");
-        assert!(Arc::ptr_eq(&lock_a1, &lock_a2));
-    }
-
-    #[test]
-    fn per_file_lock_different_paths_return_different_mutexes() {
-        let lock_a = per_file_lock("/tmp/test_path_a.txt");
-        let lock_b = per_file_lock("/tmp/test_path_b.txt");
-        assert!(!Arc::ptr_eq(&lock_a, &lock_b));
-    }
-
-    #[test]
-    fn per_file_lock_serializes_concurrent_access() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let max_concurrent = Arc::new(AtomicUsize::new(0));
-        let path = "/tmp/test_concurrent_serialization.txt";
-        let mut handles = Vec::new();
-
-        for _ in 0..5 {
-            let counter = counter.clone();
-            let max_concurrent = max_concurrent.clone();
-            let path = path.to_string();
-            handles.push(std::thread::spawn(move || {
-                let lock = per_file_lock(&path);
-                let _guard = lock.lock().unwrap();
-                let active = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                max_concurrent.fetch_max(active, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                counter.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn per_file_lock_allows_parallel_different_paths() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let max_concurrent = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-
-        for i in 0..4 {
-            let counter = counter.clone();
-            let max_concurrent = max_concurrent.clone();
-            let path = format!("/tmp/test_parallel_{i}.txt");
-            handles.push(std::thread::spawn(move || {
-                let lock = per_file_lock(&path);
-                let _guard = lock.lock().unwrap();
-                let active = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                max_concurrent.fetch_max(active, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                counter.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert!(max_concurrent.load(Ordering::SeqCst) > 1);
-    }
-
-    /// Regression test for Issue #229: a zombie thread holding the cache write-lock
-    /// must not block subsequent reads indefinitely. The try_write() loop inside
-    /// the spawned thread should respect its 25s deadline and the cancellation flag.
-    #[test]
-    fn zombie_thread_does_not_block_subsequent_cache_access() {
-        let cache: Arc<tokio::sync::RwLock<u32>> = Arc::new(tokio::sync::RwLock::new(0));
-
-        // Simulate a zombie: hold the write-lock on a background thread for 2s.
-        let zombie_lock = cache.clone();
-        let _zombie = std::thread::spawn(move || {
-            let _guard = zombie_lock.blocking_write();
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        });
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // A try_read() must fail immediately (zombie holds write-lock).
-        assert!(cache.try_read().is_err());
-
-        // A try_write() loop with cancellation must exit promptly.
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel2 = cancel.clone();
-        let lock2 = cache.clone();
-        let waiter = std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            loop {
-                if cancel2.load(Ordering::Relaxed) {
-                    return (false, start.elapsed());
-                }
-                if let Ok(_guard) = lock2.try_write() {
-                    return (true, start.elapsed());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
-
-        // Set cancellation after 200ms — the loop should exit quickly.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        cancel.store(true, Ordering::Relaxed);
-
-        let (acquired, elapsed) = waiter.join().unwrap();
-        assert!(
-            !acquired,
-            "should not have acquired lock while zombie holds it"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "cancellation should have stopped the loop promptly"
-        );
-    }
-
-    // -- Regression: GitHub Issue #253 + #259 --
-    // Delegates to the real runtime helper so this test can never drift from
-    // production behaviour.
-    fn apply_start_line(
-        mode: &mut String,
-        fresh: &mut bool,
-        explicit_mode: bool,
-        start_line: Option<i64>,
-    ) {
-        super::apply_line_window(mode, fresh, explicit_mode, start_line, None, None);
-    }
-
-    #[test]
-    fn start_line_1_does_not_override_mode() {
-        let mut mode = "auto".to_string();
-        let mut fresh = false;
-        apply_start_line(&mut mode, &mut fresh, false, Some(1));
-        assert_eq!(mode, "auto", "start_line=1 should not change mode");
-        assert!(!fresh, "start_line=1 should not force fresh=true");
-    }
-
-    #[test]
-    fn start_line_gt1_overrides_implicit_mode() {
-        let mut mode = "auto".to_string();
-        let mut fresh = false;
-        apply_start_line(&mut mode, &mut fresh, false, Some(50));
-        assert_eq!(mode, "lines:50-999999");
-        assert!(fresh);
-    }
-
-    #[test]
-    fn start_line_gt1_does_not_override_explicit_map() {
-        // GitHub #259: mode=map + start_line=50 → mode stays map
-        let mut mode = "map".to_string();
-        let mut fresh = false;
-        apply_start_line(&mut mode, &mut fresh, true, Some(50));
-        assert_eq!(
-            mode, "map",
-            "explicit mode=map must not be clobbered by start_line"
-        );
-        assert!(fresh, "start_line>1 should still force fresh");
-    }
-
-    #[test]
-    fn start_line_gt1_does_not_override_explicit_signatures() {
-        let mut mode = "signatures".to_string();
-        let mut fresh = false;
-        apply_start_line(&mut mode, &mut fresh, true, Some(100));
-        assert_eq!(mode, "signatures");
-        assert!(fresh);
-    }
-
-    #[test]
-    fn start_line_gt1_honors_explicit_lines_mode() {
-        let mut mode = "lines:1-50".to_string();
-        let mut fresh = false;
-        apply_start_line(&mut mode, &mut fresh, true, Some(30));
-        assert_eq!(
-            mode, "lines:30-999999",
-            "explicit lines mode should accept start_line override"
-        );
-        assert!(fresh);
-    }
-
-    #[test]
-    fn start_line_none_does_nothing() {
-        let mut mode = "map".to_string();
-        let mut fresh = false;
-        apply_start_line(&mut mode, &mut fresh, true, None);
-        assert_eq!(mode, "map");
-        assert!(!fresh);
-    }
-
-    #[test]
-    fn start_line_1_with_explicit_mode_preserves_it() {
-        // OpenCode sends start_line=1 + mode=map — both should be preserved
-        let mut mode = "map".to_string();
-        let mut fresh = false;
-        apply_start_line(&mut mode, &mut fresh, true, Some(1));
-        assert_eq!(mode, "map");
-        assert!(!fresh);
-    }
-
-    // -- Regression: GitHub Issue #432 — `offset`/`limit` aliases --
-
-    #[test]
-    fn offset_is_alias_for_start_line() {
-        let mut mode = "auto".to_string();
-        let mut fresh = false;
-        super::apply_line_window(&mut mode, &mut fresh, false, None, Some(40), None);
-        assert_eq!(mode, "lines:40-999999");
-        assert!(fresh);
-    }
-
-    #[test]
-    fn offset_and_limit_make_bounded_window() {
-        let mut mode = "auto".to_string();
-        let mut fresh = false;
-        super::apply_line_window(&mut mode, &mut fresh, false, None, Some(40), Some(20));
-        assert_eq!(mode, "lines:40-59", "20 inclusive lines starting at 40");
-        assert!(fresh);
-    }
-
-    #[test]
-    fn limit_alone_reads_from_first_line() {
-        let mut mode = "auto".to_string();
-        let mut fresh = false;
-        super::apply_line_window(&mut mode, &mut fresh, false, None, None, Some(25));
-        assert_eq!(mode, "lines:1-25");
-        assert!(fresh);
-    }
-
-    #[test]
-    fn start_line_wins_over_offset_when_both_present() {
-        assert_eq!(
-            super::resolve_line_window(Some(10), Some(99), None),
-            Some((10, None))
-        );
-    }
-
-    #[test]
-    fn resolve_clamps_start_and_drops_nonpositive_limit() {
-        // Negative/zero start clamps to 1; non-positive limit is ignored.
-        assert_eq!(
-            super::resolve_line_window(Some(-5), None, Some(0)),
-            Some((1, None))
-        );
-        // A bare non-positive limit yields no window at all.
-        assert_eq!(super::resolve_line_window(None, None, Some(-3)), None);
-        assert_eq!(super::resolve_line_window(None, None, None), None);
-    }
-
-    #[test]
-    fn lines_mode_bounds_are_inclusive() {
-        assert_eq!(super::lines_mode(40, Some(20)), "lines:40-59");
-        assert_eq!(super::lines_mode(5, None), "lines:5-999999");
-    }
-
-    #[test]
-    fn explicit_map_not_clobbered_by_offset_limit() {
-        // #259 must also hold for the new aliases.
-        let mut mode = "map".to_string();
-        let mut fresh = false;
-        super::apply_line_window(&mut mode, &mut fresh, true, None, Some(40), Some(20));
-        assert_eq!(mode, "map", "explicit mode wins over offset/limit");
-        assert!(fresh);
-    }
-
-    /// Schema/handler consistency (GitHub #432): the handler reads
-    /// start_line/offset/limit, so the advertised schema must document them —
-    /// otherwise agents (and the generated docs/manifest) can't discover the
-    /// aliases and the divergence that caused this bug returns.
-    #[test]
-    fn schema_advertises_line_window_aliases() {
-        let tool = CtxReadTool.tool_def();
-        let props = tool
-            .input_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("ctx_read schema has a properties object");
-        for key in ["path", "mode", "start_line", "offset", "limit", "fresh"] {
-            assert!(props.contains_key(key), "ctx_read schema missing '{key}'");
-        }
-    }
-
-    // -- Regression: GitHub Issue #262 --
-    // auto_degrade_read_mode must produce a warning when mode is downgraded.
-
-    use crate::core::degradation_policy::DegradationVerdictV1;
-
-    #[test]
-    fn verdict_ok_does_not_degrade() {
-        let (mode, degraded) = super::apply_verdict("full", DegradationVerdictV1::Ok);
-        assert_eq!(mode, "full");
-        assert!(!degraded);
-    }
-
-    #[test]
-    fn verdict_warn_degrades_full_to_map() {
-        let (mode, degraded) = super::apply_verdict("full", DegradationVerdictV1::Warn);
-        assert_eq!(mode, "map");
-        assert!(degraded, "full→map must be flagged as degraded");
-    }
-
-    #[test]
-    fn verdict_warn_keeps_map() {
-        let (mode, degraded) = super::apply_verdict("map", DegradationVerdictV1::Warn);
-        assert_eq!(mode, "map");
-        assert!(!degraded, "map is not degraded under Warn");
-    }
-
-    #[test]
-    fn verdict_warn_keeps_signatures() {
-        let (mode, degraded) = super::apply_verdict("signatures", DegradationVerdictV1::Warn);
-        assert_eq!(mode, "signatures");
-        assert!(!degraded);
-    }
-
-    #[test]
-    fn verdict_throttle_degrades_full_to_signatures() {
-        let (mode, degraded) = super::apply_verdict("full", DegradationVerdictV1::Throttle);
-        assert_eq!(mode, "signatures");
-        assert!(degraded);
-    }
-
-    #[test]
-    fn verdict_throttle_degrades_map_to_signatures() {
-        let (mode, degraded) = super::apply_verdict("map", DegradationVerdictV1::Throttle);
-        assert_eq!(mode, "signatures");
-        assert!(degraded);
-    }
-
-    #[test]
-    fn verdict_throttle_keeps_lines() {
-        let (mode, degraded) = super::apply_verdict("lines:1-50", DegradationVerdictV1::Throttle);
-        assert_eq!(mode, "lines:1-50");
-        assert!(!degraded, "lines mode bypasses degradation");
-    }
-
-    #[test]
-    fn verdict_block_degrades_full_to_signatures() {
-        let (mode, degraded) = super::apply_verdict("full", DegradationVerdictV1::Block);
-        assert_eq!(mode, "signatures");
-        assert!(degraded);
-    }
-
-    #[test]
-    fn verdict_block_does_not_degrade_signatures() {
-        let (mode, degraded) = super::apply_verdict("signatures", DegradationVerdictV1::Block);
-        assert_eq!(mode, "signatures");
-        assert!(!degraded, "already at signatures — no degradation needed");
-    }
-
-    #[test]
-    fn degrade_warning_message_contains_mode_info() {
-        let (new_mode, degraded) = super::apply_verdict("full", DegradationVerdictV1::Warn);
-        assert!(degraded);
-        let warning = format!(
-            "⚠ Context pressure: mode=full was downgraded to mode={new_mode} (verdict: {:?}).",
-            DegradationVerdictV1::Warn
-        );
-        assert!(warning.contains("mode=full"));
-        assert!(warning.contains("mode=map"));
-        assert!(warning.contains("Warn"));
-    }
-
-    // --- auto_degrade_read_mode: no_degrade integration ---
-    // With default config (no LCTX_NO_DEGRADE), the profile's degradation.enforce
-    // is also off by default, so auto_degrade_read_mode returns mode unchanged.
-
-    #[test]
-    fn auto_degrade_preserves_full_when_default_config() {
-        if std::env::var("LCTX_NO_DEGRADE").is_ok() {
-            return;
-        }
-        let (mode, warning) = super::auto_degrade_read_mode("full");
-        assert_eq!(mode, "full");
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn auto_degrade_preserves_map_when_default_config() {
-        if std::env::var("LCTX_NO_DEGRADE").is_ok() {
-            return;
-        }
-        let (mode, warning) = super::auto_degrade_read_mode("map");
-        assert_eq!(mode, "map");
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn auto_degrade_preserves_signatures_when_default_config() {
-        if std::env::var("LCTX_NO_DEGRADE").is_ok() {
-            return;
-        }
-        let (mode, warning) = super::auto_degrade_read_mode("signatures");
-        assert_eq!(mode, "signatures");
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn auto_degrade_preserves_diff_always() {
-        let (mode, warning) = super::auto_degrade_read_mode("diff");
-        assert_eq!(mode, "diff");
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn auto_degrade_preserves_lines_mode_always() {
-        let (mode, warning) = super::auto_degrade_read_mode("lines:10-50");
-        assert_eq!(mode, "lines:10-50");
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn auto_degrade_preserves_aggressive_when_default_config() {
-        if std::env::var("LCTX_NO_DEGRADE").is_ok() {
-            return;
-        }
-        let (mode, warning) = super::auto_degrade_read_mode("aggressive");
-        assert_eq!(mode, "aggressive");
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn auto_degrade_preserves_entropy_when_default_config() {
-        if std::env::var("LCTX_NO_DEGRADE").is_ok() {
-            return;
-        }
-        let (mode, warning) = super::auto_degrade_read_mode("entropy");
-        assert_eq!(mode, "entropy");
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn auto_degrade_preserves_auto_when_default_config() {
-        if std::env::var("LCTX_NO_DEGRADE").is_ok() {
-            return;
-        }
-        let (mode, warning) = super::auto_degrade_read_mode("auto");
-        assert_eq!(mode, "auto");
-        assert!(warning.is_none());
-    }
-
-    // --- apply_verdict: exhaustive mode × verdict matrix ---
-
-    #[test]
-    fn verdict_warn_does_not_degrade_diff() {
-        let (mode, degraded) = super::apply_verdict("diff", DegradationVerdictV1::Warn);
-        assert_eq!(mode, "diff");
-        assert!(!degraded);
-    }
-
-    #[test]
-    fn verdict_throttle_does_not_degrade_signatures() {
-        let (mode, degraded) = super::apply_verdict("signatures", DegradationVerdictV1::Throttle);
-        assert_eq!(mode, "signatures");
-        assert!(!degraded);
-    }
-
-    #[test]
-    fn verdict_ok_preserves_map() {
-        let (mode, degraded) = super::apply_verdict("map", DegradationVerdictV1::Ok);
-        assert_eq!(mode, "map");
-        assert!(!degraded);
-    }
-
-    #[test]
-    fn verdict_ok_preserves_signatures() {
-        let (mode, degraded) = super::apply_verdict("signatures", DegradationVerdictV1::Ok);
-        assert_eq!(mode, "signatures");
-        assert!(!degraded);
-    }
-
-    #[test]
-    fn verdict_ok_preserves_lines() {
-        let (mode, degraded) = super::apply_verdict("lines:1-100", DegradationVerdictV1::Ok);
-        assert_eq!(mode, "lines:1-100");
-        assert!(!degraded);
-    }
-
-    #[test]
-    fn verdict_block_degrades_map_to_signatures() {
-        let (mode, degraded) = super::apply_verdict("map", DegradationVerdictV1::Block);
-        assert_eq!(mode, "signatures");
-        assert!(degraded);
-    }
-}
+#[path = "ctx_read_inline_tests.rs"]
+mod tests;
 
 // #660 LOC gate: repo-param tests split out to keep this file under the line
 // cap — see `ctx_read_repo_param_tests.rs`.

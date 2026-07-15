@@ -25,7 +25,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::json;
 use serial_test::serial;
 
-use lean_ctx::core::gateway::{ResolvedTransport, client, pool};
+use lean_ctx::core::mcp_catalog::{ResolvedTransport, client, pool};
 
 /// Minimal downstream MCP server exposing two tools: `echo` and `add`.
 struct EchoServer;

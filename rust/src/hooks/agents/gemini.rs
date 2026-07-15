@@ -183,7 +183,7 @@ pub(crate) fn install_gemini_hook_config(home: &std::path::Path) {
                     }]
                 },
                 {
-                    "matcher": "read_file|read_many_files|grep|search|list_dir",
+                    "matcher": "read_file|read_many_files|grep|search|list_dir|glob|list_files",
                     "hooks": [{
                         "type": "command",
                         "command": redirect_cmd
@@ -221,6 +221,72 @@ pub(crate) fn install_gemini_hook_config(home: &std::path::Path) {
             "Installed Gemini CLI hooks at {}",
             settings_path.parent().unwrap_or(&settings_path).display()
         );
+    }
+}
+
+/// Install deny-variant hooks for Gemini in Replace mode.
+/// Replaces the redirect BeforeTool hook with a deny hook.
+pub(crate) fn install_gemini_deny_hook(home: &std::path::Path) {
+    let binary = resolve_hook_command_binary();
+    let rewrite_cmd = format!("{binary} hook rewrite");
+    let deny_cmd = format!("{binary} hook deny");
+    let observe_cmd = format!("{binary} hook observe");
+
+    let settings_path = home.join(".gemini").join("settings.json");
+
+    let hook_config = serde_json::json!({
+        "hooks": {
+            "BeforeTool": [
+                {
+                    "matcher": "shell|execute_command|run_shell_command",
+                    "hooks": [{
+                        "type": "command",
+                        "command": rewrite_cmd
+                    }]
+                },
+                {
+                    "matcher": "read_file|read_many_files|grep|search|list_dir|glob|list_files",
+                    "hooks": [{
+                        "type": "command",
+                        "command": deny_cmd
+                    }]
+                }
+            ],
+            "AfterTool": [
+                {
+                    "matcher": ".*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": observe_cmd
+                    }]
+                }
+            ]
+        }
+    });
+
+    let settings_content = if settings_path.exists() {
+        std::fs::read_to_string(&settings_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if settings_content.is_empty() {
+        write_file(
+            &settings_path,
+            &serde_json::to_string_pretty(&hook_config).unwrap_or_default(),
+        );
+    } else if let Ok(mut existing) = crate::core::jsonc::parse_jsonc(&settings_content)
+        && let Some(obj) = existing.as_object_mut()
+    {
+        obj.insert("hooks".to_string(), hook_config["hooks"].clone());
+        write_file(
+            &settings_path,
+            &serde_json::to_string_pretty(&existing).unwrap_or_default(),
+        );
+    }
+
+    if !mcp_server_quiet_mode() {
+        eprintln!("  \x1b[32m✓\x1b[0m Gemini deny hook installed (Replace mode)");
     }
 }
 

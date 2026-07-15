@@ -349,6 +349,11 @@ mod tests {
 
         crate::test_env::set_var("LEAN_CTX_DATA_DIR", "");
         crate::test_env::set_var("XDG_CONFIG_HOME", xdg_base.to_str().unwrap());
+        // Isolate XDG_DATA_HOME to an empty base so the mixed config dir (not a
+        // pre-existing XDG data tree) is what wins here.
+        let xdg_data_base = std::env::temp_dir().join("test_xdg_override_wins_data");
+        let _ = std::fs::remove_dir_all(&xdg_data_base);
+        crate::test_env::set_var("XDG_DATA_HOME", xdg_data_base.to_str().unwrap());
 
         // Calls the home resolver directly: lean_ctx_data_dir() is sandboxed
         // under cfg(test) (GL #512) and would short-circuit before XDG logic.
@@ -356,6 +361,7 @@ mod tests {
 
         crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
         crate::test_env::remove_var("XDG_CONFIG_HOME");
+        crate::test_env::remove_var("XDG_DATA_HOME");
 
         let home = dirs::home_dir().unwrap();
         let legacy = home.join(".lean-ctx");
@@ -367,6 +373,7 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&xdg_base);
+        let _ = std::fs::remove_dir_all(&xdg_data_base);
     }
 
     #[cfg(unix)]

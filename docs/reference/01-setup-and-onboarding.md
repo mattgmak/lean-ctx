@@ -5,7 +5,12 @@
 > function those commands call.
 
 Source files referenced here:
-- `rust/src/setup.rs` — the setup engine
+- `rust/src/wrap/mod.rs` — one-command wrap engine
+- `rust/src/wrap/snapshot.rs` — pre-wrap config backup
+- `rust/src/wrap/verify.rs` — MCP connection probe
+- `rust/src/wrap/launch.rs` — agent launch/restart logic
+- `rust/src/wrap/unwrap.rs` — restore pre-wrap state
+- `rust/src/setup.rs` — the full setup engine
 - `rust/src/cli/dispatch/mod.rs` — command routing
 - `rust/src/cli/dispatch/help.rs` — quickstart / help text
 - `rust/src/doctor/mod.rs` — diagnostics
@@ -27,11 +32,38 @@ For lean-ctx to help you, three things must be true:
    and config.
 
 Every setup command below is just a different amount of hand-holding to reach
-that state.
+that state. Three tiers: **wrap** (one command), **onboard** (all agents), **setup** (full control).
 
 ---
 
-## 1. `lean-ctx onboard` — the recommended first command
+## 1. `lean-ctx wrap <agent>` — the recommended first command
+
+**What it does:** Sets up lean-ctx for one specific agent with a single command.
+Installs shell hooks, MCP registration, agent hooks, starts the daemon, verifies
+the MCP connection, and shows a summary — all automatically.
+
+```bash
+lean-ctx wrap cursor      # or: wrap claude / wrap codex / wrap vscode
+```
+
+**Under the hood** (`wrap::run_wrap_for_agent` in `rust/src/wrap/mod.rs`):
+
+1. **Snapshots** existing config files for later restore via `unwrap`.
+2. Installs **shell hooks** (`shell_hook::install_all`).
+3. Writes **MCP server registration** via `editor_registry::write_config_with_options`.
+4. Installs **agent hooks** (`hooks::install_agent_hook_with_mode`).
+5. Starts the **daemon** if not already running.
+6. Saves the **snapshot manifest** for `unwrap`.
+7. **Probes the MCP server** — spawns `lean-ctx mcp`, sends JSON-RPC
+   `initialize` + `tools/list`, checks `ctx_read` is present.
+8. Detects whether the agent is running and gives a launch/restart hint.
+9. Prints a premium **summary** with tool count and next steps.
+
+**Undo:** `lean-ctx unwrap cursor` restores all modified files from the snapshot.
+
+---
+
+## 1b. `lean-ctx onboard` — connect all agents at once
 
 **What it does:** Connects every AI tool found on your machine using sensible
 defaults, with zero questions, then prints one clear "you're connected" message.
@@ -290,3 +322,6 @@ shipped are marked ✓.
 - ◯ Open: the interactive wizard is still 12 steps — consider collapsing
   optional opt-ins (proxy, telemetry, auto-update) behind a single
   "Configure advanced options? [y/N]" gate so the common path is ~4 prompts.
+
+
+--- lean-ctx: ctx_compose bundles search+read+symbols in one call ---

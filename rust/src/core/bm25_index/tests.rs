@@ -190,6 +190,58 @@ fn bm25_incremental_rebuild_reuses_unchanged_files_without_reading() {
 }
 
 #[test]
+fn add_chunk_truncates_content_to_10_lines() {
+    let mut index = BM25Index::new();
+    let body_20 = (0..20)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    index.add_chunk(CodeChunk {
+        file_path: "big.rs".into(),
+        symbol_name: "big".into(),
+        kind: ChunkKind::Function,
+        start_line: 1,
+        end_line: 20,
+        content: body_20,
+        tokens: Vec::new(),
+        token_count: 0,
+    });
+    index.add_chunk(CodeChunk {
+        file_path: "small.rs".into(),
+        symbol_name: "small".into(),
+        kind: ChunkKind::Function,
+        start_line: 1,
+        end_line: 3,
+        content: "a\nb\nc".into(),
+        tokens: Vec::new(),
+        token_count: 0,
+    });
+
+    let big = index
+        .chunks
+        .iter()
+        .find(|c| c.file_path == "big.rs")
+        .unwrap();
+    assert_eq!(
+        big.content.lines().count(),
+        10,
+        "20-line body truncated to 10"
+    );
+    assert!(big.content.starts_with("line0"));
+    assert!(
+        !big.content.contains("line10"),
+        "lines beyond snippet dropped"
+    );
+
+    let small = index
+        .chunks
+        .iter()
+        .find(|c| c.file_path == "small.rs")
+        .unwrap();
+    assert_eq!(small.content, "a\nb\nc", "short body left untouched");
+}
+
+#[test]
 fn shrink_resident_trims_long_bodies_keeps_short_and_flags() {
     let mut index = BM25Index::new();
     let long_body = (0..20)
@@ -292,9 +344,9 @@ fn shrink_resident_is_not_persisted_to_disk() {
         .unwrap();
     assert!(full_lines > 5, "fixture body must exceed snippet window");
 
-    // Real-flow ordering: the index is persisted with FULL content (during the
-    // build/orchestrator pass) BEFORE any resident truncation. Truncation only
-    // mutates the in-memory copy afterwards and is never followed by a save.
+    // add_chunk already truncates to 10-line snippets (#790); the 8-line fixture
+    // stays below that threshold so saved content equals the original body.
+    // shrink_resident further tightens to 5 lines (resident-only, not persisted).
     index.save(root).expect("save full-content index");
     index.shrink_resident_content_to_snippet(5);
     assert!(index.content_truncated);

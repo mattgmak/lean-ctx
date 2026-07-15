@@ -15,8 +15,11 @@ pub const REWRITE_COMMANDS: &[RewriteEntry] = &[
     re("deno", Category::Build),
     re("vite", Category::Build),
     // Python
+    re("python", Category::Build),
+    re("python3", Category::Build),
     re("pip", Category::PackageManager),
     re("pip3", Category::PackageManager),
+    re("uv", Category::PackageManager),
     re("pytest", Category::Build),
     re("mypy", Category::Lint),
     re("ruff", Category::Lint),
@@ -55,6 +58,9 @@ pub const REWRITE_COMMANDS: &[RewriteEntry] = &[
     re("cmake", Category::Build),
     re("make", Category::Build),
     // Search (rewritten in hooks to enforce hybrid)
+    re("grep", Category::Search),
+    re("egrep", Category::Search),
+    re("fgrep", Category::Search),
     re("rg", Category::Search),
     // File read alternatives (rewritten to lean-ctx read, not lean-ctx -c)
     re("cat", Category::FileRead),
@@ -149,17 +155,64 @@ pub fn shell_alias_list() -> String {
 
 /// Check if a command string matches a rewritable prefix (for hook handlers).
 /// Excludes FileRead (handled separately in hook_handlers).
+///
+/// Handles common shell patterns:
+/// - Bare command: `git status`
+/// - Env-var prefixed: `PYTHONPATH=src python script.py`
+/// - Path-qualified: `./.venv/bin/python`, `/usr/bin/python3`
 pub fn is_rewritable_command(cmd: &str) -> bool {
+    let effective = strip_env_prefix(cmd);
+    let basename = extract_command_basename(effective);
+
     for entry in REWRITE_COMMANDS {
         if matches!(entry.category, Category::FileRead) {
             continue;
         }
         let prefix = format!("{} ", entry.command);
-        if cmd.starts_with(&prefix) || cmd == entry.command {
+        if effective.starts_with(&prefix)
+            || effective == entry.command
+            || basename == entry.command
+            || basename.starts_with(&format!("{} ", entry.command))
+        {
             return true;
         }
     }
     false
+}
+
+/// Strip leading `KEY=value` env-var assignments from a command string.
+/// e.g. `PYTHONPATH=src FOO=bar python x.py` → `python x.py`
+fn strip_env_prefix(cmd: &str) -> &str {
+    let mut rest = cmd;
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(eq_pos) = trimmed.find('=') {
+            let before_eq = &trimmed[..eq_pos];
+            if !before_eq.is_empty()
+                && before_eq
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && let Some(space_pos) = trimmed[eq_pos..].find(' ')
+            {
+                rest = &trimmed[eq_pos + space_pos..];
+                continue;
+            }
+        }
+        return trimmed;
+    }
+}
+
+/// Extract the basename of a potentially path-qualified command.
+/// e.g. `./.venv/bin/python script.py` → `python script.py`
+///      `/usr/local/bin/cargo test` → `cargo test`
+fn extract_command_basename(cmd: &str) -> &str {
+    let first_space = cmd.find(' ').unwrap_or(cmd.len());
+    let cmd_part = &cmd[..first_space];
+    if let Some(slash_pos) = cmd_part.rfind('/') {
+        &cmd[slash_pos + 1..]
+    } else {
+        cmd
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +238,9 @@ mod tests {
         assert!(!prefixes.contains(&"head ".to_string()));
         assert!(!prefixes.contains(&"tail ".to_string()));
         assert!(prefixes.contains(&"rg ".to_string()));
+        assert!(prefixes.contains(&"grep ".to_string()));
+        assert!(prefixes.contains(&"egrep ".to_string()));
+        assert!(prefixes.contains(&"fgrep ".to_string()));
         assert!(prefixes.contains(&"ls ".to_string()));
         assert!(prefixes.contains(&"find ".to_string()));
         assert!(prefixes.contains(&"git ".to_string()));
@@ -205,6 +261,28 @@ mod tests {
         assert!(is_rewritable_command("terraform plan"));
         assert!(is_rewritable_command("make build"));
         assert!(is_rewritable_command("dotnet build"));
+        assert!(is_rewritable_command("python script.py"));
+        assert!(is_rewritable_command("python3 -m pytest"));
+        assert!(is_rewritable_command("uv run test"));
+    }
+
+    #[test]
+    fn is_rewritable_env_prefix() {
+        assert!(is_rewritable_command("PYTHONPATH=src python script.py"));
+        assert!(is_rewritable_command("FOO=bar BAZ=1 cargo test"));
+        assert!(is_rewritable_command("NODE_ENV=test npm run test"));
+        assert!(!is_rewritable_command("FOO=bar echo hello"));
+    }
+
+    #[test]
+    fn is_rewritable_path_qualified() {
+        assert!(is_rewritable_command("./.venv/bin/python script.py"));
+        assert!(is_rewritable_command("/usr/bin/python3 test.py"));
+        assert!(is_rewritable_command("/usr/local/bin/cargo build"));
+        assert!(is_rewritable_command(
+            "PYTHONPATH=src ./.venv/bin/python script.py"
+        ));
+        assert!(!is_rewritable_command("/usr/bin/some-unknown-tool arg"));
     }
 
     #[test]
@@ -214,8 +292,34 @@ mod tests {
         assert!(!is_rewritable_command("cat file.rs"));
         assert!(!is_rewritable_command("head -20 file.rs"));
         assert!(is_rewritable_command("rg pattern"));
+        assert!(is_rewritable_command("grep -rn pattern src/"));
+        assert!(is_rewritable_command("egrep 'foo|bar' file.rs"));
+        assert!(is_rewritable_command("fgrep literal file.rs"));
         assert!(is_rewritable_command("ls /tmp"));
         assert!(is_rewritable_command("find . -name '*.rs'"));
+    }
+
+    #[test]
+    fn strip_env_prefix_works() {
+        assert_eq!(strip_env_prefix("python x.py"), "python x.py");
+        assert_eq!(strip_env_prefix("FOO=bar python x.py"), "python x.py");
+        assert_eq!(strip_env_prefix("A=1 B=2 cargo test"), "cargo test");
+        assert_eq!(strip_env_prefix("  FOO=bar cmd"), "cmd");
+        assert_eq!(strip_env_prefix("no_equals here"), "no_equals here");
+    }
+
+    #[test]
+    fn extract_command_basename_works() {
+        assert_eq!(extract_command_basename("python x.py"), "python x.py");
+        assert_eq!(
+            extract_command_basename("./.venv/bin/python x.py"),
+            "python x.py"
+        );
+        assert_eq!(
+            extract_command_basename("/usr/bin/python3 -m pytest"),
+            "python3 -m pytest"
+        );
+        assert_eq!(extract_command_basename("cargo test"), "cargo test");
     }
 
     #[test]

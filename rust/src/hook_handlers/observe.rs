@@ -67,10 +67,12 @@ fn emit_dedicated_session_context(input: &str) {
     if cfg.dedicated_session_context_active() {
         // Full Bare rules for dedicated-mode hosts (Claude Code, Codex, CodeBuddy)
         // where the static rules file is skipped.
+        let profile = crate::core::tool_profiles::ToolProfile::from_config(&cfg);
         let summary = crate::core::rules_canonical::render(
             cfg.shadow_mode,
             crate::core::rules_canonical::Wrapper::Bare,
             crate::core::config::CompressionLevel::Off,
+            &profile,
         );
         emit_session_start_additional_context(&summary);
     } else {
@@ -78,9 +80,14 @@ fn emit_dedicated_session_context(input: &str) {
         // have static rules but benefit from in-conversation emphasis on exclusive
         // tools. Models weight in-conversation context above static instructions.
         emit_session_start_additional_context(
-            "lean-ctx reminder: ALWAYS call ctx_compose FIRST to orient before \
-             individual Read/Grep calls. Exclusive tools with no native equivalent: \
-             ctx_compose, ctx_semantic_search, ctx_callgraph, ctx_knowledge, ctx_session.",
+            "lean-ctx active: ALWAYS use ctx_* MCP tools instead of native equivalents.\n\
+             - ctx_read > native Read (cached, re-reads ~13 tokens vs full file; 10 modes incl. map/signatures)\n\
+             - ctx_search > native Grep (compact results, denied by hook)\n\
+             - ctx_shell > native Shell (95+ compression patterns)\n\
+             - ctx_glob > native Glob (denied by hook)\n\
+             - ctx_compose = orient FIRST (bundles search+read+symbols in one call)\n\
+             Native Read passes through for StrReplace internals only — never use it for exploration.\n\
+             Exclusive tools: ctx_compose, ctx_callgraph, ctx_knowledge, ctx_session.",
         );
     }
 }
@@ -563,6 +570,30 @@ fn append_radar_event(event: &ObserveEvent) {
     {
         let _ = writeln!(f, "{line}");
     }
+
+    // #808: write an atomic marker file so the MCP server can detect
+    // compactions reliably even when large events bury the radar entry.
+    if event.event_type == "compaction" {
+        write_compaction_marker(&data_dir, event.ts);
+    }
+}
+
+/// Atomically write `last_compaction.json` via temp-file + rename.
+/// The marker is a few bytes; no other event can displace it.
+fn write_compaction_marker(data_dir: &std::path::Path, ts: u64) {
+    use std::io::Write;
+    let marker_path = data_dir.join("last_compaction.json");
+    let tmp_path = data_dir.join("last_compaction.json.tmp");
+    let payload = format!(r#"{{"ts":{ts}}}"#);
+    let Ok(mut f) = std::fs::File::create(&tmp_path) else {
+        return;
+    };
+    if f.write_all(payload.as_bytes()).is_err() || f.sync_all().is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    drop(f);
+    let _ = std::fs::rename(&tmp_path, &marker_path);
 }
 
 /// Count the IDE-hook observe events recorded in `context_radar.jsonl`.

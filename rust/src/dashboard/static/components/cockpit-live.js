@@ -35,6 +35,8 @@ var EVENT_COLORS = {
   verification_crit: 'var(--red)',
   policy: 'var(--red)',
   slo: 'var(--red)',
+  budget_warn: 'var(--yellow)',
+  budget_crit: 'var(--red)',
 };
 
 var EVENT_ICONS = {
@@ -52,6 +54,8 @@ var EVENT_ICONS = {
   verification_crit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
   policy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
   slo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  budget_warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>',
+  budget_crit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>',
 };
 
 var FILTER_CATEGORIES = {
@@ -230,6 +234,32 @@ function flattenEvent(ev) {
         explanation: eventExplanation('SloViolation'),
         ts: ts,
       };
+    case 'BudgetWarning':
+      return {
+        type: t,
+        id: evId,
+        category: 'budget_warn',
+        color: EVENT_COLORS.budget_warn,
+        icon: EVENT_ICONS.budget_warn,
+        title: 'budget · role:' + (kind.role || 'agent') + ' ' + (kind.dimension || 'tokens') + ' ' + (kind.percent || '?') + '%',
+        saved: 0,
+        detail: (kind.used || '?') + ' / ' + (kind.limit || '?'),
+        explanation: eventExplanation('BudgetWarning'),
+        ts: ts,
+      };
+    case 'BudgetExhausted':
+      return {
+        type: t,
+        id: evId,
+        category: 'budget_crit',
+        color: EVENT_COLORS.budget_crit,
+        icon: EVENT_ICONS.budget_crit,
+        title: 'budget exhausted · role:' + (kind.role || 'agent') + ' ' + (kind.dimension || 'tokens'),
+        saved: 0,
+        detail: (kind.used || '?') + ' / ' + (kind.limit || '?'),
+        explanation: eventExplanation('BudgetExhausted'),
+        ts: ts,
+      };
     default:
       return {
         type: t || 'unknown',
@@ -257,6 +287,8 @@ var EVENT_EXPLANATIONS = {
   VerificationWarning: 'Output quality verification detected a potential issue. If severity is "warning", the output was still delivered. "Critical" means content may have been degraded.',
   PolicyViolation: 'A tool call was blocked by an active policy rule (e.g. budget limit, file-type restriction). Check your lean-ctx profile if this is unexpected.',
   SloViolation: 'An internal quality metric (SLO) was breached. This is lean-ctx monitoring itself — e.g. compression ratio fell below target. Occasional violations are normal; frequent ones may indicate a configuration issue.',
+  BudgetWarning: 'Session token/shell/cost budget approaching the limit for the active role. "role:" shows the lean-ctx role (default: "coder"), not a provider or product. Adjust limits in ~/.lean-ctx/roles/<role>.toml or raise warn_at_percent.',
+  BudgetExhausted: 'Session budget for this role has been exceeded. Further tool calls may be restricted. Adjust limits in ~/.lean-ctx/roles/<role>.toml or start a new session.',
 };
 
 function eventExplanation(eventType) {

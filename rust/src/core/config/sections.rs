@@ -518,6 +518,12 @@ impl Default for GainConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CostConfig {
+    /// Per-session cost cap in USD. When accumulated cost exceeds this value,
+    /// subsequent tool calls receive a `[COST CAP]` warning instead of the
+    /// normal output (#794). 0 = unlimited (default).
+    /// Override at runtime: `LEAN_CTX_COST_CAP_OVERRIDE=1` bypasses the cap.
+    #[serde(default)]
+    pub max_session_cost_usd: f64,
     /// Fallback pricing model for any client without a per-client entry.
     /// Unset/empty → lean-ctx keeps its blended heuristic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -583,6 +589,13 @@ pub struct CodeHealthConfig {
     pub naming: bool,
     /// Compute module-coupling metrics.
     pub coupling: bool,
+    /// Inject `[CODE HEALTH]` notices as `additionalContext` in PostToolUse stdout.
+    /// Default: **false** — prevents prompt-cache invalidation on Anthropic models
+    /// (#778: each injection causes 440-520k tokens of cache re-bills when Claude
+    /// Code strips stale system-reminders retroactively).
+    /// When false, notices route to `ctx_knowledge` + dashboard instead.
+    #[serde(default)]
+    pub inject_context: bool,
 }
 
 impl Default for CodeHealthConfig {
@@ -593,6 +606,7 @@ impl Default for CodeHealthConfig {
             annotate_reads: true,
             naming: true,
             coupling: true,
+            inject_context: false,
         }
     }
 }

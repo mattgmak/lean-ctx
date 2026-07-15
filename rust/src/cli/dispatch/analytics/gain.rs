@@ -311,13 +311,15 @@ fn print_community_hint() {
     // names both the public command and the way back out (community ask: a clear
     // "how to publish/unpublish" line in the normal `gain` output).
     let body = if on_board && has_name {
-        "💡 On the public leaderboard (https://leanctx.com/metrics).  \
-         Refresh:  lean-ctx gain --publish --leaderboard   ·   Remove:  lean-ctx gain --unpublish"
+        "💡 On the public leaderboard (https://leanctx.com/metrics).\n     \
+         Refresh:  lean-ctx gain --publish --leaderboard\n     \
+         Multiple machines?  lean-ctx gain --link  (combine into one entry)\n     \
+         Remove:  lean-ctx gain --unpublish"
             .to_string()
     } else if on_board {
-        // Listed but nameless → shows as "anonymous"; spell out the exact missing step.
         "💡 You're on the leaderboard as \"anonymous\". Claim your handle:\n     \
-         lean-ctx gain --publish --leaderboard --name=\"your handle\""
+         lean-ctx gain --publish --leaderboard --name=\"your handle\"\n     \
+         Multiple machines?  lean-ctx gain --link  (combine into one entry)"
             .to_string()
     } else if published {
         "💡 You're published privately. List on the public leaderboard at https://leanctx.com/metrics:\n     \

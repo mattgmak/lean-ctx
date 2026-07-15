@@ -97,6 +97,67 @@ function isRetrySafeTool(name: string): boolean {
   return !mutatingHints.some((hint) => lower.includes(hint));
 }
 
+/**
+ * Recursively convert a single JSON Schema property to its TypeBox
+ * equivalent. Handles enums, nested objects, and typed array items so
+ * the LLM receives a faithful schema instead of `Type.Unknown()`.
+ *
+ * Standalone (not a class method) so it can recurse without `this` and
+ * be exported for unit testing.
+ */
+export function propToTypebox(prop: Record<string, unknown>): TSchema {
+  const desc = (prop.description as string) ?? undefined;
+  const jsonType = prop.type as string | undefined;
+
+  // JSON Schema `enum` -> Type.Union(Type.Literal(...)) so the LLM
+  // knows valid values (e.g. ctx_patch `op`).
+  const enumValues = prop.enum as unknown[] | undefined;
+  if (Array.isArray(enumValues) && enumValues.length > 0) {
+    const literals = enumValues.map((v) => Type.Literal(String(v)));
+    return literals.length === 1
+      ? Object.assign(literals[0], desc ? { description: desc } : {})
+      : Type.Union(literals, desc ? { description: desc } : {});
+  }
+
+  switch (jsonType) {
+    case "number":
+    case "integer":
+      return Type.Number({ description: desc });
+
+    case "boolean":
+      return Type.Boolean({ description: desc });
+
+    case "array": {
+      const items = prop.items as Record<string, unknown> | undefined;
+      const itemSchema = items ? propToTypebox(items) : Type.Unknown();
+      return Type.Array(itemSchema, desc ? { description: desc } : {});
+    }
+
+    case "object": {
+      const nested = prop.properties as
+        | Record<string, Record<string, unknown>>
+        | undefined;
+      if (nested) {
+        const nestedRequired = new Set(
+          (prop.required as string[] | undefined) ?? [],
+        );
+        const nestedFields: Record<string, TSchema> = {};
+        for (const [k, v] of Object.entries(nested)) {
+          const f = propToTypebox(v);
+          nestedFields[k] = nestedRequired.has(k) ? f : Type.Optional(f);
+        }
+        return Type.Object(nestedFields, desc ? { description: desc } : {});
+      }
+      return Type.Record(Type.String(), Type.Unknown(), {
+        description: desc,
+      });
+    }
+
+    default:
+      return Type.String({ description: desc });
+  }
+}
+
 export class McpBridge {
   private client: Client | null = null;
   private transport: StdioClientTransport | null = null;
@@ -391,38 +452,14 @@ export class McpBridge {
     const fields: Record<string, TSchema> = {};
 
     for (const [key, prop] of Object.entries(properties)) {
-      const desc = (prop.description as string) ?? undefined;
-      const jsonType = prop.type as string | undefined;
-
-      let field: TSchema;
-      switch (jsonType) {
-        case "number":
-        case "integer":
-          field = Type.Number({ description: desc });
-          break;
-        case "boolean":
-          field = Type.Boolean({ description: desc });
-          break;
-        case "array":
-          field = Type.Array(Type.Unknown(), { description: desc });
-          break;
-        case "object":
-          field = Type.Record(Type.String(), Type.Unknown(), {
-            description: desc,
-          });
-          break;
-        default:
-          field = Type.String({ description: desc });
-          break;
-      }
-
-      fields[key] = required.has(key)
-        ? field
-        : Type.Optional(field);
+      const field = propToTypebox(prop);
+      fields[key] = required.has(key) ? field : Type.Optional(field);
     }
 
     return Type.Object(fields);
   }
+
+
 
   /** True when the MCP client is connected and able to serve tool calls. */
   isConnected(): boolean {

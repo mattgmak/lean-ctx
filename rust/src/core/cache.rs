@@ -27,7 +27,10 @@ fn normalize_key(path: &str) -> String {
 }
 
 /// Built-in default token budget for the in-memory read cache.
-pub(crate) const DEFAULT_CACHE_MAX_TOKENS: usize = 500_000;
+/// 2M covers ~100 typical source files, reducing premature eviction
+/// before re-reads occur. RAM-pressure eviction via EvictionOrchestrator
+/// provides an independent safety net regardless of this budget.
+pub(crate) const DEFAULT_CACHE_MAX_TOKENS: usize = 2_000_000;
 
 /// Pure resolver for the read-cache token budget. `env` (the raw
 /// `LEAN_CTX_CACHE_MAX_TOKENS` value) wins when it parses to a positive integer,
@@ -747,10 +750,24 @@ impl SessionCache {
     }
 
     /// Returns a cached compressed output for a given file and mode key.
+    /// Counts as a cache hit — the caller avoids a full disk read + recompression.
     pub fn get_compressed(&self, path: &str, mode_key: &str) -> Option<&String> {
-        self.entries
-            .get(&normalize_key(path))?
-            .get_compressed(mode_key)
+        let key = normalize_key(path);
+        let entry = self.entries.get(&key)?;
+        let result = entry.get_compressed(mode_key)?;
+        entry.bump_read_count();
+        entry.touch();
+        self.stats.total_reads.fetch_add(1, Ordering::Relaxed);
+        self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .total_original_tokens
+            .fetch_add(entry.original_tokens as u64, Ordering::Relaxed);
+        let sent = count_tokens(result) as u64;
+        self.stats
+            .total_sent_tokens
+            .fetch_add(sent, Ordering::Relaxed);
+        crate::core::events::emit_cache_hit(path, entry.original_tokens as u64);
+        Some(result)
     }
 
     /// Marks that full (uncompressed) content was delivered for this file,
@@ -1183,6 +1200,13 @@ mod tests {
     fn hebbian_eviction_bonus_is_wired() {
         // #3: files read together build a Hebbian association via store()'s
         // recording, and that association must feed the eviction bonus.
+        //
+        // Warm up tiktoken first: the very first count_tokens() in the process
+        // lazily loads the BPE tables (can exceed the 500ms co-access burst
+        // window). store() calls count_tokens() internally, so without warming
+        // up, the two store() calls below straddle that window and never
+        // associate — a flaky-empty bonus. Warming up keeps them in one burst.
+        let _ = count_tokens("warmup");
         let mut cache = SessionCache::new();
         cache.store("/a.rs", "fn a() {}");
         cache.store("/b.rs", "fn b() {}");

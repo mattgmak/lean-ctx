@@ -27,15 +27,20 @@ pub fn effective_cache_policy() -> &'static str {
 /// Check if a host compaction event occurred since our last check.
 /// If so, reset all `full_content_delivered` flags so the next read
 /// delivers full content instead of a stub.
+///
+/// Detection strategy (#808):
+/// 1. Check `last_compaction.json` marker file first (written atomically by
+///    the observe hook). This is only a few bytes, immune to being displaced
+///    by large events.
+/// 2. Fall back to scanning the tail of `context_radar.jsonl` (256 KB window)
+///    for older hook binaries that don't write the marker.
 pub fn sync_if_compacted(cache: &mut SessionCache, data_dir: &Path) -> bool {
     let last_seen = LAST_COMPACTION_TS.load(Ordering::Relaxed);
-    let radar_path = data_dir.join("context_radar.jsonl");
 
-    if !radar_path.exists() {
-        return false;
-    }
+    let latest_ts = check_compaction_marker(data_dir, last_seen)
+        .or_else(|| scan_radar_tail(data_dir, last_seen));
 
-    let Some(latest_compaction_ts) = find_latest_compaction(&radar_path, last_seen) else {
+    let Some(latest_compaction_ts) = latest_ts else {
         return false;
     };
 
@@ -66,15 +71,36 @@ pub fn sync_if_compacted(cache: &mut SessionCache, data_dir: &Path) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Detection: marker file (primary, #808)
+// ---------------------------------------------------------------------------
+
+/// Read `last_compaction.json` — a few-byte file written atomically by the
+/// observe hook. Returns `Some(ts)` if the marker exists and its timestamp
+/// is newer than `since_ts`.
+fn check_compaction_marker(data_dir: &Path, since_ts: u64) -> Option<u64> {
+    let marker_path = data_dir.join("last_compaction.json");
+    let content = std::fs::read_to_string(&marker_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(content.trim()).ok()?;
+    let ts = parsed.get("ts")?.as_u64()?;
+    if ts > since_ts { Some(ts) } else { None }
+}
+
+// ---------------------------------------------------------------------------
+// Detection: radar tail scan (fallback for older hook binaries)
+// ---------------------------------------------------------------------------
+
 /// Scan only the tail of radar JSONL for a compaction event newer than `since_ts`.
-/// Reads at most 4KB from the end to avoid unbounded I/O on large radar files.
-fn find_latest_compaction(radar_path: &Path, since_ts: u64) -> Option<u64> {
+/// #808: window widened from 4 KB to 256 KB so large `agent_response` /
+/// `thinking` events (up to 50 000 chars each) cannot bury the compaction entry.
+fn scan_radar_tail(data_dir: &Path, since_ts: u64) -> Option<u64> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(radar_path).ok()?;
+    let radar_path = data_dir.join("context_radar.jsonl");
+    let mut file = std::fs::File::open(&radar_path).ok()?;
     let file_len = file.metadata().ok()?.len();
 
-    const TAIL_BYTES: u64 = 4096;
+    const TAIL_BYTES: u64 = 256 * 1024; // #808: was 4096
     let content = if file_len <= TAIL_BYTES {
         let mut s = String::new();
         file.read_to_string(&mut s).ok()?;
@@ -84,7 +110,6 @@ fn find_latest_compaction(radar_path: &Path, since_ts: u64) -> Option<u64> {
         let mut buf = vec![0u8; TAIL_BYTES as usize];
         let n = file.read(&mut buf).ok()?;
         let s = String::from_utf8_lossy(&buf[..n]).into_owned();
-        // Skip first partial line (we seeked into the middle of it)
         if let Some(idx) = s.find('\n') {
             s[idx + 1..].to_string()
         } else {
@@ -177,5 +202,107 @@ mod tests {
         cache.mark_full_delivered("/tmp/a.rs");
         assert!(!sync_if_compacted(&mut cache, dir.path()));
         assert!(cache.is_full_delivered("/tmp/a.rs"));
+    }
+
+    // --- #808 new tests ---
+
+    /// The marker file alone (without a radar entry) triggers a reset,
+    /// and the same marker timestamp does not trigger it a second time.
+    #[test]
+    #[serial]
+    fn marker_alone_triggers_reset() {
+        let dir = TempDir::new().unwrap();
+        // No context_radar.jsonl — only the marker
+        let marker = dir.path().join("last_compaction.json");
+        std::fs::write(&marker, r#"{"ts":5000}"#).unwrap();
+        // Need a radar file to exist (sync_if_compacted checks marker OR radar)
+        let radar = dir.path().join("context_radar.jsonl");
+        std::fs::write(&radar, "").unwrap();
+
+        LAST_COMPACTION_TS.store(0, Ordering::Relaxed);
+        let mut cache = make_cache_with_delivered(&["/tmp/x.rs"]);
+        assert!(cache.is_full_delivered("/tmp/x.rs"));
+
+        // First call: marker is newer than last_seen (0) → reset
+        assert!(sync_if_compacted(&mut cache, dir.path()));
+        assert!(!cache.is_full_delivered("/tmp/x.rs"));
+        assert_eq!(LAST_COMPACTION_TS.load(Ordering::Relaxed), 5000);
+
+        // Re-deliver, then call again: same marker ts → no reset
+        cache.mark_full_delivered("/tmp/x.rs");
+        assert!(!sync_if_compacted(&mut cache, dir.path()));
+        assert!(cache.is_full_delivered("/tmp/x.rs"));
+    }
+
+    /// A compaction event buried under a large (10 KB+) event line is still
+    /// detected via the widened 256 KB fallback window. This reproduces the
+    /// original bug — the old 4 KB window would miss it.
+    #[test]
+    #[serial]
+    fn compaction_buried_under_large_event_line_is_still_detected() {
+        let dir = TempDir::new().unwrap();
+        let radar = dir.path().join("context_radar.jsonl");
+        let mut f = std::fs::File::create(&radar).unwrap();
+
+        // Write the compaction event
+        writeln!(f, r#"{{"ts":3000,"event_type":"compaction","tokens":0}}"#).unwrap();
+
+        // Bury it under a large agent_response event (10 KB content)
+        let large_content = "x".repeat(10_000);
+        writeln!(
+            f,
+            r#"{{"ts":3001,"event_type":"agent_response","tokens":2500,"content":"{large_content}"}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        LAST_COMPACTION_TS.store(0, Ordering::Relaxed);
+        let mut cache = make_cache_with_delivered(&["/tmp/buried.rs"]);
+        assert!(cache.is_full_delivered("/tmp/buried.rs"));
+
+        // Must find the compaction despite the large event after it
+        assert!(sync_if_compacted(&mut cache, dir.path()));
+        assert!(!cache.is_full_delivered("/tmp/buried.rs"));
+    }
+
+    /// Marker file takes priority over the radar scan: even if the radar
+    /// has no compaction event, the marker triggers a reset.
+    #[test]
+    #[serial]
+    fn marker_takes_priority_over_empty_radar() {
+        let dir = TempDir::new().unwrap();
+        let radar = dir.path().join("context_radar.jsonl");
+        let mut f = std::fs::File::create(&radar).unwrap();
+        writeln!(f, r#"{{"ts":1000,"event_type":"mcp_call","tokens":50}}"#).unwrap();
+        drop(f);
+
+        let marker = dir.path().join("last_compaction.json");
+        std::fs::write(&marker, r#"{"ts":4000}"#).unwrap();
+
+        LAST_COMPACTION_TS.store(0, Ordering::Relaxed);
+        let mut cache = make_cache_with_delivered(&["/tmp/priority.rs"]);
+        assert!(sync_if_compacted(&mut cache, dir.path()));
+        assert!(!cache.is_full_delivered("/tmp/priority.rs"));
+        assert_eq!(LAST_COMPACTION_TS.load(Ordering::Relaxed), 4000);
+    }
+
+    /// A corrupt or empty marker file is ignored — falls back to radar scan.
+    #[test]
+    #[serial]
+    fn corrupt_marker_falls_back_to_radar() {
+        let dir = TempDir::new().unwrap();
+        let radar = dir.path().join("context_radar.jsonl");
+        let mut f = std::fs::File::create(&radar).unwrap();
+        writeln!(f, r#"{{"ts":6000,"event_type":"compaction","tokens":0}}"#).unwrap();
+        drop(f);
+
+        let marker = dir.path().join("last_compaction.json");
+        std::fs::write(&marker, "not valid json").unwrap();
+
+        LAST_COMPACTION_TS.store(0, Ordering::Relaxed);
+        let mut cache = make_cache_with_delivered(&["/tmp/fallback.rs"]);
+        // Corrupt marker ignored → radar scan finds the compaction
+        assert!(sync_if_compacted(&mut cache, dir.path()));
+        assert!(!cache.is_full_delivered("/tmp/fallback.rs"));
     }
 }

@@ -12,11 +12,14 @@ use super::schema::{ConfigSchema, KeySchema};
 /// Attempts to set a config key generically via schema-validated TOML round-trip.
 ///
 /// Returns the updated `Config` on success, or a user-friendly error message.
-pub fn set_by_key(key: &str, value: &str) -> Result<Config, String> {
+pub fn set_by_key(key: &str, value: &str) -> Result<Config, crate::core::error::ConfigError> {
     let schema = ConfigSchema::generate();
-    let key_schema = schema
-        .lookup(key)
-        .ok_or_else(|| format!("Unknown config key: {key}"))?;
+    let key_schema =
+        schema
+            .lookup(key)
+            .ok_or_else(|| crate::core::error::ConfigError::UnknownKey {
+                key: key.to_string(),
+            })?;
 
     let mut table = load_config_as_table()?;
     let toml_value = parse_value(value, key_schema)?;
@@ -24,9 +27,16 @@ pub fn set_by_key(key: &str, value: &str) -> Result<Config, String> {
 
     let cfg: Config = toml::Value::Table(table)
         .try_into()
-        .map_err(|e| format!("Invalid value for '{key}': {e}"))?;
+        .map_err(
+            |e: toml::de::Error| crate::core::error::ConfigError::InvalidValue {
+                key: key.to_string(),
+                message: e.to_string(),
+            },
+        )?;
     cfg.save()
-        .map_err(|e| format!("Error saving config: {e}"))?;
+        .map_err(|e| crate::core::error::ConfigError::Save {
+            source: Box::new(e),
+        })?;
     Ok(cfg)
 }
 
@@ -64,39 +74,49 @@ fn display_toml_value(value: &toml::Value) -> String {
     }
 }
 
-/// Loads the current config file as a raw TOML table.
-/// If no file exists, returns an empty table (fresh config).
-fn load_config_as_table() -> Result<toml::Table, String> {
-    let path = Config::path().ok_or("Cannot determine config path")?;
+fn load_config_as_table() -> Result<toml::Table, crate::core::error::ConfigError> {
+    let path = Config::path().ok_or(crate::core::error::ConfigError::MissingPath)?;
     if !path.exists() {
         return Ok(toml::Table::new());
     }
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("Cannot read config: {e}"))?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|source| crate::core::error::ConfigError::Read { source })?;
     raw.parse::<toml::Table>()
-        .map_err(|e| format!("Config parse error: {e}"))
+        .map_err(|source| crate::core::error::ConfigError::ParseToml { source })
 }
-
-/// Parses a string value into the appropriate `toml::Value` based on schema type.
-fn parse_value(value: &str, schema: &KeySchema) -> Result<toml::Value, String> {
+fn parse_value(
+    value: &str,
+    schema: &KeySchema,
+) -> Result<toml::Value, crate::core::error::ConfigError> {
     match schema.ty.as_str() {
         "bool" | "bool?" => match value {
             "true" | "1" | "yes" => Ok(toml::Value::Boolean(true)),
             "false" | "0" | "no" => Ok(toml::Value::Boolean(false)),
-            _ => Err(format!("Expected bool (true/false), got: {value}")),
+            _ => Err(crate::core::error::ConfigError::ExpectedBool {
+                value: value.to_string(),
+            }),
         },
         "u8" | "u16" | "u32" | "u64" | "usize" | "u64?" => {
-            let n: i64 = value
-                .parse()
-                .map_err(|_| format!("Expected integer, got: {value}"))?;
+            let n: i64 =
+                value
+                    .parse()
+                    .map_err(|_| crate::core::error::ConfigError::ExpectedInteger {
+                        value: value.to_string(),
+                    })?;
             if n < 0 {
-                return Err(format!("Expected unsigned integer, got: {value}"));
+                return Err(crate::core::error::ConfigError::ExpectedUnsignedInteger {
+                    value: value.to_string(),
+                });
             }
             Ok(toml::Value::Integer(n))
         }
         "f32" | "f64" => {
-            let n: f64 = value
-                .parse()
-                .map_err(|_| format!("Expected number, got: {value}"))?;
+            let n: f64 =
+                value
+                    .parse()
+                    .map_err(|_| crate::core::error::ConfigError::ExpectedNumber {
+                        value: value.to_string(),
+                    })?;
             Ok(toml::Value::Float(n))
         }
         "string" | "string?" => Ok(toml::Value::String(value.to_string())),
@@ -104,10 +124,10 @@ fn parse_value(value: &str, schema: &KeySchema) -> Result<toml::Value, String> {
             if let Some(ref allowed) = schema.values
                 && !allowed.iter().any(|v| v == value)
             {
-                return Err(format!(
-                    "Invalid value '{value}'. Allowed: {}",
-                    allowed.join(", ")
-                ));
+                return Err(crate::core::error::ConfigError::InvalidEnumValue {
+                    value: value.to_string(),
+                    allowed: allowed.join(", "),
+                });
             }
             Ok(toml::Value::String(value.to_string()))
         }
@@ -119,9 +139,9 @@ fn parse_value(value: &str, schema: &KeySchema) -> Result<toml::Value, String> {
                 .collect();
             Ok(toml::Value::Array(items))
         }
-        "table" => Err(format!(
-            "Cannot set table '{value}' via CLI. Edit config.toml directly."
-        )),
+        "table" => Err(crate::core::error::ConfigError::CannotSetTable {
+            value: value.to_string(),
+        }),
         other => {
             // Fallback: treat as string (covers unknown future types gracefully)
             tracing::debug!("Unknown schema type '{other}', treating value as string");
@@ -130,11 +150,11 @@ fn parse_value(value: &str, schema: &KeySchema) -> Result<toml::Value, String> {
     }
 }
 
-/// Sets a value in a nested TOML table using a dot-separated key path.
-/// Creates intermediate tables as needed. Returns an error (rather than
-/// panicking) if an intermediate key already holds a non-table value in the
-/// user's `config.toml` — e.g. `proxy = "x"` then `config set proxy.port 1`.
-fn set_nested(table: &mut toml::Table, key: &str, value: toml::Value) -> Result<(), String> {
+fn set_nested(
+    table: &mut toml::Table,
+    key: &str,
+    value: toml::Value,
+) -> Result<(), crate::core::error::ConfigError> {
     let parts: Vec<&str> = key.split('.').collect();
     let (parents, leaf) = parts.split_at(parts.len() - 1);
 
@@ -144,11 +164,9 @@ fn set_nested(table: &mut toml::Table, key: &str, value: toml::Value) -> Result<
             .entry(*part)
             .or_insert_with(|| toml::Value::Table(toml::Table::new()))
             .as_table_mut()
-            .ok_or_else(|| {
-                format!(
-                    "Cannot set '{key}': '{part}' already holds a non-table value in config.toml. \
-                     Fix or remove that key first."
-                )
+            .ok_or_else(|| crate::core::error::ConfigError::NonTableParent {
+                key: key.to_string(),
+                part: (*part).to_string(),
             })?;
     }
     current.insert(leaf[0].to_string(), value);
@@ -256,7 +274,7 @@ mod tests {
         let mut table = toml::Table::new();
         table.insert("proxy".into(), toml::Value::String("oops".into()));
         let err = set_nested(&mut table, "proxy.port", toml::Value::Integer(8080)).unwrap_err();
-        assert!(err.contains("non-table"), "got: {err}");
+        assert!(err.to_string().contains("non-table"), "got: {err}");
     }
 
     #[test]

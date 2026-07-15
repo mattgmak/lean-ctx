@@ -22,7 +22,7 @@ mod shell_security {
     fn check(command: &str, allowlist: &[&str]) -> Result<(), String> {
         let val = allowlist.join(",");
         unsafe { std::env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", &val) };
-        let result = check_shell_allowlist(command);
+        let result = check_shell_allowlist(command).map_err(|err| err.to_string());
         unsafe { std::env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE") };
         result
     }

@@ -675,23 +675,44 @@ fn rewrite_scripts_contain_all_registry_commands() {
 }
 
 #[test]
-fn codex_is_hybrid() {
-    assert_eq!(recommend_hook_mode("codex"), HookMode::Hybrid);
+fn rewrite_script_skips_multiline_commands() {
+    let script = generate_rewrite_script("lean-ctx");
+    assert!(
+        script.contains(r"grep -qF '\n'"),
+        "rewrite script must guard against unresolved JSON \\n (#787)"
+    );
+    let compact = generate_compact_rewrite_script("lean-ctx");
+    assert!(
+        compact.contains(r"grep -qF '\n'"),
+        "compact rewrite script must guard against unresolved JSON \\n (#787)"
+    );
 }
 
 #[test]
-fn cursor_is_hybrid() {
-    assert_eq!(recommend_hook_mode("cursor"), HookMode::Hybrid);
+fn codex_is_replace() {
+    assert_eq!(recommend_hook_mode("codex"), HookMode::Replace);
 }
 
 #[test]
-fn gemini_is_hybrid() {
-    assert_eq!(recommend_hook_mode("gemini"), HookMode::Hybrid);
+fn cursor_is_replace() {
+    assert_eq!(recommend_hook_mode("cursor"), HookMode::Replace);
 }
 
 #[test]
-fn claude_is_hybrid() {
-    assert_eq!(recommend_hook_mode("claude"), HookMode::Hybrid);
+fn gemini_is_replace() {
+    assert_eq!(recommend_hook_mode("gemini"), HookMode::Replace);
+}
+
+#[test]
+fn claude_is_replace() {
+    assert_eq!(recommend_hook_mode("claude"), HookMode::Replace);
+}
+
+#[test]
+fn hybrid_fallback_agents() {
+    assert_eq!(recommend_hook_mode("crush"), HookMode::Hybrid);
+    assert_eq!(recommend_hook_mode("cline"), HookMode::Hybrid);
+    assert_eq!(recommend_hook_mode("kiro"), HookMode::Hybrid);
 }
 
 #[test]

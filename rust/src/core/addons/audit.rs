@@ -21,7 +21,7 @@
 
 use super::manifest::AddonManifest;
 use super::trust::{self, RiskFinding, RiskLevel};
-use crate::core::gateway::TransportKind;
+use crate::core::mcp_catalog::TransportKind;
 
 /// Overall publish verdict, ordered `Pass < Review < Fail`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

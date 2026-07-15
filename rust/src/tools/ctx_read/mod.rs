@@ -20,6 +20,8 @@ pub(crate) mod mode;
 pub(crate) use mode::ReadMode;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_windowed;
 
 /// Pre-counted read output carrying the output string, resolved mode,
 /// and token count computed during mode processing.
@@ -34,7 +36,7 @@ pub struct ReadOutput {
 /// SSOT via [`ReadMode`] (#528): the `map`/`signatures` summaries whose rendered
 /// body is stored per-file in `compressed_outputs`. Unknown modes are not
 /// cacheable, matching the prior `["map","signatures"].contains(mode)`.
-fn is_cacheable_mode(mode: &str) -> bool {
+pub(crate) fn is_cacheable_mode(mode: &str) -> bool {
     mode.parse::<ReadMode>()
         .is_ok_and(|m| m.is_compressed_cacheable())
 }
@@ -48,14 +50,14 @@ fn is_cacheable_mode(mode: &str) -> bool {
 /// view-specific semantics — `lines:` returns a window, `reference` a pointer,
 /// `diff` a delta, `raw` the bytes — so replacing them with the whole file would
 /// be wrong, not cheaper, and they are never capped.
-fn mode_allows_raw_cap(mode: &str) -> bool {
+pub(crate) fn mode_allows_raw_cap(mode: &str) -> bool {
     // SSOT via [`ReadMode`] (#528). Unknown modes keep the prior default of
     // `true` (only `lines:`/`reference`/`diff`/`raw` opt out of the #361 cap).
     mode.parse::<ReadMode>()
         .map_or(true, |m| m.allows_raw_cap())
 }
 
-fn compressed_cache_key(
+pub(crate) fn compressed_cache_key(
     mode: &str,
     crp_mode: CrpMode,
     task: Option<&str>,
@@ -164,6 +166,100 @@ pub fn read_file_lossy(path: &str) -> Result<String, std::io::Error> {
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     };
     Ok(crate::core::io_boundary::strip_utf8_bom(s))
+}
+
+/// A streamed line-window read (#811): only the requested span's raw lines,
+/// plus the file's true total line count for the header — the rest of the
+/// file is never buffered.
+struct LineWindow {
+    /// Raw lines within `[start, end]`, joined with `\n`.
+    body: String,
+    /// True total line count of the file.
+    total_lines: usize,
+    /// Clamped, 1-based inclusive bounds actually served.
+    start: usize,
+    end: usize,
+}
+
+/// Parses an `anchored:` window payload for the disk-streaming short-circuit
+/// below. Only the dash form (`"N-M"`) is fast-pathed — `anchored_lines_mode`
+/// (the registered handler) always emits it, using the `999999` EOF sentinel
+/// rather than a bare `"N"`. A hand-typed bare payload (meaning "N to EOF")
+/// returns `None` and falls through to the normal full-read path instead of
+/// guessing a total line count up front.
+fn parse_disk_anchor_range(payload: &str) -> Option<(usize, usize)> {
+    let (s, e) = payload.split_once('-')?;
+    let start = s.trim().parse::<usize>().ok()?.max(1);
+    let end = e.trim().parse::<usize>().ok()?;
+    Some((start, end))
+}
+
+/// Streams `path` line-by-line and extracts only `[start, end]` (1-based,
+/// inclusive) without ever holding the whole file in memory — the
+/// anchored-window counterpart to [`read_file_lossy`] (#811). Every line is
+/// still counted (one cheap UTF-8 pass, no per-line allocation outside the
+/// requested window) so the caller can report the true total. Returns `None`
+/// on anything that isn't a clean streamed text read (I/O error, a binary
+/// file, invalid UTF-8 anywhere in the file) so the caller can fall back to
+/// the existing, more permissive `read_file_lossy` path — behaviour never
+/// regresses, it just doesn't always get the fast path.
+fn read_line_window(path: &str, start: usize, end: usize) -> Option<LineWindow> {
+    if crate::core::binary_detect::is_binary_file(path) {
+        return None;
+    }
+    use std::io::BufRead;
+    let file = open_with_retry(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut total = 0usize;
+    let mut collected = Vec::new();
+    for line in reader.lines() {
+        let line = line.ok()?;
+        total += 1;
+        if total >= start && total <= end {
+            collected.push(line);
+        }
+    }
+    Some(LineWindow {
+        body: collected.join("\n"),
+        total_lines: total,
+        start: start.min(total.max(1)),
+        end: end.min(total),
+    })
+}
+
+/// #811: attempt the disk-streaming short-circuit for a fresh `anchored:N-M`
+/// read. `None` when the request isn't eligible (not a windowed anchored
+/// read, or a preread is already in hand — nothing to short-circuit) or the
+/// fast path can't run cleanly (binary file, invalid UTF-8, I/O error); the
+/// caller falls through to the normal full-read path in that case.
+fn try_disk_anchored_window(
+    path: &str,
+    mode: &str,
+    fresh: bool,
+    preread_is_none: bool,
+    file_ref: &str,
+    short: &str,
+) -> Option<ReadOutput> {
+    if !fresh || !preread_is_none {
+        return None;
+    }
+    let range = mode.strip_prefix("anchored:")?;
+    let (start, end) = parse_disk_anchor_range(range)?;
+    let window = read_line_window(path, start, end)?;
+    let (out, _) = format_anchored_output_window(
+        file_ref,
+        short,
+        &window.body,
+        window.total_lines,
+        Some((window.start, window.end)),
+    );
+    let out = crate::core::redaction::redact_text_if_enabled(&out);
+    let sent = count_tokens(&out);
+    Some(ReadOutput {
+        content: out,
+        resolved_mode: mode.to_string(),
+        output_tokens: sent,
+    })
 }
 
 /// Opens a file, retrying once after a brief pause on NotFound.
@@ -383,7 +479,7 @@ fn handle_with_options(
 
 /// `LEAN_CTX_FORCE_FRESH=1` — an explicit operator override that always forces a
 /// cold full read, independent of conversation scoping.
-fn force_fresh_env() -> bool {
+pub(crate) fn force_fresh_env() -> bool {
     static FORCE_FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCE_FRESH.get_or_init(|| {
         std::env::var("LEAN_CTX_FORCE_FRESH").is_ok_and(|v| v == "1" || v == "true")
@@ -399,7 +495,7 @@ fn force_fresh_env() -> bool {
 /// withholds cross-agent stubs precisely while restoring the subagent's *own*
 /// cheap re-reads. The blanket force-fresh is therefore kept only as the fallback
 /// when scoping is disabled (#956).
-fn is_subagent_context() -> bool {
+pub(crate) fn is_subagent_context() -> bool {
     static IS_SUBAGENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IS_SUBAGENT.get_or_init(|| std::env::var("CURSOR_TASK_ID").is_ok_and(|v| !v.is_empty()))
 }
@@ -696,7 +792,11 @@ pub fn resolve_explicit_delta_mode(
         mode: mode.to_string(),
         note: None,
     };
-    if fresh || !enabled || !explicit_mode || !(mode == "full" || mode.starts_with("lines:")) {
+    if fresh
+        || !enabled
+        || !explicit_mode
+        || !(mode == "full" || mode == "full-compact" || mode.starts_with("lines:"))
+    {
         return unchanged;
     }
     let Some(entry) = cache.get(path) else {
@@ -780,6 +880,15 @@ fn handle_with_options_inner(
         cache.invalidate(path);
     }
 
+    // #811: a fresh, explicitly windowed `anchored:N-M` read never needs the
+    // cache (fresh always bypasses it) or the whole file in memory — try the
+    // disk-streaming short-circuit first.
+    if let Some(out) =
+        try_disk_anchored_window(path, mode, fresh, preread.is_none(), &file_ref, &short)
+    {
+        return out;
+    }
+
     if mode == "diff" {
         let (out, _) = handle_diff(cache, path, &file_ref);
         let out = crate::core::redaction::redact_text_if_enabled(&out);
@@ -829,13 +938,30 @@ fn handle_with_options_inner(
             mode.to_string()
         };
 
-        if resolved_mode == "full" {
-            // Read-locked stub fast path (single source of truth, shared with
-            // the registered handler's concurrent read-lock attempt). Reached by
-            // an explicit `mode=full` and by `auto` that resolved to a full
-            // cache-hit, so both collapse identically to the `[unchanged]` stub.
+        if resolved_mode == "full" || resolved_mode == "full-compact" {
             if let Some(out) = try_stub_hit_readonly(cache, path) {
                 return out;
+            }
+            if resolved_mode == "full-compact" {
+                let content = match read_file_lossy(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let msg = format!("ERROR: {e}");
+                        return ReadOutput {
+                            content: msg,
+                            resolved_mode: "error".into(),
+                            output_tokens: 0,
+                        };
+                    }
+                };
+                let (out, _) = format_full_compact_output(&content);
+                let out = crate::core::redaction::redact_text_if_enabled(&out);
+                let sent = count_tokens(&out);
+                return ReadOutput {
+                    content: out,
+                    resolved_mode: "full-compact".into(),
+                    output_tokens: sent,
+                };
             }
             let (out, _) = handle_full_with_auto_delta(cache, path, &file_ref, &short, ext, task);
             let out = crate::core::redaction::redact_text_if_enabled(&out);
@@ -857,7 +983,7 @@ fn handle_with_options_inner(
             );
             let compressed_hit = cache.get_compressed(path, &cache_key).cloned();
             if let Some(cached_output) = compressed_hit {
-                cache.record_cache_hit(path);
+                // get_compressed() already recorded the cache hit (stats + event)
                 let out = crate::core::redaction::redact_text_if_enabled(&cached_output);
                 let sent = count_tokens(&out);
                 return ReadOutput {
@@ -952,8 +1078,20 @@ fn handle_with_options_inner(
     // after releasing the lock and appends it to the response.
     let graph_hint: Option<String> = None;
 
-    if mode == "full" {
+    if mode == "full" || mode == "full-compact" {
         cache.mark_full_delivered(path);
+
+        if mode == "full-compact" {
+            let (output, _) = format_full_compact_output(&content);
+            let output = crate::core::redaction::redact_text_if_enabled(&output);
+            let sent = count_tokens(&output);
+            return ReadOutput {
+                content: output,
+                resolved_mode: "full-compact".into(),
+                output_tokens: sent,
+            };
+        }
+
         let (mut output, _) = format_full_output(
             &file_ref,
             &short,
@@ -1082,13 +1220,15 @@ pub fn is_instruction_file(path: &str) -> bool {
 /// is roughly token-neutral and applied to whichever string wins), so the
 /// comparison is apples-to-apples with `original_tokens`. Empty files
 /// (`raw_tokens == 0`) keep their framing so the reader still gets a signal.
-fn cap_to_raw(
+pub(crate) fn cap_to_raw(
     framed: String,
     framed_tokens: usize,
     raw_content: &str,
     raw_tokens: usize,
 ) -> String {
     if raw_tokens > 0 && framed_tokens > raw_tokens {
+        let prevented = (framed_tokens - raw_tokens) as u64;
+        crate::core::cache_telemetry::record_raw_cap(prevented);
         raw_content.to_string()
     } else {
         framed
@@ -1103,7 +1243,7 @@ fn cap_to_raw(
 /// caller can collapse the re-read to the cheap `[unchanged]` stub instead of
 /// re-delivering the whole body. Pass `None` only where no session cache exists
 /// (the CLI cold path), which forces a stateless cold resolution.
-fn resolve_auto_mode(
+pub(crate) fn resolve_auto_mode(
     cache: Option<&SessionCache>,
     file_path: &str,
     original_tokens: usize,

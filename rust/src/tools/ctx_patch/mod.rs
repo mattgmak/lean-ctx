@@ -3,9 +3,12 @@
 //! "Edit by reference, not by reproduction": the model edits lines by their
 //! `(line, hash)` anchor (from `ctx_read(mode="anchored")`) instead of quoting
 //! the old text byte-for-byte. Each anchor is verified against the *current*
-//! file; on drift the edit is rejected with fresh anchors. Multiple edits in
-//! one call are **batch-atomic** — all validated against the same preimage and
-//! applied all-or-nothing, bottom-up.
+//! file; on drift the edit is rejected with fresh anchors — except a
+//! single-line anchor (`set_line`/`insert_after`) whose content moved intact
+//! to exactly one other line (e.g. an earlier, separate edit shifted it):
+//! that's resolved automatically rather than failing (#812). Multiple edits
+//! in one call are **batch-atomic** — all validated against the same
+//! preimage and applied all-or-nothing, bottom-up.
 //!
 //! Reuses the exact `ctx_edit` I/O boundary (`crate::tools::edit_io`):
 //! TOCTOU preimage guard, permission-preserving atomic write, read-only-roots

@@ -1,11 +1,17 @@
 use std::path::Path;
 
 use super::super::{
-    HookMode, hybrid_rules_content, mcp_server_quiet_mode, resolve_hook_command_binary, write_file,
+    HookMode, hybrid_rules_content, mcp_server_quiet_mode, replace_rules_content,
+    resolve_hook_command_binary, write_file,
 };
 
 pub(crate) fn install_qoder_hook_with_mode(mode: HookMode) {
     match mode {
+        HookMode::Replace => {
+            install_qoder_hook();
+            install_qoder_deny_hook();
+            install_qoder_hybrid_rules(mode);
+        }
         HookMode::Hybrid => {
             install_qoder_hook();
             install_qoder_hybrid_rules(mode);
@@ -23,6 +29,76 @@ pub(crate) fn install_qoder_hook() {
     };
     let settings_path = home.join(".qoder").join("settings.json");
     install_qoder_hook_config_at("Qoder", &settings_path);
+}
+
+fn install_qoder_deny_hook() {
+    let Some(home) = crate::core::home::resolve_home_dir() else {
+        return;
+    };
+    let settings_path = home.join(".qoder").join("settings.json");
+    let deny_cmd = format!("{} hook deny", resolve_hook_command_binary());
+
+    let mut root = if settings_path.exists() {
+        std::fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|c| crate::core::jsonc::parse_jsonc(&c).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let original = root.clone();
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let root_obj = root.as_object_mut().unwrap();
+    let hooks_value = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks_value.is_object() {
+        *hooks_value = serde_json::json!({});
+    }
+    let hooks_obj = hooks_value.as_object_mut().unwrap();
+    let pre = hooks_obj
+        .entry("PreToolUse".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !pre.is_array() {
+        *pre = serde_json::json!([]);
+    }
+    let entries = pre.as_array_mut().unwrap();
+
+    entries.retain(|e| !is_lean_ctx_qoder_deny_entry(e));
+    entries.push(serde_json::json!({
+        "matcher": "Read|Grep|Glob",
+        "hooks": [{
+            "type": "command",
+            "command": deny_cmd,
+            "timeout": 10
+        }]
+    }));
+
+    if root != original {
+        write_file(
+            &settings_path,
+            &serde_json::to_string_pretty(&root).unwrap_or_default(),
+        );
+        if !mcp_server_quiet_mode() {
+            eprintln!("  \x1b[32m✓\x1b[0m Qoder deny hook installed (Replace mode)");
+        }
+    }
+}
+
+fn is_lean_ctx_qoder_deny_entry(entry: &serde_json::Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|c| c.contains("lean-ctx") && c.contains("hook deny"))
+            })
+        })
 }
 
 fn install_qoder_hook_config_at(name: &str, settings_path: &Path) -> bool {
@@ -106,6 +182,7 @@ fn install_qoder_hybrid_rules(mode: HookMode) {
     let rules_path = rules_dir.join("lean-ctx.md");
 
     let content = match mode {
+        HookMode::Replace => replace_rules_content(),
         HookMode::Hybrid => hybrid_rules_content(),
         HookMode::Mcp => return,
     };
@@ -114,6 +191,7 @@ fn install_qoder_hybrid_rules(mode: HookMode) {
 
     let mode_name = match mode {
         HookMode::Hybrid => "hybrid",
+        HookMode::Replace => "replace",
         HookMode::Mcp => "mcp",
     };
     eprintln!(

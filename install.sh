@@ -4,6 +4,7 @@
 # Usage:
 #   ./install.sh                # download pre-built binary (no Rust needed)
 #   ./install.sh --download     # download pre-built binary (no Rust needed)
+#   ./install.sh --cuda         # download Linux x86_64 CUDA-enabled binary
 #   ./install.sh --build-only   # build only, don't install
 #   ./install.sh --uninstall    # fully remove lean-ctx (processes, configs, autostart, data, binary)
 #
@@ -18,6 +19,7 @@ set -eu
 
 REPO="yvgude/lean-ctx"
 INSTALL_DIR="${LEAN_CTX_INSTALL_DIR:-$HOME/.local/bin}"
+INSTALL_FLAVOR="${LEAN_CTX_INSTALL_FLAVOR:-cpu}"
 # Resolve the script's directory when invoked as a file. When piped via
 # `curl ... | sh`, $0 is "sh" (or similar) — the [ -f "$0" ] guard then
 # falls back to pwd, which is what the bottom-of-file dispatcher expects:
@@ -36,37 +38,66 @@ echo "lean-ctx installer"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 finish() {
+  # --- Auto-fix PATH if needed ---
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *)
       echo ""
-      echo "Warning: $INSTALL_DIR is not in your PATH."
       shell_name="$(basename "${SHELL:-bash}" 2>/dev/null || echo bash)"
       rc="$HOME/.bashrc"
       case "$shell_name" in
         zsh)  rc="$HOME/.zshrc" ;;
         fish) rc="$HOME/.config/fish/config.fish" ;;
       esac
-      if [ "$shell_name" = "fish" ]; then
-        echo "  fish_add_path $INSTALL_DIR"
+
+      if [ "${LEAN_CTX_NO_PATH_FIX:-}" = "1" ]; then
+        echo "Warning: $INSTALL_DIR is not in your PATH."
+        echo "  Add it manually, then run: lean-ctx onboard"
       else
-        echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> $rc && source $rc"
-        # macOS (and any bash login shell) reads ~/.bash_profile, not ~/.bashrc — so a PATH
-        # line in ~/.bashrc never loads in Terminal.app/IDE login shells. 'lean-ctx onboard'
-        # fixes this automatically; this is the manual one-liner if you skip onboarding.
-        if [ "$shell_name" = "bash" ] && [ "$(uname -s)" = "Darwin" ]; then
-          echo "  # then make login shells load ~/.bashrc (macOS bash):"
-          echo "  grep -qs '.bashrc' \"\$HOME/.bash_profile\" 2>/dev/null || printf '\\n[ -f ~/.bashrc ] && . ~/.bashrc\\n' >> \"\$HOME/.bash_profile\""
+        echo "Adding $INSTALL_DIR to PATH..."
+        if [ "$shell_name" = "fish" ]; then
+          printf '\nfish_add_path %s\n' "$INSTALL_DIR" >> "$rc" 2>/dev/null || true
+        else
+          printf '\nexport PATH="%s:$PATH"\n' "$INSTALL_DIR" >> "$rc" 2>/dev/null || true
+          if [ "$shell_name" = "bash" ] && [ "$(uname -s)" = "Darwin" ]; then
+            grep -qs '.bashrc' "$HOME/.bash_profile" 2>/dev/null || \
+              printf '\n[ -f ~/.bashrc ] && . ~/.bashrc\n' >> "$HOME/.bash_profile" 2>/dev/null || true
+          fi
         fi
+        export PATH="$INSTALL_DIR:$PATH"
+        echo "  Done. PATH updated in $rc and current session."
       fi
       ;;
   esac
+
   echo ""
-  echo "Done! Verify with: lean-ctx --version"
+  echo "Done! lean-ctx $(\"$INSTALL_DIR/lean-ctx\" --version 2>/dev/null || echo 'installed')."
+
+  # --- Auto-onboard unless opted out ---
+  if [ "${LEAN_CTX_NO_ONBOARD:-}" = "1" ]; then
+    echo ""
+    echo "Next step: Run 'lean-ctx onboard' to connect your AI tools."
+    return
+  fi
+
   echo ""
-  echo "Next step: Run 'lean-ctx onboard' to connect your AI tools (zero questions)."
-  echo "  Sets up MCP tools, shell hooks, and editor rules with sensible defaults."
-  echo "  Want to choose every option yourself? Run 'lean-ctx setup' instead."
+  echo "Running onboard (connecting your AI tools)..."
+  "$INSTALL_DIR/lean-ctx" onboard 2>&1 || true
+
+  # --- Detect installed agents and suggest wrap ---
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Setup complete! Quick start:"
+  echo ""
+  echo "  lean-ctx wrap cursor   # one-command setup for Cursor"
+  echo "  lean-ctx wrap claude   # one-command setup for Claude Code"
+  echo "  lean-ctx wrap codex    # one-command setup for Codex CLI"
+  echo ""
+  echo "  lean-ctx doctor        # verify installation"
+  echo "  lean-ctx gain          # see savings after first use"
+  echo ""
+  echo "Full control: lean-ctx setup  (interactive wizard)"
+  echo "Skip auto-onboard: curl ... | LEAN_CTX_NO_ONBOARD=1 sh"
 }
 
 detect_target() {
@@ -140,6 +171,21 @@ stop_running_instance() {
 
 install_download() {
   target="$(detect_target)"
+  case "$INSTALL_FLAVOR" in
+    cuda|gpu)
+      if [ "$target" != "x86_64-unknown-linux-gnu" ]; then
+        echo "Error: CUDA pre-built binary is currently published for x86_64 GNU/Linux only."
+        echo "Detected: $target"
+        exit 1
+      fi
+      target="${target}-cuda"
+      ;;
+    cpu|"") ;;
+    *)
+      echo "Error: unknown install flavor '$INSTALL_FLAVOR' (expected cpu or cuda)"
+      exit 1
+      ;;
+  esac
   echo "Mode: download pre-built binary"
   echo "Platform: $target"
   echo ""
@@ -294,13 +340,15 @@ uninstall() {
 
 case "${1:-}" in
   --download)    install_download ;;
+  --cuda|--gpu)  INSTALL_FLAVOR="cuda"; install_download ;;
   --build-only)  install_from_source --build-only ;;
   --uninstall)   shift; uninstall "$@" ;;
   --help|-h)
-    echo "Usage: $0 [--download|--build-only|--uninstall|--help]"
+    echo "Usage: $0 [--download|--cuda|--build-only|--uninstall|--help]"
     echo ""
     echo "  (no args)     Download pre-built binary (builds from source if run inside the lean-ctx repo)"
     echo "  --download    Download pre-built binary (no Rust needed)"
+    echo "  --cuda        Download Linux x86_64 CUDA-enabled binary"
     echo "  --build-only  Build only, don't install"
     echo "  --uninstall   Fully remove lean-ctx (processes, configs, autostart, data, binary)"
     echo ""
@@ -309,6 +357,7 @@ case "${1:-}" in
     echo ""
     echo "Environment:"
     echo "  LEAN_CTX_INSTALL_DIR  Custom install directory (default: ~/.local/bin)"
+    echo "  LEAN_CTX_INSTALL_FLAVOR  Binary flavor: cpu or cuda (default: cpu)"
     ;;
   *)
     if [ -d "$RUST_DIR" ]; then

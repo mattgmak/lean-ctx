@@ -422,21 +422,22 @@ fn init_claude_installs_dedicated_rules_file_without_claude_md() {
     // documented as a guard-safe editing path (read-before-write gate).
     // v5 (#1008 / GL #1144): edits route through anchored ctx_patch, ctx_edit
     // is a legacy power-profile mention; v4's guard semantics stay documented.
+    // v6: block content updated; version bump propagated here.
     assert!(
-        claude_md.contains("lean-ctx-claude-v5"),
-        "CLAUDE.md must carry the v5 block version"
+        claude_md.contains("lean-ctx-claude-v6"),
+        "CLAUDE.md must carry the v6 block version"
     );
     assert!(
         claude_md.contains("ctx_patch"),
-        "v5 block must route edits to the anchored editor (#1008)"
+        "v6 block must route edits to the anchored editor (#1008)"
     );
     assert!(
         claude_md.contains("prior native Read"),
-        "v5 block must document Claude Code's path-keyed read-before-write gate"
+        "v6 block must document Claude Code's path-keyed read-before-write gate"
     );
     assert!(
         !claude_md.contains("@rules/"),
-        "v5 block must not @-import rules (inline expansion defeats #555)"
+        "v6 block must not @-import rules (inline expansion defeats #555)"
     );
     assert!(
         claude_md.len() < 2048,

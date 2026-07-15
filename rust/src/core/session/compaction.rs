@@ -26,7 +26,7 @@ fn resume_block_hint(level: &CompressionLevel) -> Option<String> {
         CompressionLevel::Standard => Some(
             "[COMPRESSION: standard] Dense output. Atomic fact lines, abbreviations, diff-only code.".to_string(),
         ),
-        CompressionLevel::Max => Some(
+        CompressionLevel::Max | CompressionLevel::Raw => Some(
             "[COMPRESSION: max] Expert-terse mode. Telegraph format, symbolic vocabulary, zero narration.".to_string(),
         ),
     }

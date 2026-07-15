@@ -284,7 +284,8 @@ pub fn get_str(args: &Map<String, Value>, key: &str) -> Option<String> {
 }
 
 pub fn get_int(args: &Map<String, Value>, key: &str) -> Option<i64> {
-    args.get(key).and_then(serde_json::Value::as_i64)
+    args.get(key)
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
 }
 
 /// Read a non-negative integer argument as `usize`.
@@ -368,5 +369,40 @@ mod tests {
         let err = result.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("path is required"), "got: {msg}");
+    }
+
+    #[test]
+    fn get_int_coerces_string_to_number() {
+        let mut args = Map::new();
+        args.insert("n".into(), json!("42"));
+        assert_eq!(super::get_int(&args, "n"), Some(42));
+    }
+
+    #[test]
+    fn get_int_native_number_still_works() {
+        let mut args = Map::new();
+        args.insert("n".into(), json!(7));
+        assert_eq!(super::get_int(&args, "n"), Some(7));
+    }
+
+    #[test]
+    fn get_int_invalid_string_returns_none() {
+        let mut args = Map::new();
+        args.insert("n".into(), json!("not_a_number"));
+        assert_eq!(super::get_int(&args, "n"), None);
+    }
+
+    #[test]
+    fn get_usize_coerces_string() {
+        let mut args = Map::new();
+        args.insert("n".into(), json!("100"));
+        assert_eq!(super::get_usize(&args, "n"), Some(100));
+    }
+
+    #[test]
+    fn get_usize_negative_string_returns_none() {
+        let mut args = Map::new();
+        args.insert("n".into(), json!("-5"));
+        assert_eq!(super::get_usize(&args, "n"), None);
     }
 }

@@ -21,6 +21,10 @@ pub fn granular_tool_defs() -> Vec<Tool> {
 /// `ctx` meta-tool does not exist as a standalone registry entry), so it is
 /// maintained here rather than derived from the registry.
 pub fn unified_tool_defs() -> Vec<Tool> {
+    super::apply_tool_annotations(unified_tool_defs_raw())
+}
+
+fn unified_tool_defs_raw() -> Vec<Tool> {
     vec![
         tool_def(
             "ctx_read",
@@ -196,6 +200,59 @@ mod tests {
             assert!(
                 name == "ctx" || registry.contains(name),
                 "unified tool '{name}' is neither the ctx meta-tool nor a registry tool"
+            );
+        }
+    }
+
+    /// Read-only tools must carry `readOnlyHint: true` so MCP clients can
+    /// allow them in restricted/readonly subagent contexts.
+    #[test]
+    fn readonly_tools_have_annotation() {
+        let defs = crate::server::registry::build_registry().tool_defs();
+        for t in &defs {
+            let name = t.name.as_ref();
+            if crate::tool_defs::READONLY_TOOL_NAMES.contains(&name) {
+                let ann = t
+                    .annotations
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("READONLY tool '{name}' is missing annotations"));
+                assert_eq!(
+                    ann.read_only_hint,
+                    Some(true),
+                    "READONLY tool '{name}' must have readOnlyHint=true"
+                );
+            }
+        }
+    }
+
+    /// Destructive tools must carry `destructiveHint: true`.
+    #[test]
+    fn destructive_tools_have_annotation() {
+        let defs = crate::server::registry::build_registry().tool_defs();
+        for t in &defs {
+            let name = t.name.as_ref();
+            if crate::tool_defs::DESTRUCTIVE_TOOL_NAMES.contains(&name) {
+                let ann = t
+                    .annotations
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("DESTRUCTIVE tool '{name}' is missing annotations"));
+                assert_eq!(
+                    ann.destructive_hint,
+                    Some(true),
+                    "DESTRUCTIVE tool '{name}' must have destructiveHint=true"
+                );
+            }
+        }
+    }
+
+    /// Every tool in READONLY_TOOL_NAMES must exist in the registry.
+    #[test]
+    fn readonly_tool_names_exist_in_registry() {
+        let registry = crate::server::registry::build_registry();
+        for &name in crate::tool_defs::READONLY_TOOL_NAMES {
+            assert!(
+                registry.contains(name),
+                "READONLY_TOOL_NAMES references '{name}' which is not registered"
             );
         }
     }

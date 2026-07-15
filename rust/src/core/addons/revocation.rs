@@ -3,10 +3,10 @@
 //! A revocation immediately **blocks an addon from running** — at three points:
 //!
 //! 1. **install** ([`super::install`]) — a revoked addon refuses to install,
-//! 2. **gateway catalog build** ([`crate::core::gateway::catalog`]) — a revoked
+//! 2. **gateway catalog build** ([`crate::core::mcp_catalog::catalog`]) — a revoked
 //!    server is dropped from the catalog with a surfaced error (its tools
 //!    disappear), and
-//! 3. **every proxy call** ([`crate::core::gateway`]) — a call to a revoked
+//! 3. **every proxy call** ([`crate::core::mcp_catalog`]) — a call to a revoked
 //!    server is refused.
 //!
 //! This is the platform's emergency brake: a compromised or malicious addon can

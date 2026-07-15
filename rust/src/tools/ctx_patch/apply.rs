@@ -75,6 +75,27 @@ fn split_new_text(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// #812: when a line's content no longer matches its anchor because an
+/// earlier edit — possibly a prior *separate* `ctx_patch` call earlier in the
+/// same session, not necessarily this batch — shifted it, look for the same
+/// content elsewhere in the file before giving up. Only redirects on an
+/// unambiguous unique match: zero or 2+ matches fall through to a normal
+/// stale-anchor conflict rather than guess which one the model meant. Scoped
+/// to single-line anchors (`set_line`/`insert_after`); `replace_lines`/
+/// `delete` spans are left as an exact match only.
+fn find_unique_shifted_line(lines: &[String], hash: &str) -> Option<usize> {
+    let mut matches = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| anchor::hash_matches(l, hash))
+        .map(|(i, _)| i);
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 /// Validate every op's anchors against `lines` (the single preimage) and
 /// normalize them to splices. Collects *all* stale anchors before failing so the
 /// model gets the complete picture in one round-trip.
@@ -115,14 +136,30 @@ pub(crate) fn resolve_ops(
                         "line {line} is past end of file ({len} lines)"
                     )));
                 }
-                check(*line, hash, &mut misses);
-                edits.push(ResolvedEdit {
-                    start_idx: line - 1,
-                    remove_count: 1,
-                    new_lines: split_new_text(new_text),
-                    lo: *line,
-                    hi: *line,
-                });
+                let resolved = if lines
+                    .get(*line - 1)
+                    .is_some_and(|cur| anchor::hash_matches(cur, hash))
+                {
+                    Some(*line - 1)
+                } else {
+                    find_unique_shifted_line(lines, hash)
+                };
+                match resolved {
+                    Some(idx) => edits.push(ResolvedEdit {
+                        start_idx: idx,
+                        remove_count: 1,
+                        new_lines: split_new_text(new_text),
+                        lo: idx + 1,
+                        hi: idx + 1,
+                    }),
+                    None => misses.push(AnchorMiss {
+                        line: *line,
+                        expected: hash.clone(),
+                        actual: lines
+                            .get(*line - 1)
+                            .map_or_else(|| "<eof>".to_string(), |cur| anchor::line_hash(cur)),
+                    }),
+                }
             }
             AnchorOp::ReplaceLines {
                 start_line,
@@ -189,16 +226,34 @@ pub(crate) fn resolve_ops(
                             .to_string(),
                     ));
                 }
-                if let Some(h) = hash {
-                    check(*line, h, &mut misses);
+                let resolved_line = match hash {
+                    None => Some(*line),
+                    Some(_) if *line == 0 => Some(*line),
+                    Some(h)
+                        if lines
+                            .get(*line - 1)
+                            .is_some_and(|cur| anchor::hash_matches(cur, h)) =>
+                    {
+                        Some(*line)
+                    }
+                    Some(h) => find_unique_shifted_line(lines, h).map(|idx| idx + 1),
+                };
+                match resolved_line {
+                    Some(l) => edits.push(ResolvedEdit {
+                        start_idx: l,
+                        remove_count: 0,
+                        new_lines,
+                        lo: l,
+                        hi: l,
+                    }),
+                    None => misses.push(AnchorMiss {
+                        line: *line,
+                        expected: hash.clone().unwrap_or_default(),
+                        actual: lines
+                            .get(*line - 1)
+                            .map_or_else(|| "<eof>".to_string(), |cur| anchor::line_hash(cur)),
+                    }),
                 }
-                edits.push(ResolvedEdit {
-                    start_idx: *line,
-                    remove_count: 0,
-                    new_lines,
-                    lo: *line,
-                    hi: *line,
-                });
             }
         }
     }
@@ -520,5 +575,90 @@ mod tests {
         ];
         let edits = resolve_ops(&lines, &ops).ok().unwrap();
         assert_eq!(apply_edits(lines, edits), vec!["A", "3", "4", "E"]);
+    }
+
+    #[test]
+    fn set_line_recovers_when_content_shifted_to_a_different_unique_line() {
+        // #812: the anchor for "target" was captured when it was line 2 (e.g.
+        // from an earlier, separate ctx_patch call that has since inserted a
+        // line above it). It now lives at line 3 unchanged — the edit should
+        // land there instead of hard-failing.
+        let lines = vec![
+            "intro".to_string(),
+            "filler".to_string(),
+            "target".to_string(),
+            "tail".to_string(),
+        ];
+        let ops = vec![AnchorOp::SetLine {
+            line: 2, // stale: this used to be "target"'s line
+            hash: anc(2, "target"),
+            new_text: "TARGET".into(),
+        }];
+        let edits = resolve_ops(&lines, &ops).ok().unwrap();
+        assert_eq!(
+            apply_edits(lines, edits),
+            vec!["intro", "filler", "TARGET", "tail"]
+        );
+    }
+
+    #[test]
+    fn set_line_recovery_declines_on_ambiguous_duplicate_content() {
+        // Two lines share the anchored content — redirecting would be a guess,
+        // so this must still report a stale-anchor conflict rather than pick
+        // one silently.
+        let lines = vec!["same".to_string(), "filler".to_string(), "same".to_string()];
+        let ops = vec![AnchorOp::SetLine {
+            line: 1,
+            hash: "ffff".to_string(), // wrong for line 1 as it stands today
+            new_text: "X".into(),
+        }];
+        match resolve_ops(&lines, &ops) {
+            Err(ResolveError::Conflict(misses)) => assert_eq!(misses.len(), 1),
+            _ => panic!("expected a conflict"),
+        }
+    }
+
+    #[test]
+    fn insert_after_recovers_when_anchor_line_shifted() {
+        let lines = vec![
+            "intro".to_string(),
+            "filler".to_string(),
+            "anchor".to_string(),
+            "tail".to_string(),
+        ];
+        let ops = vec![AnchorOp::InsertAfter {
+            line: 1, // stale: "anchor" used to be line 1
+            hash: Some(anc(1, "anchor")),
+            new_text: "new".into(),
+        }];
+        let edits = resolve_ops(&lines, &ops).ok().unwrap();
+        assert_eq!(
+            apply_edits(lines, edits),
+            vec!["intro", "filler", "anchor", "new", "tail"]
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_apply_to_replace_lines_spans() {
+        // Scoped to single-line anchors (set_line/insert_after) — a shifted
+        // replace_lines span still hard-fails rather than guessing where a
+        // two-anchor range landed.
+        let lines = vec![
+            "intro".to_string(),
+            "filler".to_string(),
+            "start".to_string(),
+            "end".to_string(),
+        ];
+        let ops = vec![AnchorOp::ReplaceLines {
+            start_line: 1, // stale: "start"/"end" used to be lines 1-2
+            start_hash: anc(1, "start"),
+            end_line: 2,
+            end_hash: anc(2, "end"),
+            new_text: "X".into(),
+        }];
+        assert!(matches!(
+            resolve_ops(&lines, &ops),
+            Err(ResolveError::Conflict(_))
+        ));
     }
 }

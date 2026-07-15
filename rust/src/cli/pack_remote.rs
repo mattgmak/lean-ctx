@@ -150,9 +150,14 @@ pub(crate) fn cmd_pack_install_remote(
 
     // Depth-1 dependency resolution (GH #727): declared, non-optional deps
     // install from the same registry and land in the same lockfile.
-    if let Err(e) =
-        install_declared_dependencies(&manifest, &base, token.as_deref(), project_root, refresh)
-    {
+    if let Err(e) = install_declared_dependencies(
+        &manifest.dependencies,
+        Some(&manifest.name),
+        &base,
+        token.as_deref(),
+        project_root,
+        refresh,
+    ) {
         eprintln!("ERROR: dependency install failed: {e}");
         eprintln!(
             "  `{}` itself is installed; fix the dependency and re-run.",
@@ -164,35 +169,47 @@ pub(crate) fn cmd_pack_install_remote(
     apply_or_report(&manifest.name, &manifest.version, project_root);
 }
 
-/// Install every non-optional declared dependency of `manifest` (depth 1,
-/// GH #727). Already-locked deps present in the store are skipped offline;
-/// everything else resolves SemVer against the registry, downloads through
-/// the standard verified import path, and is pinned in the lockfile.
+/// Install every non-optional declared dependency in `deps` (declared by the
+/// root package `root_name`, depth 1, GH #727). Already-locked deps present in
+/// the store are skipped offline; everything else resolves SemVer against the
+/// registry, downloads through the standard verified import path, and is
+/// pinned in the lockfile.
+///
+/// Returns the [`ResolvedDep`]s that actually landed — already-satisfied deps
+/// at their **locked** version, freshly resolved ones at the picked version —
+/// so the caller can expand `[mcp.env]` `{pack_dir:}` against the exact
+/// versions on disk rather than a second, possibly-divergent resolution
+/// (GH #727, Finding B). Takes the dependency slice + root name directly so a
+/// local `lean-ctx-addon.toml` (no hosted `PackageManifest`) installs the same
+/// way (Finding A).
 pub(crate) fn install_declared_dependencies(
-    manifest: &crate::core::context_package::PackageManifest,
+    deps: &[crate::core::context_package::manifest::PackageDependency],
+    root_name: Option<&str>,
     base: &str,
     token: Option<&str>,
     project_root: &str,
     refresh: bool,
-) -> Result<(), String> {
+) -> Result<Vec<crate::core::context_package::deps::ResolvedDep>, String> {
     use crate::core::context_package::{LocalRegistry, deps, lockfile, remote};
 
-    if manifest.dependencies.iter().all(|d| d.optional) {
-        return Ok(());
+    if deps.iter().all(|d| d.optional) {
+        return Ok(Vec::new());
     }
     let registry = LocalRegistry::open()?;
     let root = std::path::Path::new(project_root);
+    let mut resolved_deps = Vec::new();
 
-    for dep in manifest.dependencies.iter().filter(|d| !d.optional) {
-        if !refresh && let Some(ver) = deps::already_satisfied(root, &registry, dep) {
+    for dep in deps.iter().filter(|d| !d.optional) {
+        if !refresh && let Some(resolved) = deps::already_satisfied(root, &registry, dep) {
             println!(
-                "Dependency {}@{ver} already satisfied (locked, offline).",
-                dep.name
+                "Dependency {}@{} already satisfied (locked, offline).",
+                dep.name, resolved.version
             );
+            resolved_deps.push(resolved);
             continue;
         }
 
-        let resolved = deps::resolve_one(&manifest.name, dep, base, token)?;
+        let resolved = deps::resolve_one(root_name, dep, base, token)?;
         let (ns, slug) = (&resolved.namespace, &resolved.slug);
         println!(
             "Installing dependency @{ns}/{slug}@{} (declared: `{} {}`)",
@@ -229,8 +246,9 @@ pub(crate) fn install_declared_dependencies(
             "  ✓ {}@{} installed + pinned",
             dep_manifest.name, dep_manifest.version
         );
+        resolved_deps.push(resolved);
     }
-    Ok(())
+    Ok(resolved_deps)
 }
 
 /// `pack update <ns>/<name>` — refresh a hosted pack (and its declared

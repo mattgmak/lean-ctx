@@ -370,6 +370,12 @@ impl GotchaStore {
 
     // -- Prevention tracking ------------------------------------------------
 
+    pub fn add_universal(&mut self, gotcha: Gotcha) {
+        if !self.gotchas.iter().any(|g| g.id == gotcha.id) {
+            self.gotchas.push(gotcha);
+        }
+    }
+
     pub fn mark_prevented(&mut self, gotcha_id: &str) {
         if let Some(g) = self.gotchas.iter_mut().find(|g| g.id == gotcha_id) {
             g.prevented_count += 1;

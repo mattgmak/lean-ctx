@@ -17,7 +17,7 @@ mod merge;
 mod provenance;
 mod proxy;
 mod read_dedup;
-mod read_redirect;
+pub(crate) mod read_redirect;
 mod render;
 pub mod risk;
 pub mod schema;
@@ -434,6 +434,14 @@ pub struct Config {
     /// replacement" so agents use ctx_* without explicit opt-in.
     #[serde(default)]
     pub shadow_mode: bool,
+    /// Global hook mode override. When set, overrides the per-agent auto-detection.
+    /// - `replace`: Native Read/Grep/Glob/Shell denied, lean-ctx MCP is the only path
+    /// - `hybrid`: MCP + shell hooks for compression (legacy)
+    /// - `mcp`: MCP server only, no hooks
+    ///
+    /// Default: unset (auto-detect per agent via `recommend_hook_mode`)
+    #[serde(default)]
+    pub hook_mode: Option<String>,
     /// Opt-in (#520): write a human-readable debug log of intercepted MCP tool
     /// calls and hook routing decisions (lean-ctx vs native, with reasons) to
     /// `<state_dir>/logs/debug.log`. Override via the LEAN_CTX_DEBUG_LOG env var.
@@ -498,7 +506,7 @@ pub struct Config {
     #[serde(default)]
     pub memory_profile: MemoryProfile,
     /// Controls how aggressively memory is freed when idle.
-    /// Values: "aggressive" (default, 5 min TTL), "shared" (30 min TTL for multi-IDE use).
+    /// Values: "shared" (default, 1h TTL), "aggressive" (5 min TTL for low-memory devices).
     /// Override via LEAN_CTX_MEMORY_CLEANUP env var.
     #[serde(default)]
     pub memory_cleanup: MemoryCleanup,
@@ -568,7 +576,7 @@ pub struct Config {
     /// plus an incoming read would exceed this, lean-ctx evicts the least-valuable
     /// entries *immediately* (RRF: recency × frequency × size) so the read always
     /// proceeds — eviction is never deferred to the staleness TTL. `0` uses the
-    /// built-in default (500k). `LEAN_CTX_CACHE_MAX_TOKENS` env var overrides this.
+    /// built-in default (2M). `LEAN_CTX_CACHE_MAX_TOKENS` env var overrides this.
     #[serde(default)]
     pub cache_max_tokens: usize,
     /// Cross-project boundary policy.
@@ -585,7 +593,7 @@ pub struct Config {
     /// servers. Global-only (never merged from project-local config) and a full
     /// no-op until `gateway.enabled = true`.
     #[serde(default)]
-    pub gateway: crate::core::gateway::GatewayConfig,
+    pub gateway: crate::core::mcp_catalog::GatewayConfig,
     /// Self-hosted org gateway server (`[gateway_server]`, enterprise#20):
     /// deployment parameters for the usage cockpit — seat count for the
     /// org-wide projection, display label, and the central admin API the local
@@ -685,6 +693,12 @@ pub struct Config {
     #[serde(default)]
     pub shell_allow_writes: bool,
 
+    /// #814: opt-in to allow `python3 -c`, `node -e`, etc. in ctx_shell.
+    /// Default `false` — inline code is blocked because it leaves no auditable
+    /// artifact. Override via `LEAN_CTX_SHELL_ALLOW_INLINE_SCRIPTS=1`.
+    #[serde(default)]
+    pub shell_allow_inline_scripts: bool,
+
     /// Setup behavior: controls what gets injected during setup and updates.
     #[serde(default)]
     pub setup: SetupConfig,
@@ -767,6 +781,7 @@ impl Default for Config {
             embedding: EmbeddingConfig::default(),
             shell_hook_disabled: false,
             shadow_mode: false,
+            hook_mode: None,
             debug_log: false,
             shell_activation: ShellActivation::default(),
             skip_agent_aliases: false,
@@ -795,7 +810,7 @@ impl Default for Config {
             boundary_policy: crate::core::memory_boundary::BoundaryPolicy::default(),
             secret_detection: SecretDetectionConfig::default(),
             sensitivity: crate::core::sensitivity::SensitivityConfig::default(),
-            gateway: crate::core::gateway::GatewayConfig::default(),
+            gateway: crate::core::mcp_catalog::GatewayConfig::default(),
             gateway_server: GatewayServerConfig::default(),
             addons: crate::core::addons::AddonsConfig::default(),
             allow_auto_reroot: false,
@@ -811,6 +826,7 @@ impl Default for Config {
             shell_timeout_secs: None,
             shell_heavy_timeout_secs: None,
             shell_allow_writes: false,
+            shell_allow_inline_scripts: false,
             setup: SetupConfig::default(),
         }
     }
@@ -845,8 +861,9 @@ fn record_parse_error(err: Option<String>) {
 ///
 /// Sensitive = anything that can widen lean-ctx's own boundaries or steer the
 /// agent: the shell allowlist, path-jail roots, proxy upstreams, command
-/// aliases, network passthrough, rules scope/injection, tool disabling and
-/// permission inheritance. Comfort/perf knobs are intentionally NOT listed.
+/// aliases, network passthrough, rules scope/injection, tool surface control
+/// (profile/enabled-list/categories, disabling) and permission inheritance.
+/// Comfort/perf knobs are intentionally NOT listed.
 fn strip_sensitive_overrides(local: &mut Config) -> Vec<&'static str> {
     let mut withheld: Vec<&'static str> = Vec::new();
 
@@ -904,6 +921,18 @@ fn strip_sensitive_overrides(local: &mut Config) -> Vec<&'static str> {
     if !local.disabled_tools.is_empty() {
         local.disabled_tools.clear();
         withheld.push("disabled_tools");
+    }
+    if local.tool_profile.is_some() {
+        local.tool_profile = None;
+        withheld.push("tool_profile");
+    }
+    if !local.tools_enabled.is_empty() {
+        local.tools_enabled.clear();
+        withheld.push("tools_enabled");
+    }
+    if !local.default_tool_categories.is_empty() {
+        local.default_tool_categories.clear();
+        withheld.push("default_tool_categories");
     }
 
     withheld
@@ -976,6 +1005,16 @@ impl Config {
             "off" | "none" | "disabled" => RulesInjection::Off,
             _ => RulesInjection::Shared,
         }
+    }
+
+    /// Returns the user-configured hook mode override, or `None` for auto-detect.
+    /// Env var `LEAN_CTX_HOOK_MODE` takes priority over config.
+    #[must_use]
+    pub fn hook_mode_override(&self) -> Option<crate::hooks::HookMode> {
+        let raw = std::env::var("LEAN_CTX_HOOK_MODE")
+            .ok()
+            .or_else(|| self.hook_mode.clone())?;
+        crate::hooks::HookMode::from_str_loose(raw.trim())
     }
 
     /// Returns the effective permission-inheritance mode, preferring the
@@ -1181,6 +1220,20 @@ impl Config {
                 "1" | "true" | "yes" | "on"
             ),
             Err(_) => self.shell_allow_writes,
+        }
+    }
+
+    /// #814: returns `true` if `ctx_shell` may accept inline interpreter scripts
+    /// (`python3 -c "..."`, `node -e "..."`, etc.).
+    /// `LEAN_CTX_SHELL_ALLOW_INLINE_SCRIPTS` (`1`/`true`/`yes`/`on`) overrides
+    /// `config.toml`. The real command gating (allowlist) still applies.
+    pub fn shell_allow_inline_scripts_effective(&self) -> bool {
+        match std::env::var("LEAN_CTX_SHELL_ALLOW_INLINE_SCRIPTS") {
+            Ok(raw) => matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => self.shell_allow_inline_scripts,
         }
     }
 
@@ -1606,10 +1659,13 @@ impl Config {
     {
         let mut cfg = match std::fs::read_to_string(path) {
             Ok(raw) if !raw.trim().is_empty() => toml::from_str::<Self>(&raw).map_err(|e| {
-                super::error::LeanCtxError::Config(format!(
-                    "refusing to modify an unparseable config.toml ({e}); fix it \
+                super::error::LeanCtxError::Config(
+                    format!(
+                        "refusing to modify an unparseable config.toml ({e}); fix it \
                      manually or run `lean-ctx doctor --fix`, then retry"
-                ))
+                    )
+                    .into(),
+                )
             })?,
             _ => Self::default(),
         };
@@ -1636,16 +1692,16 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)
-            .map_err(|e| super::error::LeanCtxError::Config(e.to_string()))?;
+            .map_err(|e| super::error::LeanCtxError::Config(e.to_string().into()))?;
         // Baseline = what loading an empty config yields. This honors serde's
         // field-level `#[serde(default)]` (which can diverge from the struct's
         // `Default` impl), so minimal mode skips exactly the keys that a fresh
         // load would produce — no spurious lines on save.
         let baseline = toml::from_str::<Self>("").unwrap_or_else(|_| Self::default());
         let defaults = toml::to_string_pretty(&baseline)
-            .map_err(|e| super::error::LeanCtxError::Config(e.to_string()))?;
+            .map_err(|e| super::error::LeanCtxError::Config(e.to_string().into()))?;
         crate::config_io::write_toml_preserving_minimal(path, &content, &defaults)
-            .map_err(super::error::LeanCtxError::Config)?;
+            .map_err(|e| super::error::LeanCtxError::Config(e.into()))?;
         Ok(())
     }
 

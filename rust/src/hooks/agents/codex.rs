@@ -204,6 +204,10 @@ fn ensure_codex_hooks_enabled(config_content: &str) -> Option<String> {
     shared_ensure_codex_hooks_enabled(config_content)
 }
 
+// Codex deny is handled mode-aware by the codex-pretooluse handler at runtime:
+// non-rewritable Bash calls are denied in Replace mode, rewritten in Hybrid.
+// A separate deny hook is not needed (Codex PreToolUse only fires for Bash).
+
 #[cfg(test)]
 mod tests {
     use super::{

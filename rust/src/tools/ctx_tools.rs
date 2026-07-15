@@ -1,7 +1,7 @@
-//! `ctx_tools` business logic (#210): the MCP Tool-Catalog Gateway meta-tool.
+//! `ctx_tools` business logic (#210): the MCP Tool-Catalog meta-tool.
 //!
 //! Keeps the registered wrapper thin: this module owns config gating, action
-//! routing, and driving the async [`gateway`] from the synchronous tool
+//! routing, and driving the async [`mcp_catalog`] from the synchronous tool
 //! handler. The MCP dispatch layer wraps handlers in `block_in_place`, so an ambient
 //! runtime handle is available there. The CLI `call` path has no ambient
 //! runtime, so `run` falls back to building its own current_thread runtime
@@ -10,7 +10,7 @@
 use serde_json::{Map, Value};
 
 use crate::core::config::Config;
-use crate::core::gateway;
+use crate::core::mcp_catalog;
 
 const DISABLED_HINT: &str = "gateway is disabled. Enable it in ~/.lean-ctx/config.toml:\n\
      [gateway]\n\
@@ -41,7 +41,7 @@ impl Rt {
 /// Execute a `ctx_tools` action, returning response text or an error message.
 ///
 /// `project_root` is the caller's project root (from `ToolContext`); it is
-/// forwarded to [`gateway::proxy`] so output post-processing (#1095) can index
+/// forwarded to [`mcp_catalog::proxy`] so output post-processing (#1095) can index
 /// downstream results into the project's stores. Empty = no project scope.
 pub fn run(args: &Map<String, Value>, project_root: &str) -> Result<String, String> {
     let cfg = Config::load();
@@ -58,7 +58,7 @@ pub fn run(args: &Map<String, Value>, project_root: &str) -> Result<String, Stri
 
     // L4: expose any compression-integration addon as a named lean-ctx
     // compressor (once per process). No-op when none are configured.
-    gateway::adapters::compression::ensure_registered(&cfg.gateway);
+    mcp_catalog::adapters::compression::ensure_registered(&cfg.gateway);
 
     let action = args.get("action").and_then(Value::as_str).unwrap_or("find");
     let rt = match tokio::runtime::Handle::try_current() {
@@ -79,16 +79,16 @@ pub fn run(args: &Map<String, Value>, project_root: &str) -> Result<String, Stri
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let outcome = rt.block_on(gateway::find(&cfg.gateway, &query));
-            Ok(gateway::render_cards(&outcome))
+            let outcome = rt.block_on(mcp_catalog::find(&cfg.gateway, &query));
+            Ok(mcp_catalog::render_cards(&outcome))
         }
-        "list" => Ok(rt.block_on(gateway::servers_overview(&cfg.gateway))),
+        "list" => Ok(rt.block_on(mcp_catalog::servers_overview(&cfg.gateway))),
         "refresh" => {
-            gateway::catalog::invalidate();
-            let outcome = rt.block_on(gateway::find(&cfg.gateway, ""));
+            mcp_catalog::catalog::invalidate();
+            let outcome = rt.block_on(mcp_catalog::find(&cfg.gateway, ""));
             Ok(format!(
                 "gateway catalog refreshed.\n\n{}",
-                gateway::render_cards(&outcome)
+                mcp_catalog::render_cards(&outcome)
             ))
         }
         "call" => {
@@ -100,7 +100,12 @@ pub fn run(args: &Map<String, Value>, project_root: &str) -> Result<String, Stri
                 None | Some(Value::Null) => Map::new(),
                 Some(_) => return Err("'arguments' must be a JSON object".to_string()),
             };
-            rt.block_on(gateway::proxy(&cfg.gateway, tool, arguments, project_root))
+            rt.block_on(mcp_catalog::proxy(
+                &cfg.gateway,
+                tool,
+                arguments,
+                project_root,
+            ))
         }
         other => Err(format!(
             "invalid action '{other}' (use: find, call, list, refresh)"

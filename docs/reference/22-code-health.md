@@ -138,6 +138,7 @@ All knobs live under `[code_health]`:
 | `gate` | `"warn"` | Edit-gate behaviour: `"warn"` (annotate), `"block"` (refuse clean→over-threshold), `"off"`. |
 | `annotate_reads` | `true` | Inline `cc=` annotations in `signatures` / `map` reads. |
 | `naming` | `true` | Run the naming-quality heuristic. |
+| `inject_context` | `false` | Emit `[CODE HEALTH]` notices as `additionalContext` in PostToolUse hook stdout. **Off by default** to prevent prompt-cache invalidation on Anthropic models (#778). When off, notices route to `ctx_knowledge` + dashboard. Override: `LEAN_CTX_INJECT_CONTEXT=1`. |
 
 ---
 

@@ -12,7 +12,7 @@
 //! the install policy gate all read from one source of truth.
 
 use super::manifest::AddonManifest;
-use crate::core::gateway::TransportKind;
+use crate::core::mcp_catalog::TransportKind;
 
 /// How much an addon is trusted — set by the registry it ships in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -388,6 +388,41 @@
     },
     {
       "addon": {
+        "name": "lean-md",
+        "display_name": "Lean-MarkDown (LMD)",
+        "version": "0.2.0",
+        "description": "Directive-driven Markdown for agent plans. Reusable macros, phase-isolation and single-sourcing keep plans token-lean and cache-safe — written hard against lean-ctx, inspired by MarkdownAI.",
+        "author": "dasTholo",
+        "homepage": "https://github.com/dasTholo/lean-md",
+        "license": "Apache-2.0",
+        "categories": [
+          "plans",
+          "workflow"
+        ],
+        "integration": "none",
+        "keywords": [
+          "markdown",
+          "plans",
+          "macros",
+          "directives",
+          "phase-isolation",
+          "subagents"
+        ],
+        "min_lean_ctx": "3.9.6",
+        "verified": false
+      },
+      "mcp": {
+        "transport": "stdio",
+        "command": "",
+        "args": [],
+        "env": {},
+        "sha256": "",
+        "url": "",
+        "headers": {}
+      }
+    },
+    {
+      "addon": {
         "name": "letta",
         "display_name": "Letta (MemGPT)",
         "version": "",
@@ -406,41 +441,6 @@
           "memgpt",
           "competitor",
           "mcp"
-        ],
-        "min_lean_ctx": "3.8.0",
-        "verified": false
-      },
-      "mcp": {
-        "transport": "stdio",
-        "command": "",
-        "args": [],
-        "env": {},
-        "sha256": "",
-        "url": "",
-        "headers": {}
-      }
-    },
-    {
-      "addon": {
-        "name": "lmd",
-        "display_name": "Lean-MarkDown (LMD)",
-        "version": "",
-        "description": "Directive-driven Markdown for agent plans. Reusable macros, phase-isolation and single-sourcing keep plans token-lean and cache-safe — written hard against lean-ctx, inspired by MarkdownAI.",
-        "author": "dasTholo",
-        "homepage": "https://github.com/dasTholo/lean-ctx/tree/feat-lmd-v1",
-        "license": "Apache-2.0",
-        "categories": [
-          "plans",
-          "workflow"
-        ],
-        "integration": "none",
-        "keywords": [
-          "markdown",
-          "plans",
-          "macros",
-          "directives",
-          "phase-isolation",
-          "subagents"
         ],
         "min_lean_ctx": "3.8.0",
         "verified": false

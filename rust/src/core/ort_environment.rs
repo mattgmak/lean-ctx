@@ -9,7 +9,10 @@
 //! 1. `ORT_DYLIB_PATH` env var (resolved relative to the executable directory)
 //! 2. The lean-ctx managed runtime (`lean-ctx embeddings provision`, GH #732)
 //!    — version-matched to this build's `ort` API level by construction
-//! 3. Nix profile paths — `/run/current-system/sw/lib/`, `~/.nix-profile/lib/` (Linux)
+//! 3. Nix profile paths (Linux):
+//!    - `/run/current-system/sw/lib/` (system profile)
+//!    - `/etc/profiles/per-user/$USER/lib/` (NixOS Home Manager per-user)
+//!    - `~/.nix-profile/lib/` (legacy user profile symlink)
 //! 4. Well-known system directories per platform, including the active
 //!    `HOMEBREW_PREFIX` and the standard Homebrew/Linuxbrew lib dirs
 //! 5. `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`
@@ -54,7 +57,7 @@ pub fn ensure_ort_env(eps: &[ExecutionProviderDispatch]) -> anyhow::Result<()> {
 /// The library path is resolved by [`resolve_ort_dylib`]; errors are
 /// propagated eagerly to avoid hanging on first session creation.
 fn init_ort(eps: &[ExecutionProviderDispatch]) -> anyhow::Result<()> {
-    let path = resolve_ort_dylib()?;
+    let path = resolved_ort_dylib_path()?;
 
     tracing::debug!("Loading libonnxruntime from {}", path.display());
     validate_ort_dylib_version(&path)?;
@@ -69,6 +72,10 @@ fn init_ort(eps: &[ExecutionProviderDispatch]) -> anyhow::Result<()> {
 
     tracing::info!("ONNX Runtime initialised ({})", path.display());
     Ok(())
+}
+
+pub(crate) fn resolved_ort_dylib_path() -> anyhow::Result<PathBuf> {
+    resolve_ort_dylib()
 }
 
 type OrtGetApiBase = unsafe extern "C" fn() -> *const OrtApiBase;
@@ -202,9 +209,10 @@ fn resolve_ort_dylib() -> anyhow::Result<PathBuf> {
 
 /// Check Nix profile symlinks for `libonnxruntime`.
 ///
-/// Nix maintains `/run/current-system/sw/lib/` (system profile) and
-/// `~/.nix-profile/lib/` (user profile) as symlinks to the currently
-/// activated package versions — these are always authoritative.
+/// Nix maintains `/run/current-system/sw/lib/` (system profile),
+/// `/etc/profiles/per-user/$USER/lib/` (NixOS Home Manager per-user profile),
+/// and `~/.nix-profile/lib/` (legacy user profile symlink) as symlinks to the
+/// currently activated package versions — these are always authoritative.
 #[cfg(target_os = "linux")]
 fn nix_profile_search(name: &str) -> Option<PathBuf> {
     let home = dirs::home_dir();
@@ -213,9 +221,25 @@ fn nix_profile_search(name: &str) -> Option<PathBuf> {
         .map(|h| h.join(".nix-profile").join("lib").join(name));
     let candidates = [
         Some(Path::new("/run/current-system/sw/lib").join(name)),
+        nix_per_user_lib(Path::new("/etc/profiles/per-user"), name),
         user_profile,
     ];
     candidates.into_iter().flatten().find(|c| c.is_file())
+}
+
+/// Resolve the per-user Nix profile library path from `$USER`.
+///
+/// Returns `None` when `USER` is unset, empty, or contains path-traversal
+/// characters (`/`, `\0`, `..`).  The `base` parameter enables unit-testing
+/// without touching `/etc/profiles/per-user`.
+#[cfg(target_os = "linux")]
+fn nix_per_user_lib(base: &Path, name: &str) -> Option<PathBuf> {
+    let user = std::env::var("USER").ok()?;
+    if user.is_empty() || user.contains('/') || user.contains('\0') || user.contains("..") {
+        return None;
+    }
+    let candidate = base.join(&user).join("lib").join(name);
+    candidate.is_file().then_some(candidate)
 }
 
 /// Check well-known system directories for `libonnxruntime`.
@@ -362,7 +386,43 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn nix_profile_search_no_panic() {
-        // When no Nix profile is present, returns None without crashing.
         assert!(nix_profile_search("nonexistent.so").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nix_per_user_lib_discovers_file_under_base() {
+        let tmp = std::env::temp_dir().join(format!("lc-nix-pu-{}", std::process::id()));
+        let name = "libonnxruntime-test-marker.so";
+        let user = "testuser";
+        let libdir = tmp.join(user).join("lib");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::write(libdir.join(name), b"marker").unwrap();
+
+        crate::test_env::set_var("USER", user);
+        let found = nix_per_user_lib(&tmp, name);
+        crate::test_env::remove_var("USER");
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(found, Some(libdir.join(name)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nix_per_user_lib_rejects_traversal_in_user() {
+        let tmp = std::env::temp_dir().join(format!("lc-nix-trv-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // NUL bytes cannot be set via std::env::set_var (OS rejects them),
+        // but the contains('\0') guard is defense-in-depth for direct callers.
+        for bad in ["", "../etc", "foo/bar"] {
+            crate::test_env::set_var("USER", bad);
+            assert!(
+                nix_per_user_lib(&tmp, "lib.so").is_none(),
+                "USER={bad:?} should be rejected"
+            );
+        }
+        crate::test_env::remove_var("USER");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

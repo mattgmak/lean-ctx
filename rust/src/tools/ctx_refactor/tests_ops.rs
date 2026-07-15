@@ -868,3 +868,160 @@ fn reformat_without_ide_is_backend_required() {
         "got: {out}"
     );
 }
+
+/// Minimal backend whose `reformat` returns a canned `changed_paths` list.
+struct ReformatStub {
+    changed: Vec<String>,
+}
+impl crate::lsp::backend::LspBackend for ReformatStub {
+    fn open_file(&mut self, _u: &lsp_types::Uri, _l: &str, _t: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn references(
+        &mut self,
+        _u: &lsp_types::Uri,
+        _p: lsp_types::Position,
+        _s: &str,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        Ok(vec![])
+    }
+    fn definition(
+        &mut self,
+        _u: &lsp_types::Uri,
+        _p: lsp_types::Position,
+    ) -> Result<lsp_types::GotoDefinitionResponse, String> {
+        Ok(lsp_types::GotoDefinitionResponse::Array(vec![]))
+    }
+    fn implementations(
+        &mut self,
+        _u: &lsp_types::Uri,
+        _p: lsp_types::Position,
+        _s: &str,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        Ok(vec![])
+    }
+    fn rename(
+        &mut self,
+        _u: &lsp_types::Uri,
+        _p: lsp_types::Position,
+        _n: &str,
+    ) -> Result<Option<lsp_types::WorkspaceEdit>, String> {
+        Ok(None)
+    }
+    fn reformat(
+        &mut self,
+        _q: &crate::lsp::backend::ReformatQuery,
+    ) -> Result<crate::lsp::backend::ReformatResult, String> {
+        Ok(crate::lsp::backend::ReformatResult {
+            applied: true,
+            changed_paths: self.changed.clone(),
+        })
+    }
+}
+
+#[test]
+fn reformat_command_path_reports_changed_and_invalidates_single_file() {
+    // rustfmt-gated: only runs when rustfmt is installed.
+    if std::process::Command::new("rustfmt")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP: rustfmt not in PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("drift.rs"), "fn   x( ){let y=1;}\n").unwrap(); // drift
+    let root = dir.path().to_str().unwrap();
+    let args = serde_json::json!({ "action": "reformat", "path": "drift.rs" });
+
+    // First run: rustfmt rewrites the drifted file → "changed".
+    let out = super::handle_reformat_refactor(&args, root);
+    assert!(out.contains("via rustfmt"), "got: {out}");
+    assert!(
+        out.contains("— changed"),
+        "first run must report changed; got: {out}"
+    );
+
+    // Second run: already conformant → honest "unchanged" (B2: blake3 on the
+    // single file, never a directory).
+    let out2 = super::handle_reformat_refactor(&args, root);
+    assert!(
+        out2.contains("— unchanged"),
+        "second run must report unchanged; got: {out2}"
+    );
+}
+
+#[test]
+fn reformat_jetbrains_scope_invalidates_all_changed_paths() {
+    // B2: the Jetbrains arm must keep every changed path, invalidate ALL of them,
+    // and report the true count. This test observes the REAL cache effect rather
+    // than the output string alone: it warms `cli_cache` for both changed paths,
+    // runs `render_reformat`, then asserts both entries were evicted. A B-regression
+    // that skips the invalidate loop (e.g. `.map(|_| ())`) leaves the — unchanged —
+    // entries cached, so the post-run reads stay `Hit` and this test goes red.
+    //
+    // The private data dir isolates the on-disk `cli_cache` store and serializes
+    // via the global env-lock, so warming/eviction is deterministic here.
+    let _data = crate::core::data_dir::isolated_data_dir();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.kt"), "val a = 1\n").unwrap();
+    std::fs::write(dir.path().join("b.kt"), "val b = 1\n").unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    // Resolve exactly as `render_reformat` does for each changed path, so the cache
+    // keys line up: `invalidate` and `check_and_read` both funnel the abs path
+    // through `normalize_tool_path` (same key convention).
+    let abs_a = crate::core::path_resolve::resolve_tool_path(Some(root), None, "a.kt").unwrap();
+    let abs_b = crate::core::path_resolve::resolve_tool_path(Some(root), None, "b.kt").unwrap();
+
+    // `check_and_read` re-inserts on a Miss, so it is a single-shot probe: read it
+    // exactly once per assertion. A `Hit` proves the entry is currently present.
+    let is_cached = |abs: &str| {
+        matches!(
+            crate::core::cli_cache::check_and_read(abs),
+            crate::core::cli_cache::CacheResult::Hit { .. }
+        )
+    };
+
+    // Warm: the first read is a Miss that inserts the entry; the second must Hit.
+    let _ = crate::core::cli_cache::check_and_read(&abs_a);
+    let _ = crate::core::cli_cache::check_and_read(&abs_b);
+    assert!(
+        is_cached(&abs_a),
+        "premise: a.kt must be cached after warming"
+    );
+    assert!(
+        is_cached(&abs_b),
+        "premise: b.kt must be cached after warming"
+    );
+
+    let mut be = ReformatStub {
+        changed: vec!["a.kt".into(), "b.kt".into()],
+    };
+    let query = crate::lsp::backend::ReformatQuery {
+        abs_path: abs_a.clone(),
+        rel_path: "a.kt".into(),
+        scope: crate::lsp::backend::ReformatScope::File,
+        optimize_imports: false,
+    };
+    let out = super::render_reformat(&mut be, root, &query);
+    assert!(out.contains("changed files: 2"), "got: {out}");
+    assert!(
+        !out.contains("unchanged"),
+        "Jetbrains arm must not report unchanged; got: {out}"
+    );
+
+    // The real effect: BOTH changed paths were invalidated. The stub never rewrites
+    // the files, so their content hash is unchanged — the only way these reads can
+    // Miss is an actual eviction by the invalidate loop.
+    assert!(
+        !is_cached(&abs_a),
+        "render_reformat must invalidate a.kt (B2 regression: invalidate loop skipped)"
+    );
+    assert!(
+        !is_cached(&abs_b),
+        "render_reformat must invalidate b.kt (B2 regression: invalidate loop skipped)"
+    );
+}

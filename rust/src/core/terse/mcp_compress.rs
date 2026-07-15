@@ -21,7 +21,7 @@ impl DescriptionMode {
         match level {
             CompressionLevel::Off | CompressionLevel::Lite => Self::Full,
             CompressionLevel::Standard => Self::Terse,
-            CompressionLevel::Max => Self::Lazy,
+            CompressionLevel::Max | CompressionLevel::Raw => Self::Lazy,
         }
     }
 }

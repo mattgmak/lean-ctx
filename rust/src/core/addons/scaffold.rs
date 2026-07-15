@@ -7,7 +7,7 @@
 //! to end on a fresh scaffold.
 
 use crate::core::addons::trust;
-use crate::core::gateway::TransportKind;
+use crate::core::mcp_catalog::TransportKind;
 
 /// The manifest filename an addon ships and `addon add <path>` expects.
 pub const MANIFEST_FILENAME: &str = "lean-ctx-addon.toml";

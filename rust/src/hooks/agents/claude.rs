@@ -17,8 +17,14 @@ pub(crate) fn install_claude_hook_with_mode(global: bool, mode: HookMode) {
     // #281: register the MCP server only when MCP updates are enabled. The hook
     // scripts/config above and the rules/skill below still install, so an
     // MCP-disabled setup keeps the CLI integration without an MCP entry.
-    if matches!(mode, HookMode::Hybrid | HookMode::Mcp) && super::super::should_register_mcp() {
+    if matches!(mode, HookMode::Hybrid | HookMode::Mcp | HookMode::Replace)
+        && super::super::should_register_mcp()
+    {
         install_claude_mcp_server(&home);
+    }
+
+    if mode == HookMode::Replace {
+        install_claude_permissions_deny_replace(&home);
     }
 
     let scope = crate::core::config::Config::load().rules_scope_effective();
@@ -83,6 +89,71 @@ fn install_claude_mcp_server(home: &std::path::Path) {
     }
 }
 
+/// In Replace mode, add Read/Grep/Glob/Bash to Claude Code's `permissions.deny`
+/// so native tools are completely unavailable and the agent must use ctx_* MCP tools.
+pub(crate) fn install_claude_permissions_deny_replace(home: &std::path::Path) {
+    let settings_path = home.join(".claude").join("settings.json");
+
+    let mut json = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            crate::core::jsonc::parse_jsonc(&content).unwrap_or_else(|_| serde_json::json!({}))
+        }
+    } else {
+        let _ = std::fs::create_dir_all(home.join(".claude"));
+        serde_json::json!({})
+    };
+
+    let Some(obj) = json.as_object_mut() else {
+        return;
+    };
+
+    let permissions = obj
+        .entry("permissions")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(perm_obj) = permissions.as_object_mut() else {
+        return;
+    };
+    let deny = perm_obj
+        .entry("deny")
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(arr) = deny.as_array_mut() else {
+        return;
+    };
+
+    // Bash intentionally NOT denied: permissions.deny blocks globally including
+    // plugin commands (codex-companion etc.). PreToolUse hook handles agent Bash. (GH #799)
+    let deny_tools = ["Read", "Grep", "Glob"];
+    let mut changed = false;
+    for tool in deny_tools {
+        let val = serde_json::Value::String(tool.to_string());
+        if !arr.contains(&val) {
+            arr.push(val);
+            changed = true;
+        }
+    }
+
+    // Remove stale "Bash" entry left by older versions (GH #799).
+    let bash_val = serde_json::Value::String("Bash".to_string());
+    if let Some(pos) = arr.iter().position(|v| v == &bash_val) {
+        arr.remove(pos);
+        changed = true;
+    }
+
+    if changed {
+        if let Ok(out) = serde_json::to_string_pretty(&json) {
+            let _ = std::fs::write(&settings_path, out);
+        }
+        if !mcp_server_quiet_mode() {
+            eprintln!(
+                "  \x1b[32m✓\x1b[0m Claude Code: denied native Read/Grep/Glob (Replace mode)"
+            );
+        }
+    }
+}
+
 /// Shared with `doctor` so the instructions check recognises the same block
 /// this installer writes (GH #396: doctor must not demand the retired rules file).
 ///
@@ -94,7 +165,7 @@ fn install_claude_mcp_server(home: &std::path::Path) {
 /// appended a duplicate (GH #549).
 pub(crate) const CLAUDE_MD_BLOCK_START: &str = crate::core::rules_canonical::AGENTS_BLOCK_START;
 const CLAUDE_MD_BLOCK_END: &str = crate::core::rules_canonical::AGENTS_BLOCK_END;
-const CLAUDE_MD_BLOCK_VERSION: &str = "lean-ctx-claude-v5";
+const CLAUDE_MD_BLOCK_VERSION: &str = "lean-ctx-claude-v6";
 
 // v3 (GL #555): self-contained, no `@rules/lean-ctx.md` import. Claude Code
 // expands `@` imports inline at launch ("imports do not reduce context usage"
@@ -115,7 +186,7 @@ const CLAUDE_MD_BLOCK_VERSION: &str = "lean-ctx-claude-v5";
 // Read → Edit stays fully supported (v4's guard semantics unchanged).
 const CLAUDE_MD_BLOCK_CONTENT_MCP: &str = "\
 <!-- lean-ctx -->
-<!-- lean-ctx-claude-v5 -->
+<!-- lean-ctx-claude-v6 -->
 ## lean-ctx — Context Runtime
 
 When the `ctx_*` MCP tools are listed in this session, prefer them over native equivalents:
@@ -128,6 +199,26 @@ When the `ctx_*` MCP tools are listed in this session, prefer them over native e
 Native `Read` → `Edit`/`StrReplace` stays fully supported — the edit gate requires a
 prior native Read of the same file path. Write, Delete, Glob — use normally.
 If no `ctx_*` tools are listed in this session, use the native tools throughout.
+
+Read modes: anchored (edit), full (verbatim), map (overview), signatures (API), diff (post-edit), lines:N-M (range), auto.
+Details live in the `lean-ctx` skill (loads on demand — keep this file lean).
+<!-- /lean-ctx -->";
+
+const CLAUDE_MD_BLOCK_CONTENT_REPLACE: &str = "\
+<!-- lean-ctx -->
+<!-- lean-ctx-claude-v6 -->
+## lean-ctx — Replace Mode (native tools denied)
+
+Native Read/Grep/Glob/Bash are denied by policy. Use ONLY `ctx_*` MCP tools:
+- `ctx_read` for ALL file reads (cached, 10 modes, re-reads ~13 tokens)
+- `ctx_shell` for ALL shell commands (95+ compression patterns)
+- `ctx_search` instead of Grep/rg (compact results)
+- `ctx_tree` instead of ls/find (compact directory maps)
+- `ctx_glob` instead of Glob (file pattern matching)
+- Edits: `ctx_read(mode=\"anchored\")` → `ctx_patch` (line+hash anchors, never echo old text; `op=create` for new files).
+
+Write and Delete — use native tools normally.
+Do NOT attempt native Read, Grep, Glob, or Bash — they will be denied.
 
 Read modes: anchored (edit), full (verbatim), map (overview), signatures (API), diff (post-edit), lines:N-M (range), auto.
 Details live in the `lean-ctx` skill (loads on demand — keep this file lean).
@@ -154,17 +245,18 @@ fn install_claude_global_claude_md_for_mode(home: &std::path::Path, mode: HookMo
 
     let existing = std::fs::read_to_string(&claude_md_path).unwrap_or_default();
     let block = match mode {
+        HookMode::Replace => CLAUDE_MD_BLOCK_CONTENT_REPLACE,
         HookMode::Mcp | HookMode::Hybrid => CLAUDE_MD_BLOCK_CONTENT_MCP,
     };
-    let block_version = match mode {
-        HookMode::Mcp | HookMode::Hybrid => CLAUDE_MD_BLOCK_VERSION,
-    };
+    let block_version = CLAUDE_MD_BLOCK_VERSION;
 
-    // A single up-to-date block needs no rewrite. Otherwise — a stale version
-    // *or* duplicate blocks accumulated from the pre-#549 marker mismatch —
-    // collapse every lean-ctx block and write exactly one canonical copy back.
+    // A single up-to-date block needs no rewrite. Check both version tag AND
+    // mode-specific content — the Replace and MCP blocks share the version tag
+    // but have different instructions (GH #1250 follow-up).
     let block_count = existing.matches(CLAUDE_MD_BLOCK_START).count();
-    if block_count == 1 && existing.contains(block_version) {
+    let is_replace_block = existing.contains("denied by policy");
+    let mode_matches = matches!(mode, HookMode::Replace) == is_replace_block;
+    if block_count == 1 && existing.contains(block_version) && mode_matches {
         return;
     }
     let cleaned = remove_all_blocks(&existing, CLAUDE_MD_BLOCK_START, CLAUDE_MD_BLOCK_END);
@@ -915,8 +1007,6 @@ mod tests {
 
     #[test]
     fn installer_heals_duplicate_claude_blocks() {
-        // GH #549: pre-fix installs accumulated duplicate blocks; a re-run must
-        // collapse them to exactly one while preserving the user's own content.
         let _lock = crate::core::data_dir::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
@@ -938,5 +1028,89 @@ mod tests {
             "duplicates must collapse to one, got:\n{after}"
         );
         assert!(after.contains("# my notes"), "user content must survive");
+    }
+
+    #[test]
+    fn replace_mode_adds_permissions_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+        // Start with existing settings
+        let settings = home.join(".claude").join("settings.json");
+        std::fs::write(&settings, r#"{"hooks": {}}"#).unwrap();
+
+        install_claude_permissions_deny_replace(home);
+
+        let content = std::fs::read_to_string(&settings).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let deny = json
+            .pointer("/permissions/deny")
+            .and_then(|d| d.as_array())
+            .unwrap();
+
+        assert!(deny.contains(&serde_json::json!("Read")));
+        assert!(deny.contains(&serde_json::json!("Grep")));
+        assert!(deny.contains(&serde_json::json!("Glob")));
+        // Bash must NOT be in permissions.deny — it blocks plugins (GH #799)
+        assert!(!deny.contains(&serde_json::json!("Bash")));
+        // Original content preserved
+        assert!(json.get("hooks").is_some());
+    }
+
+    #[test]
+    fn replace_mode_permissions_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+        let settings = home.join(".claude").join("settings.json");
+        std::fs::write(&settings, r"{}").unwrap();
+
+        install_claude_permissions_deny_replace(home);
+        install_claude_permissions_deny_replace(home);
+
+        let content = std::fs::read_to_string(&settings).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let deny = json
+            .pointer("/permissions/deny")
+            .and_then(|d| d.as_array())
+            .unwrap();
+
+        // Each tool should appear exactly once
+        let read_count = deny.iter().filter(|v| v.as_str() == Some("Read")).count();
+        assert_eq!(read_count, 1, "idempotent: Read must appear exactly once");
+    }
+
+    #[test]
+    fn replace_mode_removes_stale_bash_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+        // Simulate a settings.json left by an older lean-ctx version
+        let settings = home.join(".claude").join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"permissions": {"deny": ["Read", "Grep", "Glob", "Bash"]}}"#,
+        )
+        .unwrap();
+
+        install_claude_permissions_deny_replace(home);
+
+        let content = std::fs::read_to_string(&settings).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let deny = json
+            .pointer("/permissions/deny")
+            .and_then(|d| d.as_array())
+            .unwrap();
+
+        assert!(deny.contains(&serde_json::json!("Read")));
+        assert!(deny.contains(&serde_json::json!("Grep")));
+        assert!(deny.contains(&serde_json::json!("Glob")));
+        assert!(
+            !deny.contains(&serde_json::json!("Bash")),
+            "stale Bash must be removed (GH #799)"
+        );
     }
 }

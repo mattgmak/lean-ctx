@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn window_defaults_and_validation() {
         let (from, to) = resolve_window(None, None).expect("default window");
-        assert!((to - from).num_days() == 30);
+        assert_eq!((to - from).num_days(), 30);
 
         let (from, to) = resolve_window(Some("2026-07-01T00:00:00Z"), Some("2026-07-31T23:59:59Z"))
             .expect("explicit window");

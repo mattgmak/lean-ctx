@@ -141,8 +141,7 @@ pub fn collect_rules_files(home: &Path, project: &Path) -> Vec<RulesFileCost> {
     let mut seen = std::collections::HashSet::new();
     out.retain(|f| {
         let canonical = std::fs::canonicalize(&f.path)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| f.path.clone());
+            .map_or_else(|_| f.path.clone(), |p| p.to_string_lossy().to_string());
         seen.insert(canonical)
     });
 

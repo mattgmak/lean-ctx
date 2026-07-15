@@ -11,7 +11,7 @@ use super::manifest::AddonManifest;
 use super::policy::AddonsConfig;
 use super::store::{ArtifactReceipt, InstalledAddon, InstalledStore};
 use crate::core::config::Config;
-use crate::core::gateway::GatewayServer;
+use crate::core::mcp_catalog::GatewayServer;
 
 /// Result of a successful [`install`].
 pub struct InstallOutcome {
@@ -32,6 +32,25 @@ pub fn preflight(
     force: bool,
 ) -> Result<GatewayServer, String> {
     manifest.validate()?;
+
+    // Version gate (GH #727): an older lean-ctx does not understand this addon's
+    // `[[dependencies]]` / `{pack_dir:…}` wiring — it would install the addon and
+    // silently ignore both. Abort. This deliberately diverges from
+    // `context_package::loader`, which only warns on a min-version mismatch: a
+    // warning here would leave exactly the silent-ignore path this gate exists to
+    // close.
+    let min_version = manifest.addon.min_lean_ctx.trim();
+    if !min_version.is_empty() {
+        let current = env!("CARGO_PKG_VERSION");
+        if crate::core::context_package::loader::version_lt(current, min_version) {
+            return Err(format!(
+                "addon `{}` requires lean-ctx >= {min_version}, but this binary is {current} — \
+                 upgrade lean-ctx and retry.",
+                manifest.addon.name
+            ));
+        }
+    }
+
     let server = manifest.to_gateway_server();
     server.resolve().map_err(|e| {
         format!(
@@ -142,7 +161,7 @@ pub fn install(
     });
     store.save()?;
 
-    crate::core::gateway::catalog::invalidate();
+    crate::core::mcp_catalog::catalog::invalidate();
 
     Ok(InstallOutcome {
         name,
@@ -177,7 +196,7 @@ pub fn remove(name: &str) -> Result<RemoveOutcome, String> {
     let last_removed = store.addons.is_empty();
     store.save()?;
 
-    crate::core::gateway::catalog::invalidate();
+    crate::core::mcp_catalog::catalog::invalidate();
 
     Ok(RemoveOutcome {
         name: name.to_string(),
@@ -308,6 +327,33 @@ mod tests {
         let _iso = isolated_data_dir();
         let listed = AddonManifest::from_toml("[addon]\nname = \"listed\"\n").expect("parse");
         assert!(install(&listed, "registry", false, None).is_err());
+    }
+
+    /// The running binary's own version always clears its own gate.
+    #[test]
+    fn preflight_accepts_an_equal_min_lean_ctx() {
+        let _iso = isolated_data_dir();
+        let toml = format!(
+            "[addon]\nname = \"demo\"\nversion = \"1.0.0\"\nmin_lean_ctx = \"{}\"\n\
+             [mcp]\ncommand = \"demo-bin\"\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let m = AddonManifest::from_toml(&toml).expect("parses");
+        preflight(&m, &AddonsConfig::default(), false).expect("equal version passes");
+    }
+
+    /// A requirement above the running binary aborts, naming both versions.
+    #[test]
+    fn preflight_aborts_when_the_binary_is_too_old() {
+        let _iso = isolated_data_dir();
+        let m = AddonManifest::from_toml(
+            "[addon]\nname = \"demo\"\nversion = \"1.0.0\"\nmin_lean_ctx = \"999.0.0\"\n\
+             [mcp]\ncommand = \"demo-bin\"\n",
+        )
+        .expect("parses");
+        let err = preflight(&m, &AddonsConfig::default(), false).expect_err("too old");
+        assert!(err.contains("requires lean-ctx >= 999.0.0"), "{err}");
+        assert!(err.contains(env!("CARGO_PKG_VERSION")), "{err}");
     }
 
     #[test]

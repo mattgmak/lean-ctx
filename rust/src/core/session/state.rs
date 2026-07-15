@@ -475,7 +475,7 @@ impl SessionState {
         let p = std::path::Path::new(candidate);
         match crate::core::pathjail::jail_path(p, std::path::Path::new(fallback_root)) {
             Ok(jailed) => (jailed.to_string_lossy().to_string(), None),
-            Err(reason) => (fallback_root.to_string(), Some(reason)),
+            Err(reason) => (fallback_root.to_string(), Some(reason.to_string())),
         }
     }
 

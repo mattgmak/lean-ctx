@@ -362,7 +362,7 @@ fn bandit_explore(file_path: &str, token_count: usize) -> Option<String> {
         10001..=50000 => "lg",
         _ => "xl",
     };
-    let bandit_key = format!("{ext}_{bucket}");
+    let bandit_key = crate::core::bandit::bandit_key("mode", ext, Some(bucket));
     let mut store = crate::core::bandit::BanditStore::load(&project_root);
     let bandit = store.get_or_create(&bandit_key);
     // #4: deterministic argmax-of-mean by default; Thompson only under the flag.

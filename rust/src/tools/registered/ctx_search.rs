@@ -106,10 +106,50 @@ impl McpTool for CtxSearchTool {
     }
 }
 
+/// Known argument keys for ctx_search — used by the lenient fallback to detect
+/// unrecognized keys that weaker models may use instead of `pattern`.
+const KNOWN_KEYS: &[&str] = &[
+    "action",
+    "pattern",
+    "query",
+    "name",
+    "handle",
+    "path",
+    "paths",
+    "include",
+    "ext",
+    "anchored",
+    "max_results",
+    "top_k",
+    "mode",
+    "file",
+    "kind",
+    "file_path",
+    "line",
+    "languages",
+    "path_glob",
+    "workspace",
+    "artifacts",
+    "ignore_gitignore",
+];
+
 /// `action=regex` (default) — exact-pattern search over one or more roots.
 fn handle_regex(args: &Map<String, Value>, ctx: &ToolContext) -> Result<ToolOutput, ErrorData> {
+    // Lenient fallback: if `pattern` is missing, accept the first unrecognized
+    // string value as the pattern. Handles weak models that use keys like
+    // "search_term", "text", "regex", etc. instead of the documented "pattern".
     let pattern = get_str(args, "pattern")
-        .ok_or_else(|| ErrorData::invalid_params("pattern is required", None))?;
+        .or_else(|| {
+            args.iter()
+                .find(|(k, v)| !KNOWN_KEYS.contains(&k.as_str()) && v.is_string())
+                .and_then(|(_, v)| v.as_str().map(String::from))
+        })
+        .ok_or_else(|| {
+            ErrorData::invalid_params(
+                "pattern is required. Example: ctx_search(pattern=\"fn main\", path=\"/src\")",
+                None,
+            )
+        })?;
     let resolved = crate::server::multi_path::resolve_tool_paths(args, ctx)
         .map_err(|e| ErrorData::invalid_params(format!("ERROR: {e}"), None))?;
     // `include` is the canonical glob filter; `ext` is the deprecated alias
@@ -550,5 +590,35 @@ mod tests {
         assert_eq!(ext_to_include("*.rs"), "*.rs");
         assert_eq!(ext_to_include("*.{rs,ts}"), "*.{rs,ts}");
         assert_eq!(ext_to_include("src/**/*.tsx"), "src/**/*.tsx");
+    }
+
+    #[test]
+    fn lenient_fallback_uses_unknown_string_key_as_pattern() {
+        use super::{KNOWN_KEYS, get_str};
+
+        // Simulate Gemma sending {"search_term": "fn main"} — an unknown key
+        // with a string value should be picked up by the lenient fallback.
+        let a = args(&[("search_term", json!("fn main"))]);
+        let pattern = get_str(&a, "pattern").or_else(|| {
+            a.iter()
+                .find(|(k, v)| !KNOWN_KEYS.contains(&k.as_str()) && v.is_string())
+                .and_then(|(_, v)| v.as_str().map(String::from))
+        });
+        assert_eq!(pattern, Some("fn main".to_string()));
+    }
+
+    #[test]
+    fn lenient_fallback_does_not_grab_known_keys() {
+        use super::{KNOWN_KEYS, get_str};
+
+        // If only known keys are present (but pattern is missing), fallback
+        // should NOT pick them up — it returns None.
+        let a = args(&[("path", json!("/src")), ("max_results", json!(10))]);
+        let pattern = get_str(&a, "pattern").or_else(|| {
+            a.iter()
+                .find(|(k, v)| !KNOWN_KEYS.contains(&k.as_str()) && v.is_string())
+                .and_then(|(_, v)| v.as_str().map(String::from))
+        });
+        assert_eq!(pattern, None);
     }
 }

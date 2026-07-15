@@ -110,13 +110,16 @@ pub(super) fn lean_ctx_server_entry_with_instructions(
     // HookCovered profile removes.
     let hook_covered = crate::core::home::resolve_home_dir()
         .is_some_and(|home| crate::core::rules_channel::client_hook_covered(agent_key, &home));
+    let cfg = crate::core::config::Config::load();
+    let profile = crate::core::tool_profiles::ToolProfile::from_config(&cfg);
     let instructions = if hook_covered {
-        crate::core::rules_canonical::render_hook_covered_bare(shadow, level)
+        crate::core::rules_canonical::render_hook_covered_bare(shadow, level, &profile)
     } else {
         crate::core::rules_canonical::render(
             shadow,
             crate::core::rules_canonical::Wrapper::Bare,
             level,
+            &profile,
         )
     };
 

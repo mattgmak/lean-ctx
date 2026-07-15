@@ -77,7 +77,9 @@ pub fn build_instructions_for_test(crp_mode: CrpMode) -> String {
     // Resolve the effective compression level from config/env (matches the live
     // build_full_instructions path) so terse/compression env vars are honoured.
     let level = CompressionLevel::effective(&crate::core::config::Config::load());
-    let skeleton = rc::render(shadow, Wrapper::Bare, level);
+    let tp =
+        crate::core::tool_profiles::ToolProfile::from_config(&crate::core::config::Config::load());
+    let skeleton = rc::render(shadow, Wrapper::Bare, level, &tp);
     let shell_hint = build_shell_hint();
 
     let base = format!(
@@ -105,7 +107,9 @@ pub fn build_instructions_with_client_for_compiler(
     client_name: &str,
     _unified_tool_mode: bool,
 ) -> String {
-    let skeleton = rc::render(true, Wrapper::Bare, CompressionLevel::Off);
+    let tp =
+        crate::core::tool_profiles::ToolProfile::from_config(&crate::core::config::Config::load());
+    let skeleton = rc::render(true, Wrapper::Bare, CompressionLevel::Off, &tp);
     let shell_hint = build_shell_hint();
 
     let base = format!(
@@ -311,20 +315,22 @@ fn build_full_instructions(
     // "ctx_* replaces native tools" to a Cursor whose hooks already compress
     // the native calls re-creates exactly the instruction dissonance the
     // HookCovered rule profile removes.
+    let cfg = crate::core::config::Config::load();
+    let tool_profile = crate::core::tool_profiles::ToolProfile::from_config(&cfg);
     let skeleton = if client_loads_rules_from_file(client_name) {
         let anchor = if client_is_hook_covered(client_name) {
-            HOOK_COVERED_ANCHOR
+            hook_covered_anchor(&tool_profile)
         } else {
-            SKELETON_ANCHOR
+            skeleton_anchor(&tool_profile)
         };
         let compression = rc::compression_text(level);
         if compression.is_empty() {
-            anchor.to_string()
+            anchor
         } else {
             format!("{anchor}\n{compression}")
         }
     } else {
-        rc::render(shadow, Wrapper::Bare, level)
+        rc::render(shadow, Wrapper::Bare, level, &tool_profile)
     };
 
     // Pointer to the full rule file (honours CLAUDE_CONFIG_DIR): agents load the
@@ -438,19 +444,39 @@ pub fn claude_code_instructions() -> String {
     build_instructions(CrpMode::Off)
 }
 
-/// One-line replacement for the full rules skeleton when the client already
-/// auto-loads the canonical block from its own rule file (#578). Anchors the
-/// binding ("the rules you loaded apply to THIS server") without re-billing
-/// the guidance.
+/// One-line anchor for clients whose rule file carries the canonical block (#578).
+/// Profile-aware (#756): only mentions tools the profile exposes.
+fn skeleton_anchor(tp: &crate::core::tool_profiles::ToolProfile) -> String {
+    if tp.is_tool_enabled("ctx_compose") {
+        "lean-ctx active — your auto-loaded lean-ctx rules apply: \
+         ctx_* tools replace native Read/Grep/Shell/Glob (ctx_compose first)."
+            .into()
+    } else {
+        "lean-ctx active — your auto-loaded lean-ctx rules apply: \
+         ctx_* tools replace native Read/Grep/Shell/Glob."
+            .into()
+    }
+}
+
+/// Anchor for hook-covered hosts (GL #1153). Profile-aware (#756).
+fn hook_covered_anchor(tp: &crate::core::tool_profiles::ToolProfile) -> String {
+    let mut s =
+        String::from("lean-ctx active — hooks compress native Shell/Read/Grep transparently");
+    if tp.is_tool_enabled("ctx_compose") {
+        s.push_str("; call ctx_compose to orient");
+    }
+    // #509: ctx_semantic_search folded into ctx_search(action=semantic)
+    if tp.is_tool_enabled("ctx_session") || tp.is_tool_enabled("ctx_knowledge") {
+        s.push_str(", ctx_search(action=semantic) / ctx_knowledge for meaning & memory");
+    }
+    s.push('.');
+    s
+}
+
+// Test-only backward-compat constants for assertion substrings.
+#[cfg(test)]
 const SKELETON_ANCHOR: &str = "lean-ctx active — your auto-loaded lean-ctx rules apply: \
     ctx_* tools replace native Read/Grep/Shell/Glob (ctx_compose first).";
-
-/// The anchor for hook-covered hosts (GL #1153): consistent with the
-/// HookCovered rule profile — native tools are fine (the hooks compress
-/// them), the MCP call is for the exclusive capabilities.
-const HOOK_COVERED_ANCHOR: &str = "lean-ctx active — hooks compress native Shell/Read/Grep \
-    transparently; call ctx_compose to orient, ctx_semantic_search / ctx_knowledge for \
-    meaning & memory.";
 
 fn client_loads_compression_from_file(client_name: &str) -> bool {
     crate::core::home::resolve_home_dir().is_some_and(|home| {
@@ -512,12 +538,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         std::fs::create_dir_all(home.join(".cursor/rules")).unwrap();
+        let tp = crate::core::tool_profiles::ToolProfile::Power;
         std::fs::write(
             home.join(".cursor/rules/lean-ctx.mdc"),
             rc::render(
                 false,
                 Wrapper::Dedicated,
                 crate::core::config::CompressionLevel::Standard,
+                &tp,
             ),
         )
         .unwrap();
@@ -572,12 +600,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         std::fs::create_dir_all(home.join(".cursor/rules")).unwrap();
+        let tp = crate::core::tool_profiles::ToolProfile::Power;
         std::fs::write(
             home.join(".cursor/rules/lean-ctx.mdc"),
             rc::render(
                 false,
                 Wrapper::HookCovered,
                 crate::core::config::CompressionLevel::Off,
+                &tp,
             ),
         )
         .unwrap();
@@ -603,11 +633,12 @@ mod tests {
         crate::test_env::remove_var("LEAN_CTX_MINIMAL");
 
         assert!(
-            covered.contains(HOOK_COVERED_ANCHOR),
+            covered.contains("hooks compress native Shell/Read/Grep"),
             "hook-covered client must get the hook-aware anchor:\n{covered}"
         );
         assert!(
-            !covered.contains(SKELETON_ANCHOR) && !covered.contains("MANDATORY MAPPING"),
+            !covered.contains("ctx_* tools replace native")
+                && !covered.contains("MANDATORY MAPPING"),
             "hook-covered client must not carry the replace-native wording:\n{covered}"
         );
     }

@@ -39,26 +39,7 @@ impl LeanCtxServer {
         let name = resolved_name.as_str();
         let args = resolved_args.as_ref();
 
-        let role_check = role_guard::check_tool_access(name);
-        if let Some(denied) = role_guard::into_call_tool_result(&role_check) {
-            tracing::warn!(
-                tool = name,
-                role = %role_check.role_name,
-                "Tool blocked by role policy"
-            );
-            return Ok(denied);
-        }
-
-        // #673 — context-policy-pack tool gating. Additive to the role guard:
-        // a pack's `allow_tools`/`deny_tools` are enforced here. No-op (allow)
-        // when no policy pack is active, so existing behavior is unchanged.
-        let policy_check = policy_guard::check_tool_access(name);
-        if let Some(denied) = policy_guard::into_call_tool_result(&policy_check) {
-            tracing::warn!(
-                tool = name,
-                policy = ?policy_check.policy_name,
-                "Tool blocked by context policy pack"
-            );
+        if let Some(denied) = Self::guard_role_and_policy(name) {
             return Ok(denied);
         }
 
@@ -84,64 +65,22 @@ impl LeanCtxServer {
             None => (name, args),
         };
 
-        // #676 — egress / output DLP on agent writes & actions. Inspect the
-        // payload of write/action tools BEFORE dispatch so a forbidden write
-        // never touches disk and a forbidden command never runs. Only the
-        // agent's tool-driven egress is governed here (a human's own editor
-        // writes never pass through this path). No-op unless the active pack has
-        // an `[egress]` section. Payload mapping (incl. all ctx_patch bodies)
-        // lives in `core::egress::write_payload` — shared with `policy enforce`.
-        if let Some(active) = crate::core::policy::runtime::active()
-            && active.egress.is_active()
-        {
-            let target = crate::core::egress::write_payload(guard_name, guard_args);
-            if let Some((payload, kind)) = target {
-                if let Some(reason) = active.egress.check_content(&payload, &active.redaction) {
-                    tracing::warn!(tool = guard_name, %reason, "agent egress blocked by policy");
-                    policy_guard::audit_egress(guard_name, &reason);
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "[POLICY BLOCKED] {kind} blocked by context policy pack egress rule \
-                         ({reason}). Adjust .lean-ctx/policy.toml to proceed."
-                    ))]));
-                }
-                if let Some(max) = active.egress.max_writes_per_min
-                    && !crate::core::egress::check_rate(max)
-                {
-                    tracing::warn!(tool = guard_name, max, "agent egress rate limit exceeded");
-                    policy_guard::audit_egress(guard_name, "rate-limit");
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "[POLICY BLOCKED] {kind} rate limit exceeded ({max}/min) by context \
-                         policy pack. Slow agent writes/actions or adjust .lean-ctx/policy.toml."
-                    ))]));
-                }
-            }
+        if let Some(blocked) = Self::guard_egress(guard_name, guard_args) {
+            return Ok(blocked);
         }
 
-        if name != "ctx_workflow" {
-            let active = self.workflow.read().await.clone();
-            if let Some(run) = active {
-                if run.current == "done" || is_workflow_stale(&run) {
-                    let mut wf = self.workflow.write().await;
-                    *wf = None;
-                    let _ = crate::core::workflow::clear_active();
-                } else if !WORKFLOW_PASSTHROUGH_TOOLS.contains(&name)
-                    && let Some(state) = run.spec.state(&run.current)
-                    && let Some(allowed) = &state.allowed_tools
-                {
-                    let allowed_ok = allowed.iter().any(|t| t == name);
-                    if !allowed_ok {
-                        let mut shown = allowed.clone();
-                        shown.sort();
-                        shown.truncate(30);
-                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                            "Tool '{name}' blocked by workflow '{}' (state: {}). Allowed: {}. Use ctx_workflow(action=\"stop\") to exit.",
-                            run.spec.name,
-                            run.current,
-                            shown.join(", ")
-                        ))]));
-                    }
-                }
-            }
+        if let Some(blocked) = self.guard_workflow(name).await {
+            return Ok(blocked);
+        }
+
+        // #794: cost cap guard — block tool calls when session cost exceeds the
+        // configured limit. ctx_session is exempt so the agent can inspect
+        // budget status and override the cap.
+        if name != "ctx_session"
+            && let Some(cap_msg) =
+                crate::core::budget_tracker::BudgetTracker::global().cost_cap_message()
+        {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(cap_msg)]));
         }
 
         // #990: determine machine-readability *before* the once-per-session
@@ -624,12 +563,25 @@ impl LeanCtxServer {
                 let name_owned = name.to_string();
                 tokio::spawn(async move {
                     let result = std::panic::AssertUnwindSafe(async {
-                        let mut cache = cache_clone.write().await;
-                        crate::tools::autonomy::maybe_auto_dedup(
-                            &autonomy_clone,
-                            &mut cache,
-                            &name_owned,
-                        );
+                        // #807: bounded lock — the old unbounded `.write().await`
+                        // could queue behind a long computation and then hold the
+                        // lock during dedup, cascading the stall.
+                        let cache_timeout = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            cache_clone.write(),
+                        )
+                        .await;
+                        if let Ok(mut cache) = cache_timeout {
+                            crate::tools::autonomy::maybe_auto_dedup(
+                                &autonomy_clone,
+                                &mut cache,
+                                &name_owned,
+                            );
+                        } else {
+                            tracing::debug!(
+                                "background auto_dedup: cache lock timeout (5s), skipping"
+                            );
+                        }
                     })
                     .catch_unwind()
                     .await;
@@ -1031,6 +983,101 @@ impl LeanCtxServer {
         }
 
         Ok(finalize_call_result(result_text, shell_outcome))
+    }
+
+    fn guard_role_and_policy(name: &str) -> Option<CallToolResult> {
+        let role_check = role_guard::check_tool_access(name);
+        if let Some(denied) = role_guard::into_call_tool_result(&role_check) {
+            tracing::warn!(
+                tool = name,
+                role = %role_check.role_name,
+                "Tool blocked by role policy"
+            );
+            return Some(denied);
+        }
+
+        // #673 — context-policy-pack tool gating. Additive to the role guard:
+        // a pack's `allow_tools`/`deny_tools` are enforced here. No-op (allow)
+        // when no policy pack is active, so existing behavior is unchanged.
+        let policy_check = policy_guard::check_tool_access(name);
+        if let Some(denied) = policy_guard::into_call_tool_result(&policy_check) {
+            tracing::warn!(
+                tool = name,
+                policy = ?policy_check.policy_name,
+                "Tool blocked by context policy pack"
+            );
+            return Some(denied);
+        }
+        None
+    }
+
+    fn guard_egress(
+        guard_name: &str,
+        guard_args: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<CallToolResult> {
+        // #676 — egress / output DLP on agent writes & actions. Inspect the
+        // payload of write/action tools BEFORE dispatch so a forbidden write
+        // never touches disk and a forbidden command never runs. Only the
+        // agent's tool-driven egress is governed here (a human's own editor
+        // writes never pass through this path). No-op unless the active pack has
+        // an `[egress]` section. Payload mapping (incl. all ctx_patch bodies)
+        // lives in `core::egress::write_payload` — shared with `policy enforce`.
+        if let Some(active) = crate::core::policy::runtime::active()
+            && active.egress.is_active()
+        {
+            let target = crate::core::egress::write_payload(guard_name, guard_args);
+            if let Some((payload, kind)) = target {
+                if let Some(reason) = active.egress.check_content(&payload, &active.redaction) {
+                    tracing::warn!(tool = guard_name, %reason, "agent egress blocked by policy");
+                    policy_guard::audit_egress(guard_name, &reason);
+                    return Some(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "[POLICY BLOCKED] {kind} blocked by context policy pack egress rule \
+                         ({reason}). Adjust .lean-ctx/policy.toml to proceed."
+                    ))]));
+                }
+                if let Some(max) = active.egress.max_writes_per_min
+                    && !crate::core::egress::check_rate(max)
+                {
+                    tracing::warn!(tool = guard_name, max, "agent egress rate limit exceeded");
+                    policy_guard::audit_egress(guard_name, "rate-limit");
+                    return Some(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "[POLICY BLOCKED] {kind} rate limit exceeded ({max}/min) by context \
+                         policy pack. Slow agent writes/actions or adjust .lean-ctx/policy.toml."
+                    ))]));
+                }
+            }
+        }
+        None
+    }
+
+    async fn guard_workflow(&self, name: &str) -> Option<CallToolResult> {
+        if name != "ctx_workflow" {
+            let active = self.workflow.read().await.clone();
+            if let Some(run) = active {
+                if run.current == "done" || is_workflow_stale(&run) {
+                    let mut wf = self.workflow.write().await;
+                    *wf = None;
+                    let _ = crate::core::workflow::clear_active();
+                } else if !WORKFLOW_PASSTHROUGH_TOOLS.contains(&name)
+                    && let Some(state) = run.spec.state(&run.current)
+                    && let Some(allowed) = &state.allowed_tools
+                {
+                    let allowed_ok = allowed.iter().any(|t| t == name);
+                    if !allowed_ok {
+                        let mut shown = allowed.clone();
+                        shown.sort();
+                        shown.truncate(30);
+                        return Some(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "Tool '{name}' blocked by workflow '{}' (state: {}). Allowed: {}. Use ctx_workflow(action=\"stop\") to exit.",
+                            run.spec.name,
+                            run.current,
+                            shown.join(", ")
+                        ))]));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resolve project root from MCP client roots (once per session).

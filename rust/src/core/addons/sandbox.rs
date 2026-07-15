@@ -3,7 +3,7 @@
 //! A stdio addon is a child process with the user's full privileges. When
 //! `addons.sandbox` is enabled, lean-ctx wraps that child in an OS-native
 //! sandbox launcher before spawning it (the single spawn point is
-//! [`crate::core::gateway::client`]):
+//! [`crate::core::mcp_catalog::client`]):
 //!
 //! - **macOS** → `sandbox-exec` with a generated SBPL profile,
 //! - **Linux** → `bwrap` (bubblewrap) with a read-only root + network unshare.

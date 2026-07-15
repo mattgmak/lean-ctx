@@ -13,7 +13,7 @@ use std::path::Path;
 
 use super::bootstrap::AddonInstall;
 use super::capabilities::AddonCapabilities;
-use crate::core::gateway::{GatewayServer, TransportKind};
+use crate::core::mcp_catalog::{GatewayServer, TransportKind};
 
 /// `[addon]` — human + catalog metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -108,6 +108,13 @@ pub struct AddonManifest {
     /// bootstrap → `[mcp] command` on `PATH`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub artifacts: BTreeMap<String, super::artifact_install::ArtifactAsset>,
+    /// `[[dependencies]]` — context packages this addon needs at runtime
+    /// (depth-1, GH #727). Forwarded verbatim into the published pack's
+    /// `PackageManifest.dependencies`, where the existing resolver consumes it.
+    /// A `{pack_dir:@ns/name}` placeholder in `[mcp.env]` may only name a
+    /// non-optional dependency declared here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<crate::core::context_package::manifest::PackageDependency>,
 }
 
 impl AddonManifest {
@@ -129,7 +136,7 @@ impl AddonManifest {
     /// `addon.integration` if set, otherwise derived from `addon.categories`.
     /// Returns the canonical adapter slug (or empty for none).
     pub fn integration_kind(&self) -> String {
-        use crate::core::gateway::adapters::IntegrationKind;
+        use crate::core::mcp_catalog::adapters::IntegrationKind;
         let explicit = self.addon.integration.trim();
         let kind = if explicit.is_empty() {
             IntegrationKind::from_categories(&self.addon.categories)
@@ -181,6 +188,39 @@ impl AddonManifest {
                     "addon `{name}` artifact for `{triple}` is missing `sha256` — a managed \
                      binary must be pinned"
                 ));
+            }
+        }
+        for dep in &self.dependencies {
+            if crate::core::context_package::remote::parse_remote_ref(&dep.name).is_none() {
+                return Err(format!(
+                    "addon `{name}` dependency `{}` must be a scoped `@ns/name` reference",
+                    dep.name
+                ));
+            }
+            crate::core::context_package::deps::parse_version_req(&dep.version_req)
+                .map_err(|e| format!("addon `{name}` dependency `{}`: {e}", dep.name))?;
+        }
+
+        // A `{pack_dir:…}` placeholder may only name a declared, non-optional
+        // dependency: `addon add` never resolves optional deps, so the placeholder
+        // could never expand. Both are manifest-parse errors, never install-time ones.
+        for (key, value) in &self.mcp.env {
+            let refs = super::pack_env::referenced_packs(value)
+                .map_err(|e| format!("addon `{name}` [mcp.env] `{key}`: {e}"))?;
+            for pack in refs {
+                let Some(dep) = self.dependencies.iter().find(|d| d.name == pack) else {
+                    return Err(format!(
+                        "addon `{name}` [mcp.env] `{key}`: `{{pack_dir:{pack}}}` names a pack that is \
+                         not declared in [[dependencies]]"
+                    ));
+                };
+                if dep.optional {
+                    return Err(format!(
+                        "addon `{name}` [mcp.env] `{key}`: `{{pack_dir:{pack}}}` refers to an optional \
+                         dependency — optional dependencies are never resolved, so the placeholder \
+                         could never expand"
+                    ));
+                }
             }
         }
         Ok(())
@@ -486,5 +526,143 @@ sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         assert!(m.artifacts.is_empty());
         let toml = toml::to_string(&m).expect("serialize");
         assert!(!toml.contains("[artifacts"), "got: {toml}");
+    }
+
+    // ── [[dependencies]] — depth-1 pack dependencies (GH #727) ──
+
+    const DEP_MANIFEST: &str = r#"
+[addon]
+name = "demo"
+version = "0.2.0"
+
+[mcp]
+command = "demo-bin"
+
+[mcp.env]
+LEAN_MD_SKILLS_DIR = "{pack_dir:@dasTholo/lean-md-skills}"
+
+[[dependencies]]
+name = "@dasTholo/lean-md-skills"
+version_req = "^0.2"
+"#;
+
+    #[test]
+    fn dependencies_parse_and_validate() {
+        let m = AddonManifest::from_toml(DEP_MANIFEST).expect("parses");
+        assert_eq!(m.dependencies.len(), 1);
+        assert_eq!(m.dependencies[0].name, "@dasTholo/lean-md-skills");
+        assert_eq!(m.dependencies[0].version_req, "^0.2");
+        assert!(!m.dependencies[0].optional);
+        m.validate().expect("valid");
+    }
+
+    #[test]
+    fn unscoped_dependency_name_is_rejected() {
+        let toml = DEP_MANIFEST.replace("@dasTholo/lean-md-skills", "lean-md-skills");
+        let err = AddonManifest::from_toml(&toml)
+            .expect("parses")
+            .validate()
+            .expect_err("unscoped");
+        assert!(err.contains("scoped `@ns/name`"), "{err}");
+    }
+
+    #[test]
+    fn bad_semver_range_is_rejected() {
+        let toml =
+            DEP_MANIFEST.replace(r#"version_req = "^0.2""#, r#"version_req = "not-a-range""#);
+        let err = AddonManifest::from_toml(&toml)
+            .expect("parses")
+            .validate()
+            .expect_err("bad range");
+        assert!(err.contains("invalid version range"), "{err}");
+    }
+
+    #[test]
+    fn optional_dependency_behind_a_placeholder_is_rejected() {
+        let toml = format!("{DEP_MANIFEST}optional = true\n");
+        let err = AddonManifest::from_toml(&toml)
+            .expect("parses")
+            .validate()
+            .expect_err("optional + placeholder");
+        assert!(err.contains("optional dependency"), "{err}");
+    }
+
+    #[test]
+    fn placeholder_naming_an_undeclared_pack_is_rejected() {
+        let toml = DEP_MANIFEST.replace(
+            "{pack_dir:@dasTholo/lean-md-skills}",
+            "{pack_dir:@dasTholo/other}",
+        );
+        let err = AddonManifest::from_toml(&toml)
+            .expect("parses")
+            .validate()
+            .expect_err("undeclared pack");
+        assert!(err.contains("not declared in [[dependencies]]"), "{err}");
+    }
+
+    #[test]
+    fn unknown_placeholder_scheme_is_rejected() {
+        let toml = DEP_MANIFEST.replace("pack_dir:", "bin_dir:");
+        let err = AddonManifest::from_toml(&toml)
+            .expect("parses")
+            .validate()
+            .expect_err("unknown scheme");
+        assert!(err.contains("unknown placeholder"), "{err}");
+    }
+
+    /// Characterization of [`crate::core::addons::pack_env::expand_pack_env`]
+    /// (GH #727): a `{pack_dir:@ns/name}` placeholder resolves against the
+    /// resolved-dependency slice built from `AddonManifest::dependencies`,
+    /// yielding the versioned on-disk store path. This asserts the *expansion*
+    /// only — it hand-builds the `ResolvedDep` slice and does not exercise
+    /// `cmd_add`'s resolve/install wiring.
+    ///
+    /// The self-dependency guard on the addon path (Finding A) is covered
+    /// elsewhere, not here: the root-reference derivation by
+    /// `cli::addon_cmd::addon_self_ref` (unit-tested in that module) and the
+    /// scoped-vs-bare refusal by
+    /// `context_package::deps::addon_scoped_self_dependency_is_refused`. The
+    /// end-to-end install path stays network-bound and is plan-forbidden as a
+    /// live-registry integration test.
+    #[test]
+    fn expand_pack_env_maps_declared_dependency_to_pack_dir() {
+        use crate::core::context_package::deps::ResolvedDep;
+        use crate::core::context_package::remote::parse_remote_ref;
+
+        let m = AddonManifest::from_toml(DEP_MANIFEST).expect("parses");
+        m.validate().expect("valid");
+
+        // Simulate the slice the install step produces from `manifest.dependencies`.
+        let resolved: Vec<ResolvedDep> = m
+            .dependencies
+            .iter()
+            .map(|d| {
+                let r = parse_remote_ref(&d.name).expect("scoped");
+                ResolvedDep {
+                    name: d.name.clone(),
+                    namespace: r.namespace,
+                    slug: r.name,
+                    version: "0.2.0".into(),
+                    artifact_sha256: "a".repeat(64),
+                }
+            })
+            .collect();
+
+        let out = crate::core::addons::pack_env::expand_pack_env(
+            &m.mcp.env,
+            &resolved,
+            std::path::Path::new("/store"),
+        )
+        .expect("expands against manifest.dependencies");
+        // Segment names are explicit here (only the separator comes from the
+        // platform): `Path::join` is production's own separator, so this
+        // asserts the real invariant instead of duplicating the code under test.
+        let expected = std::path::Path::new("/store")
+            .join("skills")
+            .join("@dasTholo__lean-md-skills")
+            .join("0.2.0")
+            .display()
+            .to_string();
+        assert_eq!(out["LEAN_MD_SKILLS_DIR"], expected);
     }
 }

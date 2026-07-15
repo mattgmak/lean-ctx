@@ -444,7 +444,7 @@ fn import_gotchas(
     }
 }
 
-fn version_lt(current: &str, required: &str) -> bool {
+pub(crate) fn version_lt(current: &str, required: &str) -> bool {
     let parse = |v: &str| -> Vec<u32> {
         v.split('.')
             .map(|s| s.parse::<u32>().unwrap_or(0))

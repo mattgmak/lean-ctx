@@ -1201,3 +1201,208 @@ fn passes_enforced_is_mode_independent() {
     assert!(!tricky_off, "mode-independent: sink still fails under off");
     assert!(clean_off, "clean pipeline passes regardless of mode");
 }
+
+// --- GH #760: path segments must not be mistaken for command names ---
+
+#[test]
+fn gh760_find_with_lib_path_segment_not_blocked() {
+    let list = allow(&["find", "tr"]);
+    let cmd = "find target/quarkus-app/lib -name \"*.jar\" | tr '\\n' ':'";
+    let result = check_all_segments(cmd, &list);
+    assert!(
+        result.is_ok(),
+        "path segment 'lib' in find args must not be treated as a command: {result:?}"
+    );
+}
+
+#[test]
+fn gh760_find_with_deeply_nested_path_not_blocked() {
+    let list = allow(&["find", "wc"]);
+    let cmd = "find /usr/local/lib/python3/dist-packages -name '*.py' | wc -l";
+    let result = check_all_segments(cmd, &list);
+    assert!(
+        result.is_ok(),
+        "path arguments must not be scanned for command names: {result:?}"
+    );
+}
+
+#[test]
+fn gh760_extract_base_ignores_path_arguments() {
+    assert_eq!(
+        extract_base_from_segment("find target/quarkus-app/lib -name \"*.jar\""),
+        "find",
+        "base command must be the first token, not a path segment"
+    );
+    assert_eq!(
+        extract_base_from_segment("ls /usr/local/lib"),
+        "ls",
+        "base command must be ls, not lib"
+    );
+}
+
+#[test]
+fn gh760_non_allowlisted_single_command_passes_enforced_false() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "git,cargo");
+    let mvnw = passes_enforced("mvnw clean package");
+    let md5sum = passes_enforced("md5sum file.txt");
+    let update_alt = passes_enforced("update-alternatives --list java");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert!(
+        !mvnw,
+        "non-allowlisted mvnw must fail passes_enforced (hook leaves it raw)"
+    );
+    assert!(!md5sum, "non-allowlisted md5sum must fail passes_enforced");
+    assert!(
+        !update_alt,
+        "non-allowlisted update-alternatives must fail passes_enforced"
+    );
+}
+
+#[test]
+fn gh760_pipeline_with_all_allowed_passes() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "find,tr,sort");
+    let result =
+        passes_enforced("find target/quarkus-app/lib -name \"*.jar\" | tr '\\n' ':' | sort");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert!(
+        result,
+        "pipeline with all-allowlisted commands must pass enforced"
+    );
+}
+
+#[test]
+fn gh760_pipeline_with_non_allowed_sink_fails() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "find");
+    let result = passes_enforced("find . -name '*.jar' | custom-tool");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert!(
+        !result,
+        "pipeline with non-allowlisted sink must fail (hook leaves raw)"
+    );
+}
+
+/// #815: compound command block message includes segment position
+/// and "no part of the pipeline ran" advisory.
+#[test]
+fn compound_block_includes_segment_position() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "cp,git,go");
+    let result = super::enforce_shell_allowlist("cp a b && git stash && go build && ./cbc_old");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("segment 4/4"),
+        "must show which segment was blocked: {err}"
+    );
+    assert!(
+        err.contains("no part of the pipeline ran"),
+        "must say nothing ran: {err}"
+    );
+}
+
+/// #815: single-command block does NOT show pipeline advisory.
+#[test]
+fn single_command_block_omits_pipeline_advisory() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "git");
+    let result = super::enforce_shell_allowlist("./cbc_old --help");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        !err.contains("segment"),
+        "single command must not show pipeline info: {err}"
+    );
+}
+
+/// #813: `is_project_root_binary` returns false for non-path tokens.
+#[test]
+fn project_root_binary_rejects_bare_name() {
+    assert!(
+        !super::is_project_root_binary("cbc_old"),
+        "bare name without path separator must not be auto-allowed"
+    );
+}
+
+/// #813: `is_project_root_binary` returns false for non-existent files.
+#[test]
+fn project_root_binary_rejects_nonexistent_path() {
+    assert!(
+        !super::is_project_root_binary("./nonexistent_binary_813"),
+        "non-existent file must not be auto-allowed"
+    );
+}
+
+/// #813: `is_project_root_binary` returns true for an existing file under
+/// the project root (the test binary `cargo test` itself qualifies).
+#[test]
+fn project_root_binary_accepts_existing_project_file() {
+    // Use Cargo.toml as a known file in the project root — it's not executable,
+    // but is_project_root_binary only checks path + existence + project-root,
+    // not execute permission (that's the OS's job at runtime).
+    assert!(
+        super::is_project_root_binary("./Cargo.toml"),
+        "existing file under project root must be auto-allowed"
+    );
+}
+
+/// #813: auto-allow integrates into enforce_shell_allowlist for paths.
+#[test]
+fn enforce_allows_project_root_binary_path() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "git");
+    // ./Cargo.toml is under the project root — would be blocked as "Cargo.toml"
+    // is not in the allowlist, but the path check auto-allows it.
+    let result = super::enforce_shell_allowlist("./Cargo.toml --version");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert!(
+        result.is_ok(),
+        "project-root binary path must be auto-allowed: {:?}",
+        result
+    );
+}
+
+/// #814: python3 -c is blocked by default.
+#[test]
+fn python3_inline_blocked_by_default() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "python3");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOW_INLINE_SCRIPTS");
+    let result = super::enforce_shell_allowlist("python3 -c \"print(42)\"");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert!(result.is_err(), "python3 -c must be blocked by default");
+}
+
+/// #814: python3 -c is allowed when opt-in is enabled.
+#[test]
+fn python3_inline_allowed_with_opt_in() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "python3");
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOW_INLINE_SCRIPTS", "1");
+    let result = super::enforce_shell_allowlist("python3 -c \"print(42)\"");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOW_INLINE_SCRIPTS");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert!(
+        result.is_ok(),
+        "python3 -c must be allowed with opt-in: {:?}",
+        result
+    );
+}
+
+/// #814: node -e is also gated by the same opt-in.
+#[test]
+fn node_eval_allowed_with_opt_in() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE", "node");
+    crate::test_env::set_var("LEAN_CTX_SHELL_ALLOW_INLINE_SCRIPTS", "1");
+    let result = super::enforce_shell_allowlist("node -e \"console.log(42)\"");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOW_INLINE_SCRIPTS");
+    crate::test_env::remove_var("LEAN_CTX_SHELL_ALLOWLIST_OVERRIDE");
+    assert!(
+        result.is_ok(),
+        "node -e must be allowed with opt-in: {:?}",
+        result
+    );
+}

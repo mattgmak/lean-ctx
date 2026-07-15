@@ -1,3 +1,15 @@
+//! HTTP server combining Streamable-HTTP MCP transport, REST APIs, and
+//! optional team/commercial surfaces behind feature flags.
+//!
+//! # Pillar mapping
+//!
+//! - **Engine:** HTTP MCP transport, Context OS event bus (SSE), A2A handoffs,
+//!   agent registry, capabilities/manifest/openapi endpoints.
+//! - **Cloud (commercial):** `team/` (hosted team server), `team_billing`
+//!   (billing proxy). Both gated by `feature = "team-server"`.
+//! - **Cross-pillar:** `savings_ingest`, `savings_summary`, `roi_webhook` —
+//!   consumed by both the local dashboard and cloud sync.
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

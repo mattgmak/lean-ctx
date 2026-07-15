@@ -731,3 +731,92 @@ fn plan_hash_is_deterministic_and_order_independent() {
     assert_eq!(h1, h3, "hash must be order-independent");
     assert_ne!(h1, h2, "different usage set must differ");
 }
+
+/// #803: when `name_path` resolves to a file that differs from the caller's
+/// explicit `path`, the edit must be rejected with WORKTREE_MISMATCH instead
+/// of silently writing to the wrong checkout. Simulates the real scenario
+/// where a git worktree lives INSIDE the project root (e.g.
+/// `/repo/.claude/worktrees/wt/`) so the path jail does not block it.
+#[test]
+fn handle_replace_symbol_worktree_mismatch_blocks_write() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    crate::test_env::set_var("LEAN_CTX_DATA_DIR", data.to_string_lossy().to_string());
+
+    // Main checkout root with a symbol.
+    let main_root = tmp.path().join("repo");
+    std::fs::create_dir_all(main_root.join("src")).unwrap();
+    std::fs::write(
+        main_root.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        main_root.join("src/lib.rs"),
+        "fn worktree_canary_zz() { let _ = 1; }\n",
+    )
+    .unwrap();
+    let root = main_root.to_string_lossy().to_string();
+
+    // Worktree INSIDE the project root (realistic layout).
+    let wt_dir = main_root.join(".claude/worktrees/wt/src");
+    std::fs::create_dir_all(&wt_dir).unwrap();
+    std::fs::write(
+        wt_dir.join("lib.rs"),
+        "fn worktree_canary_zz() { let _ = 2; }\n",
+    )
+    .unwrap();
+
+    // The symbol resolves via the main-root index to "src/lib.rs".
+    let resolved = super::resolve_name_path("worktree_canary_zz", &root);
+    assert!(resolved.is_ok(), "symbol should resolve: {:?}", resolved);
+
+    // Caller provides a path inside the worktree that differs from the
+    // index-resolved location — this must be caught.
+    let wt_file = main_root.join(".claude/worktrees/wt/src/lib.rs");
+    let args = serde_json::json!({
+        "action": "replace_symbol_body",
+        "name_path": "worktree_canary_zz",
+        "path": wt_file.to_string_lossy().to_string(),
+        "new_body": "fn worktree_canary_zz() { panic!(\"CANARY\"); }"
+    });
+    let out = super::handle(&args, &root, "");
+    assert!(
+        out.contains("WORKTREE_MISMATCH"),
+        "should detect mismatch, got: {out}"
+    );
+    // Verify neither file was modified.
+    let main_content = std::fs::read_to_string(main_root.join("src/lib.rs")).unwrap();
+    assert!(
+        !main_content.contains("CANARY"),
+        "main checkout must NOT be modified: {main_content}"
+    );
+    let wt_content = std::fs::read_to_string(&wt_file).unwrap();
+    assert!(
+        !wt_content.contains("CANARY"),
+        "worktree must NOT be modified: {wt_content}"
+    );
+
+    crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
+}
+
+/// #803: when `path` matches the resolved symbol (same file), the edit succeeds.
+#[test]
+fn handle_replace_symbol_same_path_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn old() {\n  1\n}\n").unwrap();
+    let abs = dir.path().join("a.rs").to_string_lossy().to_string();
+    let args = serde_json::json!({
+        "action": "replace_symbol_body",
+        "path": "a.rs",
+        "line": 1,
+        "end_line": 3,
+        "new_body": "fn new() {\n  2\n}"
+    });
+    let out = super::handle(&args, dir.path().to_str().unwrap(), &abs);
+    assert!(out.contains("replace_symbol_body applied"), "got: {out}");
+    let after = std::fs::read_to_string(dir.path().join("a.rs")).unwrap();
+    assert!(after.contains("fn new()"), "file: {after}");
+}

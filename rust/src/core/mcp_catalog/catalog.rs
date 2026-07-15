@@ -193,7 +193,7 @@ mod tests {
 
         let cfg = GatewayConfig {
             enabled: true,
-            servers: vec![crate::core::gateway::GatewayServer {
+            servers: vec![crate::core::mcp_catalog::GatewayServer {
                 name: "blocked".into(),
                 command: "true".into(),
                 enabled: true,

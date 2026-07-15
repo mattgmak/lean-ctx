@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 use super::Config;
 
 /// Controls how aggressively lean-ctx frees memory when idle.
-/// - `aggressive`: (Default) Cache cleared after short idle period (5 min). Best for single-IDE use.
-/// - `shared`: Cache retained longer (30 min). Best when multiple IDEs/models share lean-ctx context.
+/// - `aggressive`: Cache cleared after short idle period (5 min). Best for low-memory devices.
+/// - `shared`: (Default) Cache retained for 1 hour. Best for typical agent sessions with think pauses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryCleanup {
-    #[default]
     Aggressive,
+    #[default]
     Shared,
 }
 
@@ -37,7 +37,7 @@ impl MemoryCleanup {
     pub fn idle_ttl_secs(&self) -> u64 {
         match self {
             Self::Aggressive => 300,
-            Self::Shared => 1800,
+            Self::Shared => 3600,
         }
     }
 
@@ -143,11 +143,19 @@ pub struct MemoryGuardConfig {
 
 impl MemoryGuardConfig {
     pub fn effective(config: &Config) -> Self {
-        let pct = std::env::var("LEAN_CTX_MAX_RAM_PERCENT")
+        let base_pct = std::env::var("LEAN_CTX_MAX_RAM_PERCENT")
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(config.max_ram_percent)
             .clamp(1, 50);
+        // memory_profile=low halves max_ram_percent so guardian thresholds
+        // fire earlier, preventing transient RSS spikes (#790).
+        let profile = MemoryProfile::effective(config);
+        let pct = if profile == MemoryProfile::Low {
+            (base_pct / 2).max(3)
+        } else {
+            base_pct
+        };
         Self {
             max_ram_percent: pct,
         }

@@ -36,7 +36,7 @@ pub(crate) fn check_gemini_trust_and_hooks(home: &std::path::Path, binary: &str)
         .and_then(|x| x.as_array())
         .is_some_and(|arr| {
             let mut saw_rewrite = false;
-            let mut saw_redirect = false;
+            let mut saw_redirect_or_deny = false;
             for entry in arr {
                 let hooks = entry
                     .get("hooks")
@@ -52,12 +52,14 @@ pub(crate) fn check_gemini_trust_and_hooks(home: &std::path::Path, binary: &str)
                     if cmd.contains("hook rewrite") && cmd_matches_expected(first, binary) {
                         saw_rewrite = true;
                     }
-                    if cmd.contains("hook redirect") && cmd_matches_expected(first, binary) {
-                        saw_redirect = true;
+                    if (cmd.contains("hook redirect") || cmd.contains("hook deny"))
+                        && cmd_matches_expected(first, binary)
+                    {
+                        saw_redirect_or_deny = true;
                     }
                 }
             }
-            saw_rewrite && saw_redirect
+            saw_rewrite && saw_redirect_or_deny
         });
 
     let scripts_ok = home
@@ -243,16 +245,16 @@ pub(crate) fn check_cursor_hooks(path: &std::path::Path, binary: &str) -> NamedC
                 .and_then(|c| c.as_str())
                 .is_some_and(|c| c.contains(" hook rewrite"))
     });
-    let has_redirect = pre.iter().any(|e| {
+    let has_redirect_or_deny = pre.iter().any(|e| {
         matches!(
             e.get("matcher").and_then(|m| m.as_str()),
             Some("Read|Grep|Glob" | "Read|Grep" | "Read" | "Grep")
         ) && e
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|c| c.contains(" hook redirect"))
+            .is_some_and(|c| c.contains(" hook redirect") || c.contains(" hook deny"))
     });
-    let entries_ok = has_rewrite && has_redirect;
+    let entries_ok = has_rewrite && has_redirect_or_deny;
     let stale = stale_hook_binary(&content, binary);
     finalize_hook_check("Hooks", path, entries_ok, stale)
 }
@@ -356,7 +358,8 @@ pub(crate) fn check_claude_hooks(path: &std::path::Path, binary: &str) -> NamedC
         .cloned()
         .unwrap_or_default();
     let joined = serde_json::to_string(&pre).unwrap_or_default();
-    let entries_ok = joined.contains(" hook rewrite") && joined.contains(" hook redirect");
+    let entries_ok = joined.contains(" hook rewrite")
+        && (joined.contains(" hook redirect") || joined.contains(" hook deny"));
     let stale = stale_hook_binary(&joined, binary);
     finalize_hook_check("Hooks", path, entries_ok, stale)
 }

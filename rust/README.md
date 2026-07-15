@@ -74,6 +74,11 @@ cp target/release/lean-ctx ~/.local/bin/
 > echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc
 > ```
 
+Contributors iterating on the Rust engine (~700 dependencies) can opt into a
+faster local build (lld linker + sccache, Linux): `./scripts/setup-fast-build.sh`.
+One-time setup per machine; measured ~30% faster clean builds and ~2x faster
+incremental rebuilds.
+
 ### Verify Installation
 
 ```bash

@@ -12,10 +12,10 @@ With no arguments, lean-ctx speaks the MCP protocol on stdin/stdout — that is
 for your AI editor, not for interactive use, so it is waiting silently. You
 probably want one of these:
 
-  lean-ctx onboard   Connect lean-ctx to your AI tools (start here)
-  lean-ctx doctor    Check that everything is wired up correctly
-  lean-ctx gain      See how many tokens you have saved
-  lean-ctx help      Common commands (or `help all` for everything)
+  lean-ctx wrap cursor   One-command setup for Cursor (recommended)
+  lean-ctx wrap claude   One-command setup for Claude Code
+  lean-ctx doctor        Check that everything is wired up correctly
+  lean-ctx help          Common commands (or `help all` for everything)
 
 Docs: https://leanctx.com
 ",
@@ -52,7 +52,9 @@ pub(super) fn concise_help_text() -> String {
 {banner}
 
 GETTING STARTED:
-    lean-ctx onboard               Connect your AI tools with one command (recommended)
+    lean-ctx wrap <agent>          One-command setup (wrap cursor / wrap claude / wrap codex)
+    lean-ctx unwrap <agent>        Undo wrap, restore pre-wrap config
+    lean-ctx onboard               Connect all AI tools at once (zero questions)
     lean-ctx setup                 Guided setup with full control over every option
     lean-ctx doctor                Check that everything is wired up correctly
     lean-ctx gain                  See how many tokens you have saved
@@ -71,6 +73,7 @@ EVERYDAY COMMANDS:
 MANAGE:
     lean-ctx status                Am I connected? (quick check)
     lean-ctx update                Update to the latest version
+    lean-ctx enable-gpu            Install the CUDA-enabled Linux binary
     lean-ctx uninstall             Remove lean-ctx cleanly
 
 SAFETY (env vars):
@@ -96,7 +99,9 @@ pub(super) fn print_help() {
 {banner}
 
 GETTING STARTED:
-    lean-ctx onboard               Connect your AI tools with one command (recommended)
+    lean-ctx wrap <agent>          One-command setup (wrap cursor / wrap claude / wrap codex)
+    lean-ctx unwrap <agent>        Undo wrap, restore pre-wrap config
+    lean-ctx onboard               Connect all AI tools at once (zero questions)
     lean-ctx setup                 Guided setup with full control over every option
     lean-ctx doctor                Check that everything is wired up correctly
     lean-ctx gain                  See how many tokens you have saved
@@ -218,6 +223,7 @@ COMMANDS:
     slow-log [list|clear]          Show/clear slow command log (~/.lean-ctx/slow-commands.log)
     debug-log [list|tail N|clear|path]  Opt-in tool-call + hook-routing log (set debug_log / LEAN_CTX_DEBUG_LOG)
     update [<version>] [--check]   Update lean-ctx, or pin a version, from GitHub Releases
+    enable-gpu [--check]           Install CUDA-enabled binary (x86_64 GNU/Linux)
     stop                           Stop ALL lean-ctx processes (daemon, proxy, orphans)
     restart                        Restart daemon (applies config.toml changes)
     dev-install                    Build release + atomic install + restart (for development)

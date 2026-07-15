@@ -9,6 +9,7 @@ mod mode;
 #[cfg(test)]
 mod tests;
 
+use crate::core::error::ShellError;
 pub use mode::ShellSecurity;
 
 /// Checks whether a command may run, honouring the active [`ShellSecurity`] mode
@@ -18,7 +19,7 @@ pub use mode::ShellSecurity;
 /// - [`ShellSecurity::Off`] → always `Ok` (gating skipped; compression intact).
 /// - [`ShellSecurity::Warn`] → run the checks, log any violation, return `Ok`.
 /// - [`ShellSecurity::Enforce`] → block on violation (the secure default).
-pub fn check_shell_allowlist(command: &str) -> Result<(), String> {
+pub fn check_shell_allowlist(command: &str) -> Result<(), ShellError> {
     match ShellSecurity::resolve() {
         ShellSecurity::Off => Ok(()),
         ShellSecurity::Warn => {
@@ -57,7 +58,7 @@ pub fn passes_enforced(command: &str) -> bool {
 ///
 /// When the allowlist is empty, all commands pass (blocklist-only mode).
 /// When non-empty, EVERY command segment in the pipeline must match.
-fn enforce_shell_allowlist(command: &str) -> Result<(), String> {
+fn enforce_shell_allowlist(command: &str) -> Result<(), ShellError> {
     let normalized = normalize_line_continuations(command);
     let cmd = normalized.as_str();
 
@@ -67,7 +68,8 @@ fn enforce_shell_allowlist(command: &str) -> Result<(), String> {
              which is blocked regardless of allowlist. \
              This is a permanent security restriction, not a transient error.\n\
              Command: {command}"
-        ));
+        )
+        .into());
     }
 
     let strict = crate::core::config::Config::load().shell_strict_mode;
@@ -94,7 +96,7 @@ fn normalize_line_continuations(command: &str) -> String {
 /// $(), backticks, <() in arguments: warn by default, **block** when
 /// `shell_strict_mode = true` (GH #391 — the strict knob previously only
 /// changed the log line and never actually blocked).
-fn check_substitution_in_args(command: &str, strict: bool) -> Result<(), String> {
+fn check_substitution_in_args(command: &str, strict: bool) -> Result<(), ShellError> {
     if has_expanding_substitution_in_args(command) {
         if strict {
             tracing::warn!(
@@ -105,7 +107,8 @@ fn check_substitution_in_args(command: &str, strict: bool) -> Result<(), String>
                  arguments is blocked because shell_strict_mode = true. \
                  This is a permanent security restriction.\n\
                  Command: {command}"
-            ));
+            )
+            .into());
         }
         tracing::warn!(
             "[SECURITY] Command substitution in arguments detected (warn-only, set shell_strict_mode=true to block): {command}"
@@ -171,7 +174,7 @@ fn has_expanding_substitution_in_args(command: &str) -> bool {
 
 /// Piping into a bare interpreter (no script file): warn by default, **block**
 /// when `shell_strict_mode = true` (GH #391).
-fn check_pipe_to_bare_interpreter(command: &str, strict: bool) -> Result<(), String> {
+fn check_pipe_to_bare_interpreter(command: &str, strict: bool) -> Result<(), ShellError> {
     let segments = split_on_operators(command);
 
     for (idx, seg) in segments.iter().enumerate() {
@@ -188,7 +191,8 @@ fn check_pipe_to_bare_interpreter(command: &str, strict: bool) -> Result<(), Str
                     "[BLOCKED — DO NOT RETRY] Piping into bare interpreter '{base}' is blocked \
                      because shell_strict_mode = true. Run a script file instead.\n\
                      Command: {command}"
-                ));
+                )
+                .into());
             }
             tracing::warn!("[SECURITY] Pipe to bare interpreter '{base}' detected (warn-only)");
         }
@@ -197,7 +201,7 @@ fn check_pipe_to_bare_interpreter(command: &str, strict: bool) -> Result<(), Str
 }
 
 /// For empty allowlists: still enforce UNCONDITIONAL_BLOCKED commands.
-fn check_unconditional_blocked_only(command: &str) -> Result<(), String> {
+fn check_unconditional_blocked_only(command: &str) -> Result<(), ShellError> {
     let segments = extract_all_commands(command);
     for seg in &segments {
         let base = extract_base_from_segment(seg);
@@ -206,7 +210,8 @@ fn check_unconditional_blocked_only(command: &str) -> Result<(), String> {
                 "[BLOCKED — DO NOT RETRY] '{base}' is unconditionally blocked \
                  regardless of allowlist configuration.\n\
                  Command: {command}"
-            ));
+            )
+            .into());
         }
         check_inline_env_block(seg)?;
         check_interpreter_eval_only(seg)?;
@@ -283,11 +288,15 @@ fn quote_aware_token_end(input: &str) -> usize {
 /// Skips allowlist-membership tests (no allowlist exists in blocklist-only mode),
 /// but still follows delegation wrappers so `xargs bash -c …` / `timeout 5 sh -c …`
 /// cannot smuggle inline code past the check (GH #391).
-fn check_interpreter_eval_only(segment: &str) -> Result<(), String> {
+fn check_interpreter_eval_only(segment: &str) -> Result<(), ShellError> {
+    // #814: opt-in config skips the inline-code block entirely.
+    if crate::core::config::Config::load().shell_allow_inline_scripts_effective() {
+        return Ok(());
+    }
     check_interpreter_eval_only_inner(segment, 0)
 }
 
-fn check_interpreter_eval_only_inner(segment: &str, depth: usize) -> Result<(), String> {
+fn check_interpreter_eval_only_inner(segment: &str, depth: usize) -> Result<(), ShellError> {
     if depth > 3 {
         return Ok(());
     }
@@ -319,18 +328,20 @@ fn check_interpreter_eval_only_inner(segment: &str, depth: usize) -> Result<(), 
                 "[BLOCKED — DO NOT RETRY] Interpreter '{base}' with inline code execution \
                  flag '{tok}' is blocked. Use a script file instead.\n\
                  This is a permanent security restriction."
-            ));
+            )
+            .into());
         }
         if has_eval_flag_prefix(tok) {
             return Err(format!(
                 "[BLOCKED — DO NOT RETRY] Interpreter '{base}' with combined flag '{tok}' \
                  containing eval flag is blocked.\n\
                  This is a permanent security restriction."
-            ));
+            )
+            .into());
         }
     }
     if tokens[1..].iter().any(|t| t.contains("<<")) {
-        return Err(heredoc_blocked_message(&base));
+        return Err(heredoc_blocked_message(&base).into());
     }
     Ok(())
 }
@@ -395,15 +406,19 @@ fn delegated_command_tokens(tokens: &[String]) -> Vec<&str> {
 
 /// Check if a segment uses an interpreter with an eval flag, or a delegation command
 /// whose target is not in the allowlist.
-fn check_interpreter_abuse(segment: &str, allowlist: &[String]) -> Result<(), String> {
-    check_interpreter_abuse_inner(segment, allowlist, 0)
+fn check_interpreter_abuse(segment: &str, allowlist: &[String]) -> Result<(), ShellError> {
+    // #814: when inline scripts are opt-in allowed, skip the eval-flag subset
+    // of interpreter abuse checks. Delegation checks (xargs→unlisted) still apply.
+    let inline_ok = crate::core::config::Config::load().shell_allow_inline_scripts_effective();
+    check_interpreter_abuse_inner(segment, allowlist, 0, inline_ok)
 }
 
 fn check_interpreter_abuse_inner(
     segment: &str,
     allowlist: &[String],
     depth: usize,
-) -> Result<(), String> {
+    inline_ok: bool,
+) -> Result<(), ShellError> {
     if depth > 3 {
         return Ok(());
     }
@@ -419,25 +434,27 @@ fn check_interpreter_abuse_inner(
         .unwrap_or(&tokens[0])
         .to_string();
 
-    if INTERPRETER_COMMANDS.contains(&base.as_str()) {
+    if INTERPRETER_COMMANDS.contains(&base.as_str()) && !inline_ok {
         for tok in &tokens[1..] {
             if EVAL_FLAGS.contains(&tok.as_str()) {
                 return Err(format!(
                     "[BLOCKED — DO NOT RETRY] Interpreter '{base}' with inline code execution \
                      flag '{tok}' is blocked. Use a script file instead.\n\
                      This is a permanent security restriction."
-                ));
+                )
+                .into());
             }
             if has_eval_flag_prefix(tok) {
                 return Err(format!(
                     "[BLOCKED — DO NOT RETRY] Interpreter '{base}' with combined flag '{tok}' \
                      containing eval flag is blocked.\n\
                      This is a permanent security restriction."
-                ));
+                )
+                .into());
             }
         }
         if tokens[1..].iter().any(|t| t.contains("<<")) {
-            return Err(heredoc_blocked_message(&base));
+            return Err(heredoc_blocked_message(&base).into());
         }
     }
 
@@ -449,10 +466,11 @@ fn check_interpreter_abuse_inner(
                 return Err(format!(
                     "[BLOCKED — DO NOT RETRY] '{base}' delegates to '{delegated}' which is not \
                      in the shell allowlist. This is a permanent restriction."
-                ));
+                )
+                .into());
             }
             let rest_str = rest_tokens.join(" ");
-            check_interpreter_abuse_inner(&rest_str, allowlist, depth + 1)?;
+            check_interpreter_abuse_inner(&rest_str, allowlist, depth + 1, inline_ok)?;
         }
     }
 
@@ -512,7 +530,7 @@ const BLOCKED_INLINE_ENV: &[&str] = &[
     "DYLD_INSERT_LIBRARIES=",
 ];
 
-fn check_dangerous_flags(segment: &str) -> Result<(), String> {
+fn check_dangerous_flags(segment: &str) -> Result<(), ShellError> {
     let trimmed = skip_env_assignments(segment.trim());
     let tokens = shell_tokenize(trimmed);
     if tokens.is_empty() {
@@ -532,7 +550,7 @@ fn check_dangerous_flags(segment: &str) -> Result<(), String> {
                         return Err(format!(
                             "[BLOCKED — DO NOT RETRY] 'git' with dangerous flag '{tok}' is blocked.\n\
                              This is a permanent security restriction."
-                        ));
+                        ).into());
                     }
                 }
             }
@@ -544,7 +562,7 @@ fn check_dangerous_flags(segment: &str) -> Result<(), String> {
                         return Err(format!(
                             "[BLOCKED — DO NOT RETRY] 'tar' with dangerous flag '{tok}' is blocked.\n\
                              This is a permanent security restriction."
-                        ));
+                        ).into());
                     }
                 }
             }
@@ -556,7 +574,8 @@ fn check_dangerous_flags(segment: &str) -> Result<(), String> {
                         "[BLOCKED — DO NOT RETRY] 'find' with '{tok}' is blocked. \
                          Use 'find ... -print' and pipe to xargs instead.\n\
                          This is a permanent security restriction."
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -566,7 +585,8 @@ fn check_dangerous_flags(segment: &str) -> Result<(), String> {
                     return Err(format!(
                         "[BLOCKED — DO NOT RETRY] '{base}' with 'system()' call is blocked.\n\
                          This is a permanent security restriction."
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -575,14 +595,15 @@ fn check_dangerous_flags(segment: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn check_inline_env_block(segment: &str) -> Result<(), String> {
+fn check_inline_env_block(segment: &str) -> Result<(), ShellError> {
     let trimmed = segment.trim();
     for blocked in BLOCKED_INLINE_ENV {
         if trimmed.starts_with(blocked) {
             return Err(format!(
                 "[BLOCKED — DO NOT RETRY] Inline environment override '{blocked}' is blocked.\n\
                  This is a permanent security restriction."
-            ));
+            )
+            .into());
         }
     }
     Ok(())
@@ -610,14 +631,15 @@ const BODY_INTRO_KEYWORDS: &[&str] = &[
 /// this conservative walker cannot prove safe (`case`/`esac`, `;;`, a subshell
 /// with trailing content, deep nesting) is rejected — it over-blocks, never
 /// under-blocks.
-fn expand_to_leaf_segments(command: &str) -> Result<Vec<String>, String> {
+fn expand_to_leaf_segments(command: &str) -> Result<Vec<String>, ShellError> {
     if has_case_construct(command) {
         return Err(format!(
             "[BLOCKED — DO NOT RETRY] `case`/`esac` constructs are not supported in \
              restricted (allowlisted) shell mode — their `pattern)` arms cannot be \
              leaf-validated safely. Run a script file or disable the allowlist instead.\n\
              Command: {command}"
-        ));
+        )
+        .into());
     }
     let mut leaves = Vec::new();
     for seg in extract_all_commands(command) {
@@ -632,12 +654,13 @@ fn resolve_segment_leaves(
     segment: &str,
     depth: usize,
     out: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), ShellError> {
     if depth > 4 {
         return Err(format!(
             "[BLOCKED — DO NOT RETRY] Shell command nests compound/subshell groups too \
              deeply to validate safely.\nCommand: {segment}"
-        ));
+        )
+        .into());
     }
     let mut s = segment.trim();
     loop {
@@ -784,7 +807,46 @@ fn contains_double_semicolon(command: &str) -> bool {
     false
 }
 
-fn check_all_segments(command: &str, allowlist: &[String]) -> Result<(), String> {
+/// #813: check whether a command token resolves to an existing file under the
+/// project root. Called as a fallback when the base command name isn't in the
+/// allowlist — agents frequently build project-local binaries (`go build -o
+/// cbc_old`, `cargo build`, `gcc -o bench`) that shouldn't require a manual
+/// `lean-ctx allow` round-trip.
+///
+/// Only auto-allows when ALL of:
+/// 1. The token is a path (contains `/` or starts with `./`)
+/// 2. The resolved path is an existing file
+/// 3. The resolved path is under the project root
+fn is_project_root_binary(token: &str) -> bool {
+    if !token.contains('/') {
+        return false;
+    }
+    let path = std::path::Path::new(token);
+    let resolved = if path.is_relative() {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return false,
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let Ok(canonical) = resolved.canonicalize() else {
+        return false;
+    };
+    if !canonical.is_file() {
+        return false;
+    }
+    let Some(root) = crate::server::derive_project_root_from_cwd() else {
+        return false;
+    };
+    let root_path = std::path::Path::new(&root);
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
+    canonical.starts_with(&canonical_root)
+}
+
+fn check_all_segments(command: &str, allowlist: &[String]) -> Result<(), ShellError> {
     if allowlist.is_empty() {
         return Ok(());
     }
@@ -795,15 +857,17 @@ fn check_all_segments(command: &str, allowlist: &[String]) -> Result<(), String>
              which is blocked in restricted mode. \
              This is a permanent security restriction, not a transient error.\n\
              Command: {command}"
-        ));
+        )
+        .into());
     }
 
     let segments = expand_to_leaf_segments(command)?;
     if segments.is_empty() {
-        return Err("[BLOCKED — DO NOT RETRY] Empty command".to_string());
+        return Err("[BLOCKED — DO NOT RETRY] Empty command".into());
     }
 
-    for seg in &segments {
+    let total = segments.len();
+    for (idx, seg) in segments.iter().enumerate() {
         check_inline_env_block(seg)?;
         let base = extract_base_from_segment(seg);
         if base.is_empty() {
@@ -815,12 +879,39 @@ fn check_all_segments(command: &str, allowlist: &[String]) -> Result<(), String>
                  regardless of allowlist membership. \
                  This is a permanent security restriction.\n\
                  Command: {command}"
-            ));
+            )
+            .into());
         }
         check_interpreter_abuse(seg, allowlist)?;
         check_dangerous_flags(seg)?;
         if !allowlist.iter().any(|a| a == &base) {
-            return Err(allowlist_block_message(&base));
+            // #813: auto-allow binaries that resolve to existing files under
+            // the project root. The first token (before rsplit) carries the
+            // path context (e.g. "./cbc_old", "../bin/bench").
+            let first_token = shell_tokenize(skip_env_assignments(seg.trim()))
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            if is_project_root_binary(&first_token) {
+                tracing::info!(
+                    "[shell_allowlist] auto-allowing project-root binary: {first_token}"
+                );
+                continue;
+            }
+
+            // #815: for compound commands, tell the user which segment was
+            // blocked and that nothing ran (the pipeline is rejected as a
+            // whole before execution, so no prefix commands executed).
+            let mut msg = allowlist_block_message(&base);
+            if total > 1 {
+                msg.push_str(&format!(
+                    "\n\n[pipeline: segment {}/{total} blocked — \
+                     the entire command was rejected before execution, \
+                     no part of the pipeline ran]",
+                    idx + 1,
+                ));
+            }
+            return Err(msg.into());
         }
     }
     Ok(())

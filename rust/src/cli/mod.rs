@@ -1,4 +1,5 @@
 pub mod addon_cmd;
+mod addon_deps;
 mod agent_cmd;
 mod allow_cmd;
 pub mod audit_report;
@@ -6,6 +7,7 @@ mod call_cmd;
 mod cheatsheet_cmd;
 pub mod cloud;
 mod common;
+pub mod completions;
 mod compliance_cmd;
 mod compress_cmd;
 mod config_cmd;

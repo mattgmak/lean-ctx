@@ -236,7 +236,7 @@ mod tests {
         // that flips the single gateway spawn point from the legacy "inherit the
         // full host env" path to the scrubbed path (env_clear + base allowlist) —
         // so a runnable addon without one silently leaks host API keys to the
-        // child. See `core::addons::env_scrub` + `core::gateway::client`.
+        // child. See `core::addons::env_scrub` + `core::mcp_catalog::client`.
         //
         // A block may pass through a *small, reviewed* set of BYO-key env names
         // (e.g. cognee needs `LLM_API_KEY`). Any name outside this allowlist must
@@ -404,25 +404,26 @@ mod tests {
     }
 
     #[test]
-    fn flagship_lmd_is_listed() {
-        let lmd = get("lmd").expect("lmd in registry");
+    fn flagship_lean_md_is_listed() {
+        let lmd = get("lean-md").expect("lean-md in registry");
         assert_eq!(lmd.addon.author, "dasTholo");
         assert!(!lmd.addon.homepage.is_empty());
-        // Listed-only until it publishes an MCP endpoint — never fabricated.
+        // Listed-only: the addon ships as a hosted pack (`addon add @dasTholo/lean-md`),
+        // the bundled entry is discovery only — never a fabricated endpoint.
         assert!(!lmd.is_installable());
     }
 
     #[test]
     fn search_matches_keywords_and_categories() {
-        assert!(search("markdown").iter().any(|m| m.addon.name == "lmd"));
-        assert!(search("plans").iter().any(|m| m.addon.name == "lmd"));
-        assert!(search("").iter().any(|m| m.addon.name == "lmd"));
+        assert!(search("markdown").iter().any(|m| m.addon.name == "lean-md"));
+        assert!(search("plans").iter().any(|m| m.addon.name == "lean-md"));
+        assert!(search("").iter().any(|m| m.addon.name == "lean-md"));
         assert!(search("definitely-no-such-term").is_empty());
     }
 
     #[test]
     fn get_is_case_insensitive() {
-        assert!(get("LMD").is_some());
-        assert!(get("  lmd ").is_some());
+        assert!(get("LEAN-MD").is_some());
+        assert!(get("  lean-md ").is_some());
     }
 }

@@ -12,15 +12,11 @@ pub(crate) fn cmd_learn(args: &[String]) {
     let project_root = super::common::detect_project_root(args);
     let apply = args.iter().any(|a| a == "--apply");
 
-    let gotchas = gotcha_tracker::load_universal_gotchas();
-    let store = GotchaStore {
-        project_hash: String::new(),
-        gotchas,
-        error_log: Vec::new(),
-        stats: gotcha_tracker::GotchaStats::default(),
-        updated_at: chrono::Utc::now(),
-        pending_errors: Vec::new(),
-    };
+    let mut store = GotchaStore::load(&project_root);
+    let universal = gotcha_tracker::load_universal_gotchas();
+    for ug in universal {
+        store.add_universal(ug);
+    }
 
     let learnings = learn::extract_learnings(&store);
 

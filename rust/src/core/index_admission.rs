@@ -74,7 +74,7 @@ impl Admission {
 ///
 /// Budget anchor: the guardian escalates to Hard at 2× the configured RSS
 /// limit (`max_ram_percent`), where background builds are aborted anyway —
-/// so a build whose estimated peak would push RSS past that threshold is
+/// so a build whose estimated peak would push RSS past that threshold (1.5× max_ram_percent) is
 /// pointless to start in parallel. Everything below stays on the fast path;
 /// normal repositories (a few hundred MB of source) are never affected.
 #[must_use]
@@ -90,7 +90,7 @@ pub fn admit(kind: BuildKind, corpus_bytes: u64) -> Admission {
 /// Pure decision core, separated for tests.
 fn admit_with(kind: BuildKind, corpus_bytes: u64, rss_bytes: u64, limit_bytes: u64) -> Admission {
     let estimated = corpus_bytes.saturating_mul(kind.expansion_factor());
-    let hard_threshold = limit_bytes.saturating_mul(2);
+    let hard_threshold = limit_bytes.saturating_mul(3) / 2;
     let available = hard_threshold.saturating_sub(rss_bytes);
 
     if estimated <= available {
@@ -101,7 +101,7 @@ fn admit_with(kind: BuildKind, corpus_bytes: u64, rss_bytes: u64, limit_bytes: u
         parallel_ok: false,
         reason: Some(format!(
             "{} corpus {:.0} MB × {} ≈ {:.0} MB estimated peak exceeds the {:.0} MB headroom \
-             (RSS {:.0} MB, hard limit {:.0} MB = 2× max_ram_percent) — degrading to the \
+             (RSS {:.0} MB, hard limit {:.0} MB = 1.5× max_ram_percent) — degrading to the \
              sequential build with memory-pressure breaks",
             kind.label(),
             corpus_bytes as f64 / 1_048_576.0,
@@ -145,7 +145,7 @@ pub fn admit_files(kind: BuildKind, root: &Path, files: &[String]) -> Admission 
         return Admission::admitted();
     };
     let rss = super::memory_guard::get_rss_bytes().unwrap_or(0);
-    let available = limit.saturating_mul(2).saturating_sub(rss);
+    let available = (limit.saturating_mul(3) / 2).saturating_sub(rss);
     // The stat walk can stop as soon as the corpus alone proves the estimate
     // exceeds the headroom (factor ≥ 1 ⇒ corpus > available/factor suffices).
     let bail_cap = available / kind.expansion_factor().max(1);

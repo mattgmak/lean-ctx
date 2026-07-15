@@ -296,9 +296,16 @@ impl LeanCtxServer {
             let output = self.run_tool_handler(name, tool, args_map, ctx).await?;
             let handler_ms = handler_started.elapsed().as_millis() as u64;
 
-            if output.changed
+            let config_changed =
+                super::tools_config_watch::has_changed(&self.last_tools_config_hash);
+            if (output.changed || config_changed)
                 && let Some(peer) = self.peer.read().await.as_ref()
             {
+                if config_changed {
+                    tracing::info!(
+                        "Tool-config changed (profile/enabled/disabled) — sending tools/list_changed"
+                    );
+                }
                 super::notifications::send_tools_list_changed(peer).await;
             }
 

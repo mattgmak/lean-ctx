@@ -146,3 +146,17 @@ shows the smallest tool profile that exposes the tool (`M` minimal, `S` standard
    `metrics`, `session`) independently of the static profile filter.
 3. Lazy clients use `ctx_call` + `ctx_discover_tools` + `ctx_load_tools` to reach
    tools not in their active profile without listing all 79 upfront.
+
+---
+
+## lean-md addon (`.lmd.md` render pipeline)
+
+`.lmd.md` / `.lean-md` rendering is provided by the **external lean-md addon**
+(`dasTholo/lean-md`), not by lean-ctx itself. `ctx_md_render` / `ctx_md_check` are
+exposed by the addon's MCP server once installed (`lean-ctx addon add @dasTholo/lean-md`); a
+`.lmd.md` passed to `ctx_read` is returned **raw** — lean-ctx never renders it
+(rendering is an explicit addon call). The `@directive` catalog and `@lean-md` header fields live in the
+addon repo.
+
+- **Integration reference:** [`21-lean-md.md`](21-lean-md.md)
+- **Addon repo:** https://github.com/dasTholo/lean-md

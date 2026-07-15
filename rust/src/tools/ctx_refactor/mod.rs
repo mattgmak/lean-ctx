@@ -444,15 +444,57 @@ fn handle_symbols_overview(file_path: &str, project_root: &str, uri: &lsp_types:
 }
 
 fn handle_symbol_edit(action: &str, args: &Value, project_root: &str) -> String {
+    let explicit_path = args.get("path").and_then(Value::as_str);
+
     let (rel_path, start_line, end_line) = if let Some(np) =
         args.get("name_path").and_then(Value::as_str)
     {
         match resolve_name_path(np, project_root) {
-            Ok(r) => (r.rel_path, r.start_line, r.end_line),
+            Ok(r) => {
+                // #803 WORKTREE SAFETY: when the caller also provided `path`,
+                // verify the index-resolved file matches the caller's target.
+                // In git worktrees the index may point to the main checkout
+                // while the caller works in a linked worktree — writing to the
+                // wrong root causes silent data loss.
+                if let Some(caller_path) = explicit_path {
+                    let resolved_abs = match crate::core::path_resolve::resolve_tool_path(
+                        Some(project_root),
+                        None,
+                        &r.rel_path,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => return format!("ERROR: path blocked by jail: {e}"),
+                    };
+                    let caller_abs = match crate::core::path_resolve::resolve_tool_path(
+                        Some(project_root),
+                        None,
+                        caller_path,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => return format!("ERROR: path blocked by jail: {e}"),
+                    };
+                    let resolved_real = std::fs::canonicalize(&resolved_abs)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&resolved_abs));
+                    let caller_real = std::fs::canonicalize(&caller_abs)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&caller_abs));
+                    if resolved_real != caller_real {
+                        return format!(
+                            "ERROR: WORKTREE_MISMATCH: symbol '{np}' resolved to '{resolved_abs}' \
+                             but caller specified '{caller_abs}'. The symbol index points to a \
+                             different checkout (likely a git worktree mismatch). \
+                             Use op=replace_lines with explicit line range instead, \
+                             or re-index from the correct root.",
+                        );
+                    }
+                    (caller_path.to_string(), r.start_line, r.end_line)
+                } else {
+                    (r.rel_path, r.start_line, r.end_line)
+                }
+            }
             Err(e) => return format!("ERROR: {e}"),
         }
     } else {
-        let Some(path) = args.get("path").and_then(Value::as_str) else {
+        let Some(path) = explicit_path else {
             return "ERROR: provide 'name_path' or 'path'+'line' for symbol edits.".to_string();
         };
         let line = args.get("line").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -565,12 +607,16 @@ fn handle_symbol_edit(action: &str, args: &Value, project_root: &str) -> String 
 
     // 4) Dispatch (IDE-first, headless fallback) + format.
     match apply_symbol_edit(action, project_root, &edit) {
-        Ok(res) => format_edit_result(action, &res),
+        Ok(res) => format_edit_result(action, &edit.abs_path, &res),
         Err(e) => format!("ERROR: {e}"),
     }
 }
 
-fn format_edit_result(action: &str, res: &crate::lsp::backend::EditResult) -> String {
+fn format_edit_result(
+    action: &str,
+    abs_path: &str,
+    res: &crate::lsp::backend::EditResult,
+) -> String {
     if !res.applied {
         return format!("{action}: not applied.");
     }
@@ -580,8 +626,9 @@ fn format_edit_result(action: &str, res: &crate::lsp::backend::EditResult) -> St
     } else {
         res.diff.clone()
     };
+    // #803: include absolute path so callers can verify the write target
     format!(
-        "{action} applied (L{}:{}-L{}:{}):\n{}",
+        "{action} applied {abs_path} (L{}:{}-L{}:{}):\n{}",
         r.start_line + 1,
         r.start_char,
         r.end_line + 1,

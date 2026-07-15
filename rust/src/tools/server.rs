@@ -92,6 +92,7 @@ pub struct LeanCtxServer {
     pub(crate) roots_list_attempts: Arc<std::sync::atomic::AtomicU32>,
     pub(crate) bm25_cache: Arc<std::sync::Mutex<Option<crate::core::bm25_cache::Bm25CacheEntry>>>,
     pub(crate) progress_sender: crate::server::progress::SharedProgressSender,
+    pub(crate) last_tools_config_hash: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub use crate::core::protocol::ToolCallRecord;

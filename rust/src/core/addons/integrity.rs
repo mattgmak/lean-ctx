@@ -12,7 +12,7 @@
 //! that reuses the ctxpkg remote rails; this module is the local lock + verify
 //! it builds on.)
 
-use crate::core::gateway::GatewayServer;
+use crate::core::mcp_catalog::GatewayServer;
 
 /// Stable content hash of a gateway server's wiring. Deterministic: the struct
 /// serialises in field order with sorted `BTreeMap`s, so the same wiring always
