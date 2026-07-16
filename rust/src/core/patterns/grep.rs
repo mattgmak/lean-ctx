@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::core::tokens::count_tokens;
 
-const MAX_LINE_CHARS: usize = 250;
+pub(crate) const MAX_LINE_CHARS: usize = 250;
 
 fn normalize_shell_tokens(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")

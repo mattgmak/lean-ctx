@@ -53,7 +53,7 @@ pub(in crate::shell) fn compress_and_measure(
 /// stripped correctly); a succeeding command still compresses as before.
 pub(crate) fn compress_for_outcome(command: &str, output: &str, exit_code: i32) -> String {
     if exit_code != 0 && !output.trim().is_empty() && !crate::core::protect::has_markers(output) {
-        return truncate_verbatim(output, count_tokens(output));
+        return enforce_max_line_chars(truncate_verbatim(output, count_tokens(output)));
     }
     compress_if_beneficial(command, output)
 }
@@ -228,7 +228,19 @@ pub(crate) fn verbatim_yaml_crush_lossy(
     ))
 }
 
+/// Hard cap on every output line after compression. Safety-preserved head/tail/
+/// middle lines from [`truncate_with_safety_scan`] / [`truncate_verbatim`] are
+/// not exempt — without this, a single megabyte grep hit can bypass the
+/// grep compressor's 250-char limit.
+fn enforce_max_line_chars(output: String) -> String {
+    patterns::grep::truncate_oversized_lines(&output).unwrap_or(output)
+}
+
 pub(crate) fn compress_if_beneficial(command: &str, output: &str) -> String {
+    enforce_max_line_chars(compress_if_beneficial_raw(command, output))
+}
+
+fn compress_if_beneficial_raw(command: &str, output: &str) -> String {
     if output.trim().is_empty() {
         return String::new();
     }
@@ -845,5 +857,5 @@ pub fn compress_if_beneficial_pub(command: &str, output: &str) -> String {
 /// command-gated verbatim guards cannot fire, yet compiler errors, panics and
 /// test summaries must still reach the model intact for a bug-fix task.
 pub(crate) fn preserve_verbatim_pub(output: &str) -> String {
-    truncate_verbatim(output, count_tokens(output))
+    enforce_max_line_chars(truncate_verbatim(output, count_tokens(output)))
 }

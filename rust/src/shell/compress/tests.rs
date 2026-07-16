@@ -1592,6 +1592,50 @@ mod outcome_aware_tests {
     }
 
     #[test]
+    fn safety_preserved_lines_still_capped_at_max_line_chars() {
+        use super::super::engine::compress_if_beneficial;
+        use crate::core::patterns::grep::MAX_LINE_CHARS;
+
+        let huge = "x".repeat(50_000);
+        let errorish = format!(
+            "node_modules/pkg/mapperTab.js.map:1:{{\"ErrorResponse.js\":\"{huge}\"}}"
+        );
+        let mut lines = Vec::new();
+        for i in 0..5 {
+            lines.push(format!("packages/a/src/file{i}.ts:{i}: import {{ VersionSchema }}"));
+        }
+        for i in 0..27 {
+            if i == 10 {
+                lines.push(errorish.clone());
+            } else {
+                lines.push(format!("packages/b/src/other{i}.ts:{i}: VersionSchema"));
+            }
+        }
+        for i in 0..5 {
+            lines.push(format!("packages/c/src/tail{i}.ts:{i}: export const VersionSchema"));
+        }
+        let output = lines.join("\n");
+        let result = compress_if_beneficial("rg --line-number VersionSchema /project", &output);
+
+        assert!(
+            !result.contains(&huge),
+            "megabyte safety-preserved line must not pass through verbatim"
+        );
+        assert!(
+            result.contains("safety-relevant lines preserved"),
+            "safety scan should still run: {result}"
+        );
+        for line in result.lines() {
+            assert!(
+                line.len() <= MAX_LINE_CHARS,
+                "line length {} exceeds cap: {:?}",
+                line.len(),
+                &line[..line.len().min(80)]
+            );
+        }
+    }
+
+    #[test]
     fn measure_labels_stderr_only_on_failure() {
         let (failed, _) = compress_and_measure("./build.sh", "compiling main", "linker error", 1);
         assert!(
