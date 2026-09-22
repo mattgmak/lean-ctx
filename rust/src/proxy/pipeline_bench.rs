@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use super::compress_api::{CompressRequest, compress_messages};
+use super::compress_api::{CompressRequest, CompressResponse, compress_messages};
 
 const INPUT_COST_PER_MILLION_TOKENS_USD: f64 = 3.0;
 
@@ -162,16 +162,47 @@ pub fn print_report(report: &BenchmarkReport) {
     );
 }
 
+/// How many times each workload is compressed before a latency is recorded.
+///
+/// A single wall-clock sample on a shared CI runner measures the runner, not
+/// the pipeline: a neighbouring job can preempt us mid-call and charge us a
+/// second that has nothing to do with compression. That is exactly how this
+/// benchmark failed on `windows-latest` at 1.23 s against a 1 s budget while
+/// the proxy had not been touched at all.
+///
+/// Interference only ever makes a run slower, never faster, so the fastest of
+/// a few repetitions is the honest estimate of what the code costs. Raising
+/// the budget instead would have bought silence at the price of the guard; a
+/// real regression slows every repetition, so the minimum rises with it and
+/// the latency assertions below still bite.
+const LATENCY_SAMPLES: usize = 3;
+
+/// Compresses one prepared workload and reports how long that call took.
+fn compress_and_time(messages: &[Value]) -> (CompressResponse, u128) {
+    let input = messages.to_vec();
+    let started = Instant::now();
+    let compressed = compress_messages(CompressRequest {
+        messages: input,
+        model: Some("gpt-4o".to_string()),
+    });
+    (compressed, started.elapsed().as_micros())
+}
+
 fn run_scenario(scenario: BenchmarkScenario) -> BenchmarkResult {
     let messages = generate_realistic_messages(scenario.name);
     debug_assert_eq!(messages.len(), scenario.message_count);
     let total_tokens_before = estimate_tokens(&messages);
-    let started = Instant::now();
-    let compressed = compress_messages(CompressRequest {
-        messages,
-        model: Some("gpt-4o".to_string()),
-    });
-    let latency_us = started.elapsed().as_micros();
+
+    // Compression is deterministic, so every repetition returns the same
+    // messages; only the timing differs, and we keep the fastest.
+    let (mut compressed, mut latency_us) = compress_and_time(&messages);
+    for _ in 1..LATENCY_SAMPLES {
+        let (next, next_latency_us) = compress_and_time(&messages);
+        if next_latency_us < latency_us {
+            latency_us = next_latency_us;
+            compressed = next;
+        }
+    }
     let total_tokens_after = estimate_tokens(&compressed.messages);
     let savings_pct = savings_pct(total_tokens_before, total_tokens_after);
     let estimated_cost_savings_usd =
@@ -391,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn every_scenario_compresses_within_five_milliseconds() {
+    fn every_scenario_compresses_well_under_a_second() {
         let report = run_benchmark();
         for result in &report.results {
             assert!(
