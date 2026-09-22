@@ -5,7 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-## [3.10.3] — 2026-09-21
+## [3.10.3] — 2026-09-22
+
+### Fixed — a `grep` pattern is no longer silently reinterpreted (#1827)
+
+- **The `PreToolUse` shell hook rewrote `grep` onto `lean-ctx grep` while
+  passing the pattern through verbatim — but the two sides do not speak the
+  same regex dialect.** Plain `grep` applies POSIX *basic* regular expressions,
+  where `\|` alternates and a bare `|` is a literal. `lean-ctx grep` compiles
+  with the Rust `regex` crate, which reads those exactly the other way round.
+- The report was a false negative: `grep -n "headroom\|HEADROOM" db.py` on a
+  file containing both answered `0 matches for 'headroom\|HEADROOM' in 1 files`
+  and exited 1. The same defect runs the other way too — `grep -n "a|b"` is a
+  literal search in BRE, but the rewrite reported every line containing `a` or
+  `b`. Seven metacharacters flip meaning this way: `|` `+` `?` `(` `)` `{` `}`.
+- Both directions produced a *wrong answer that looks like a right one*, with
+  no error to notice, which is the shape that matters for anyone scripting
+  against the output.
+- A `grep` invocation whose pattern contains one of those seven now declines
+  the rewrite and falls through to the `lean-ctx -c` wrap, where the platform's
+  own grep resolves the pattern — the same escape valve `fgrep` and the
+  semantic flags (`-i`, `-w`, `-F`, …) already used. Output is still
+  compressed; only the matching is handed back.
+- `egrep` and `rg` keep the fast path: POSIX *extended* regular expressions and
+  the Rust `regex` crate agree on all seven. So does a plain `grep` pattern that
+  contains none of them.
+- **Not a Windows defect.** The report came from Git Bash on Windows 11, but the
+  cause is platform-independent and reproduces identically on macOS and Linux.
 
 ### Fixed — the proxy no longer forwards conversations it has emptied (#1789)
 

@@ -11,9 +11,22 @@ fn grep_simple_pattern_rewrites() {
 }
 
 #[test]
-fn grep_pattern_with_pipe_is_quoted() {
+fn grep_pattern_with_pipe_falls_through_to_native_grep() {
+    // In BRE a bare `|` is a literal, but `lean-ctx grep` would read it as
+    // alternation and report lines native grep never matches (#1827). The
+    // quoting this test used to check now happens inside the `-c` wrap.
     assert_eq!(
         rewrite_candidate("grep -r \"TODO|FIXME\" .", "lean-ctx"),
+        Some("lean-ctx -c 'grep -r \"TODO|FIXME\" .'".to_string())
+    );
+}
+
+#[test]
+fn egrep_pattern_with_pipe_still_rewrites() {
+    // The same text under ERE really is alternation, and the Rust `regex`
+    // crate agrees — so `egrep` keeps the direct rewrite.
+    assert_eq!(
+        rewrite_candidate("egrep -r \"TODO|FIXME\" .", "lean-ctx"),
         Some("lean-ctx grep \"TODO|FIXME\" .".to_string())
     );
 }
@@ -27,10 +40,12 @@ fn grep_pattern_with_dollar_is_quoted() {
 }
 
 #[test]
-fn grep_pattern_with_parens_is_quoted() {
+fn grep_pattern_with_parens_falls_through_to_native_grep() {
+    // BRE reads `(` and `)` as literals; `lean-ctx grep` reads them as a
+    // group, so `func()` would match the text `func` (#1827).
     assert_eq!(
         rewrite_candidate("grep -n \"func()\" file.rs", "lean-ctx"),
-        Some("lean-ctx grep \"func()\" file.rs".to_string())
+        Some("lean-ctx -c 'grep -n \"func()\" file.rs'".to_string())
     );
 }
 
