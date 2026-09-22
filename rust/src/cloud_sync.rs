@@ -7,8 +7,12 @@ pub enum AutoSyncOutcome {
     Synced,
     /// The server gated sync behind Pro (HTTP 402) — stop for today.
     Gated,
-    /// Every push failed without a 402 (offline / server down) — try again
-    /// at the next opportunity, do not consume today's slot.
+    /// The server rejected our credential (HTTP 401) — the key this machine
+    /// holds is gone. Retrying cannot fix it, so this is the one outcome that
+    /// must be *said out loud*: the user has to log in again.
+    Unauthenticated,
+    /// Every push failed without a 402 or 401 (offline / server down) — try
+    /// again at the next opportunity, do not consume today's slot.
     NetworkFailure,
 }
 
@@ -38,11 +42,27 @@ pub fn should_auto_push_index(
     auto_index && logged_in && local_index_exists && last_push_for_project != Some(today)
 }
 
-/// Classify per-surface push results into one [`AutoSyncOutcome`]. A 402
-/// anywhere wins (the account is gated); otherwise total failure means the
-/// network is down; anything else counts as synced.
+/// Whether an outcome should consume today's auto-sync slot. Only a network
+/// failure leaves it open — a Pro gate or a dead credential will not resolve
+/// by retrying in ten minutes, and each is announced once per process.
+#[must_use]
+pub fn consumes_daily_slot(outcome: AutoSyncOutcome) -> bool {
+    outcome != AutoSyncOutcome::NetworkFailure
+}
+
+/// Classify per-surface push results into one [`AutoSyncOutcome`]. A 401
+/// anywhere wins — a revoked credential makes every other signal moot and is
+/// the only failure the user must act on. Then a 402 (the account is gated);
+/// otherwise total failure means the network is down; anything else counts as
+/// synced.
 #[must_use]
 pub fn classify_outcomes(results: &[Result<(), String>]) -> AutoSyncOutcome {
+    if results
+        .iter()
+        .any(|r| r.as_ref().is_err_and(|e| e.contains("401")))
+    {
+        return AutoSyncOutcome::Unauthenticated;
+    }
     if results
         .iter()
         .any(|r| r.as_ref().is_err_and(|e| e.contains("402")))
@@ -159,7 +179,7 @@ pub fn cloud_background_tasks() {
             true,
             config.cloud.last_auto_sync.as_deref(),
             &today,
-        ) && auto_sync_personal_cloud() != AutoSyncOutcome::NetworkFailure
+        ) && consumes_daily_slot(auto_sync_personal_cloud())
         {
             config.cloud.last_auto_sync = Some(today.clone());
         }
@@ -261,6 +281,20 @@ fn auto_sync_personal_cloud() -> AutoSyncOutcome {
             "\n  \x1b[33m⚠\x1b[0m  Personal Cloud sync requires Pro. \
              Your local data is safe.\n  \
              Unlock: lean-ctx cloud upgrade --plan pro ($9/mo)\n"
+        );
+    }
+
+    // A dead credential used to look exactly like being offline: silent, and
+    // retried forever. Say it once, and say what fixes it.
+    static AUTH_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if outcome == AutoSyncOutcome::Unauthenticated
+        && !AUTH_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "\n  \x1b[33m⚠\x1b[0m  Personal Cloud sync is signed out on this machine \
+             — the server rejected this device's key.\n  \
+             Your local data is safe, and nothing on the server was lost.\n  \
+             Sign in again to resume syncing: lean-ctx login\n"
         );
     }
 
@@ -655,9 +689,25 @@ mod tests {
     }
 
     #[test]
-    fn outcome_classification_is_gate_then_network_then_synced() {
+    fn outcome_classification_is_auth_then_gate_then_network_then_synced() {
         // Nothing to push counts as synced (slot consumed, no retry storm).
         assert_eq!(classify_outcomes(&[]), AutoSyncOutcome::Synced);
+        // A 401 outranks everything: the credential is gone, so the gate and
+        // the network tell us nothing useful.
+        assert_eq!(
+            classify_outcomes(&[
+                Err("Push failed: http status: 401".into()),
+                Err("HTTP 402: upgrade required".into()),
+                Err("connection refused".into()),
+            ]),
+            AutoSyncOutcome::Unauthenticated
+        );
+        // A lone 401 among successes still has to surface — one revoked
+        // machine is exactly the case that used to stay silent.
+        assert_eq!(
+            classify_outcomes(&[Ok(()), Err("Push failed: http status: 401".into())]),
+            AutoSyncOutcome::Unauthenticated
+        );
         // Any 402 means the account is gated, even with other failures.
         assert_eq!(
             classify_outcomes(&[
@@ -676,5 +726,16 @@ mod tests {
             classify_outcomes(&[Ok(()), Err("timeout".into())]),
             AutoSyncOutcome::Synced
         );
+    }
+
+    #[test]
+    fn only_a_network_failure_leaves_the_daily_slot_open() {
+        // A dead credential consumes the slot: retrying cannot fix it, and the
+        // warning is printed once per process either way. Leaving the slot
+        // open here is what turned one revoked key into a silent daily retry.
+        assert!(consumes_daily_slot(AutoSyncOutcome::Unauthenticated));
+        assert!(consumes_daily_slot(AutoSyncOutcome::Gated));
+        assert!(consumes_daily_slot(AutoSyncOutcome::Synced));
+        assert!(!consumes_daily_slot(AutoSyncOutcome::NetworkFailure));
     }
 }

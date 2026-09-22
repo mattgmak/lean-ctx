@@ -5,6 +5,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — a silent sign-out no longer looks like being offline
+
+- **Background Personal-Cloud sync treated a rejected credential as a network
+  problem.** `classify_outcomes` special-cased only HTTP 402 (the Pro gate);
+  an HTTP 401 fell through to `NetworkFailure`, which prints nothing and
+  deliberately leaves the day's sync slot open so the next cycle retries. A
+  machine whose API key had been revoked therefore retried forever, in
+  silence, while the user had every reason to believe sync was working.
+- Added `AutoSyncOutcome::Unauthenticated`, ranked above the Pro gate: a dead
+  credential makes every other signal moot. It prints once per process, says
+  that local data and server data are both intact, and names the fix
+  (`lean-ctx login`).
+- The slot rule is now the named predicate `consumes_daily_slot`, so "only a
+  network failure leaves the slot open" is stated in one place and tested.
+- `login` and `register` now send a device label, so the server can bind the
+  key it issues to this machine rather than to the account.
+
+### Fixed — logging in no longer signs out your other machines (server-side)
+
+Deployed with the Cloud API, so this reaches accounts independently of the CLI
+release.
+
+- **Every `login` deleted *all* of the account's API keys and issued one
+  replacement.** Signing in on a laptop — or merely opening the web account
+  page — silently revoked the key the desktop was syncing with. The desktop
+  then hit HTTP 401 forever, which the bug above rendered invisible.
+- API keys are now scoped to a device label. Signing in on a machine replaces
+  only that machine's key; other machines keep syncing. Keys are capped per
+  account, evicting the least recently used.
+- Revoking is explicit: the account page's **Forget** button now revokes that
+  device's key as well as its sync history, and `POST /api/auth/keys/revoke`
+  can drop a single key or every key but the caller's own.
+- `last_used_at` is finally written (at most hourly, best-effort), so a key
+  that stops being used is now visible as such.
+
 ## [3.10.3] — 2026-09-22
 
 ### Fixed — a `grep` pattern is no longer silently reinterpreted (#1827)
