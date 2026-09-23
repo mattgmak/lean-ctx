@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
@@ -293,7 +293,7 @@ function runOnboard(binaryPath) {
   try {
     console.log("");
     console.log("Running onboard (connecting your AI tools)...");
-    execSync(`"${binaryPath}" onboard`, { stdio: "ignore", timeout: 30000 });
+    execFileSync(binaryPath, ["onboard"], { stdio: "ignore", timeout: 30000 });
   } catch {
     // Non-fatal: onboard may fail in restricted envs
   }

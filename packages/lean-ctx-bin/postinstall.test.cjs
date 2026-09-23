@@ -6,7 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 const assert = require("node:assert/strict");
-const { execSync, spawn } = require("node:child_process");
+const { execFileSync, execSync, spawn } = require("node:child_process");
 const { once } = require("node:events");
 const { setTimeout: delay } = require("node:timers/promises");
 
@@ -18,7 +18,7 @@ function loadRunOnboard(env) {
   const end = source.indexOf("\nfunction printSuccess", start);
   assert(start >= 0 && end > start, "runOnboard was not found");
   return vm.runInNewContext(`(${source.slice(start, end)})`, {
-    console, execSync, process: { env },
+    console, execSync, execFileSync, process: { env },
   });
 }
 

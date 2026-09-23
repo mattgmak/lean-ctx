@@ -4,7 +4,7 @@
 // Stop running lean-ctx processes before npm replaces the binary.
 // On Windows, a running .exe cannot be deleted — this prevents EBUSY / orphan files.
 
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
@@ -30,7 +30,7 @@ function cleanOrphans() {
 function stopViaLeanCtx() {
   if (!fs.existsSync(BINARY_PATH)) return false;
   try {
-    execSync(`"${BINARY_PATH}" stop`, { stdio: "ignore", timeout: 10000 });
+    execFileSync(BINARY_PATH, ["stop"], { stdio: "ignore", timeout: 10000 });
     return true;
   } catch {
     return false;
