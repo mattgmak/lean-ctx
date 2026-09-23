@@ -7,6 +7,56 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [3.10.3] — 2026-09-22
 
+### Fixed — Claude Code's Bash sandbox no longer blocks every command (#1834)
+
+- With `sandbox.enabled`, Claude Code spawns each Bash call as
+  `env SANDBOX_RUNTIME=1 … /usr/bin/sandbox-exec -p '<profile>' /bin/zsh -c '<cmd>'`
+  through `zsh -c`. The `.zshenv` redirect forwarded that launcher to
+  `lean-ctx -c`, nothing recognised it, and the allowlist hard-blocked on the
+  inner `eval` — exit 126 for every command, even `echo`. `lean-ctx -c` now
+  recognises exactly the launcher Claude Code builds
+  (`/usr/bin/sandbox-exec -p <profile>` followed by `/bin/zsh`, `/bin/bash`,
+  `/bin/sh` or the user's own `$SHELL`, then `-c <script>`). It runs the
+  allowlist gate on the unwrapped script *before* starting the sandbox, then
+  spawns the launcher as is, so the command still runs inside the user's
+  sandbox. The launcher is never unwrapped, because that would run the
+  command outside the sandbox.
+- Only the environment variables Claude Code itself sets are accepted in
+  front of the launcher: the proxy and CA variables, `TMPDIR`, and the exact
+  `GIT_SSH_COMMAND`/`GIT_CONFIG_*` values. Every other variable name falls
+  back to the normal gate, as do `env` options, `-u` of a hook variable,
+  anything between `sandbox-exec` and the shell, relative paths, and Linux
+  `bwrap`. The normal gate still blocks these, as before. This includes
+  user-defined `sandbox.setEnvVars` and an inherited `JAVA_TOOL_OPTIONS` with
+  a non-default value.
+
+### Fixed — npm install no longer breaks when the install path contains `$`
+
+- **`npm install lean-ctx-bin` into a path such as `cache_$HOME_bin` ran the
+  wrong command** (#1838). `postinstall.js` built shell strings like
+  `"<binary>" onboard`, and a double-quoted `$…` is still expanded by the shell,
+  so the binary path was rewritten before it ran. `onboard` and the pre-install
+  `stop` now go through `execFileSync` with an argv array.
+- The same applies to the remaining commands that carried a path or URL: the
+  curl download, the GitHub API lookup, the Windows `stop` and the Windows `tar`
+  extraction. None of them go through a shell anymore.
+- `postinstall.dollar.test.cjs` now runs in CI next to the stdio test (skipped
+  on Windows, where the shebang fixture cannot run).
+
+### Fixed — lean-ctx builds on FreeBSD again, without relying on `renameat2`
+
+- **The FreeBSD build stopped at `engine_artifact/unix.rs`** with
+  `cannot find value result` (#1828, reported with a patch by @yurivict).
+  Engine artifacts are published with a rename that must never replace an
+  existing file; only Linux (`renameat2`) and macOS (`renameatx_np`) had one,
+  and the fallback branch for every other Unix did not compile.
+- The fix does not call `renameat2` by syscall number: FreeBSD only has it
+  since 16.0, and an unknown syscall on 14.x/15.x raises SIGSYS and kills the
+  process. Targets without a native no-replace rename now link the new name
+  (`linkat` fails with `EEXIST` if it exists, on every POSIX system) and then
+  remove the temporary name. A file system without hard links is reported as
+  unsupported by the existing capability probe instead of failing mid-publish.
+
 ### Fixed — account sync is available again in the public build
 
 - **`login`, `register`, `sync`, `cloud` and `contribute` answered "unavailable"
