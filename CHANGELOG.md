@@ -43,6 +43,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - `postinstall.dollar.test.cjs` now runs in CI next to the stdio test (skipped
   on Windows, where the shebang fixture cannot run).
 
+### Security — the shell allowlist checks the command a wrapper really runs
+
+- **An option value of a delegation wrapper was taken for the delegated
+  command.** For `env`, `sudo`, `doas`, `nice`, `timeout` and `xargs` the
+  allowlist skipped each `-x` word on its own, so the value that followed it
+  (`-u NAME`, `-s SIGNAL`, `-I REPLACE`, …) was checked in place of the command
+  that actually runs, and that command never reached the allowlist or the
+  inline-code check. Each wrapper's options are now parsed with the argument
+  they take — attached or separate, short clusters, GNU long-option prefixes,
+  `--`, `timeout`'s duration operand, `env -S` split strings — and the check
+  applies to the real command.
+- The side effect ran the other way too: `env -u HOME git status` was blocked
+  because `HOME` looked like the command. It is allowed now.
+- `command` and `builtin` run the word after them, but as shell builtins they
+  skipped every check. They are now walked like the other wrappers;
+  `command -v`/`-V` still only look a name up.
+- A wrapper can no longer reach `eval`, `exec` or `source`, which stay
+  blocked regardless of the allowlist.
+- Wrappers nested more than three deep used to end the check silently; they
+  are now refused.
+- Commands inside a shell function body now get the inline-code and
+  dangerous-flag checks, not only the allowlist lookup.
+
+### Fixed — secret redaction stays on its line and leaves `*****` masks alone (#1830, #1831)
+
+- **A keyword with no value redacted the next line.** When a line ended in
+  `token:` or `password =`, the blank after the separator also matched the line
+  break, so the first word of the following line was treated as the value. In
+  a diff that was the `+`/`-` marker; in YAML the nested key was replaced
+  while its value stayed visible. All key/value rules, in both `ctx_read`
+  redaction and secret detection, now allow only spaces and tabs around the
+  separator; `Bearer` and `Authorization:` likewise stay on their line.
+  Reported by @andig (#1830).
+- **Asterisk masks such as `password: *****` were redacted.** They are what a
+  redactor writes in place of a secret, not a secret. Replacing them broke
+  `full` reads as an edit source: `replace_unique` built from the view did not
+  find the text on disk. An all-asterisk value now counts as a placeholder.
+  Reported by @andig (#1831).
+
 ### Fixed — lean-ctx builds on FreeBSD again, without relying on `renameat2`
 
 - **The FreeBSD build stopped at `engine_artifact/unix.rs`** with
