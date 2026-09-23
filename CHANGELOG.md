@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [3.10.3] — 2026-09-22
+
 ### Fixed — account sync is available again in the public build
 
 - **`login`, `register`, `sync`, `cloud` and `contribute` answered "unavailable"
@@ -54,8 +56,6 @@ release.
   can drop a single key or every key but the caller's own.
 - `last_used_at` is finally written (at most hourly, best-effort), so a key
   that stops being used is now visible as such.
-
-## [3.10.3] — 2026-09-22
 
 ### Fixed — a `grep` pattern is no longer silently reinterpreted (#1827)
 
