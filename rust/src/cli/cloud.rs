@@ -1,21 +1,5 @@
 use crate::{cloud_client, core};
 
-fn hosted_research_enabled() -> bool {
-    std::env::var("LEAN_CTX_EXPERIMENTAL_HOSTED").as_deref() == Ok("1")
-}
-
-fn require_hosted_research() -> bool {
-    if hosted_research_enabled() {
-        return true;
-    }
-
-    eprintln!(
-        "Hosted account operations are Research and unavailable in the public LeanCTX Runtime. \\
-         Local context tooling continues to work without an account. Set LEAN_CTX_EXPERIMENTAL_HOSTED=1 only for a local development evaluation."
-    );
-    false
-}
-
 fn mask_email(email: &str) -> String {
     match email.split_once('@') {
         Some((local, domain)) if local.len() > 2 => {
@@ -102,9 +86,6 @@ fn save_and_report(r: &cloud_client::RegisterResult, email: &str) {
 }
 
 pub fn cmd_login(args: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     let (email, pw) = require_email_and_password(args, "lean-ctx login <email> [--password <pw>]");
 
     println!("Logging in to LeanCTX Cloud...");
@@ -133,9 +114,6 @@ pub fn cmd_login(args: &[String]) {
 }
 
 pub fn cmd_forgot_password(args: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     let (email, _) = parse_auth_args(args);
 
     if email.is_empty() {
@@ -158,9 +136,6 @@ pub fn cmd_forgot_password(args: &[String]) {
 }
 
 pub fn cmd_register(args: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     let (email, pw) =
         require_email_and_password(args, "lean-ctx register <email> [--password <pw>]");
 
@@ -184,9 +159,6 @@ pub fn cmd_register(args: &[String]) {
 }
 
 pub fn cmd_sync(rest: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     if rest.first().map(String::as_str) == Some("index") {
         cmd_sync_index(&rest[1..]);
         return;
@@ -403,11 +375,15 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     CloudSyncOutcome::Done
 }
 
-/// Friendly, non-error hint shown when the server gates cloud sync behind Pro.
-/// Delegates to the central, entitlement-aware hint helper (#346) so the message
-/// reflects the user's actual plan and the cheapest unlocking tier.
+/// Friendly, non-error hint shown when the server gates cloud sync (HTTP 402):
+/// the account is valid but its plan carries no `cloud_sync` entitlement.
+/// Paid plans are application-only, so point at the account page and support
+/// instead of a checkout, and say that nothing local was touched.
 fn print_pro_upgrade_hint() {
-    super::upgrade_hint::hint_for("cloud_sync");
+    println!();
+    println!("Synchronization is not included in this account's plan.");
+    println!("Your local context is unchanged and keeps working.");
+    println!("Plan details: https://leanctx.com/account/billing/ · help: hello@leanctx.com");
 }
 
 fn build_sync_entries(store: &core::stats::StatsStore) -> Vec<serde_json::Value> {
@@ -435,9 +411,6 @@ fn collect_feedback_entries() -> Vec<serde_json::Value> {
 }
 
 pub fn cmd_contribute() {
-    if !require_hosted_research() {
-        return;
-    }
     let mut entries = Vec::new();
 
     // GH #439: mode_stats.json lives in the data dir — read it through the typed
@@ -530,9 +503,6 @@ pub fn cmd_contribute() {
 }
 
 pub fn cmd_cloud(args: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     let action = args.first().map_or("help", std::string::String::as_str);
 
     match action {
@@ -583,8 +553,6 @@ pub fn cmd_cloud(args: &[String]) {
     }
 }
 
-/// `lean-ctx cloud status` — your Personal Cloud, from the terminal. Shows the
-/// same privacy-preserving footprint as leanctx.com/account/cloud: per-bucket
 /// `lean-ctx cloud autosync <on|off|status>` — toggle the daily background
 /// Personal-Cloud push (GL #384). The flag lives in `[cloud] auto_sync`.
 fn cmd_cloud_autosync(arg: Option<&str>) {
@@ -682,6 +650,8 @@ fn cmd_cloud_autoindex(arg: Option<&str>) {
     }
 }
 
+/// `lean-ctx cloud status` — your Personal Cloud, from the terminal. Shows the
+/// same privacy-preserving footprint as leanctx.com/account/cloud: per-bucket
 /// counts + last sync, buddy, and the all-time usage totals. Free accounts see
 /// the connection state plus what upgrading unlocks.
 fn cmd_cloud_status() {
@@ -691,7 +661,7 @@ fn cmd_cloud_status() {
         return;
     }
     let email = cloud_client::account_email().unwrap_or_default();
-    println!("Connected to the development-only hosted evaluation as {email}.");
+    println!("Connected to LeanCTX Cloud as {email}.");
 
     let d = match cloud_client::fetch_account_cloud() {
         Ok(d) => d,
@@ -706,7 +676,7 @@ fn cmd_cloud_status() {
 
     if d.get("cloud_sync").and_then(serde_json::Value::as_bool) != Some(true) {
         println!("Personal Cloud sync: locked on this plan.");
-        super::upgrade_hint::hint_for("cloud_sync");
+        print_pro_upgrade_hint();
         return;
     }
 

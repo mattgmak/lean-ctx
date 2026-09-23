@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — account sync is available again in the public build
+
+- **`login`, `register`, `sync`, `cloud` and `contribute` answered "unavailable"
+  unless `LEAN_CTX_EXPERIMENTAL_HOSTED=1` was set.** The gate was meant for
+  unreleased hosted research, but it also covered the account sync that paying
+  customers already use. A Pro account on a current build therefore had no
+  sync at all. The gate is gone, and these commands work by default again.
+- `cloud status` now reads "Connected to LeanCTX Cloud as <email>."
+- If your plan does not include synchronization, the message now says so
+  directly. It also confirms that local context is unchanged and points to
+  https://leanctx.com/account/billing/ and hello@leanctx.com, instead of a
+  generic upgrade pitch.
+- The help section `HOSTED RESEARCH` is now `ACCOUNT SYNC` and lists the
+  commands that actually work.
+
 ### Fixed — a silent sign-out no longer looks like being offline
 
 - **Background Personal-Cloud sync treated a rejected credential as a network
