@@ -7,6 +7,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [3.10.3] — 2026-09-22
 
+### Fixed — a task overview no longer lists facts that share only a generic verb (#1832)
+
+- `lean-ctx overview '<task>'` listed any fact that shared a single word with
+  the task as a "relevant fact". A task like "Inspect alpha parser header
+  validation." therefore showed an unrelated fact such as "Inspect and review
+  gamma certificate deployment sequencing." because both contain "inspect".
+  Two unrelated tasks got the same unrelated facts. Only the task's content
+  words are matched now: words like "the", "and", "inspect", "review", "check"
+  or "fix" are ignored, punctuation is trimmed ("validation." matches
+  "validation") and words are split the way facts are indexed. A task made
+  only of such words lists no facts. The sub-agent briefing pack uses the same
+  matching. An explicit `ctx_knowledge` recall still matches every word you
+  pass. Thanks to @rtbe for the isolated reproduction.
+
+### Fixed — Pi: `ctx_shell`'s `timeout` now reaches `lean-ctx -c` (#1833)
+
+- In `pi-lean-ctx`, `ctx_shell(command, timeout=<seconds>)` passed the timeout
+  only to Pi's outer bash tool. The `lean-ctx -c` wrapper inside it kept its
+  default of 120 s. A call with `timeout=200` was therefore stopped after
+  about two minutes with `output truncated at 8 MB / 120s limit`. The
+  per-call timeout is now passed to `lean-ctx -c` as
+  `LEAN_CTX_SHELL_TIMEOUT_MS`, capped at the same one-hour ceiling the MCP
+  `timeout_ms` has. A `LEAN_CTX_SHELL_TIMEOUT_MS` you set yourself still wins,
+  and `raw=true` is unchanged because it does not go through lean-ctx. Thanks
+  to @rtbe for the precise report.
+
+### Fixed — a `jq` program in single quotes is no longer blocked as `source` (#1829)
+
+- A quoted `jq` filter such as `'… | . as $r | …'` was blocked. The block said
+  the command runs `eval`/`exec`/`source` or a substitution. The quick
+  pre-scan for `| . ` and similar separators looked through quotes, so it read
+  jq's identity filter as the shell's `.` (source) builtin. That scan now
+  ignores text inside single quotes. The per-segment check still decides
+  every command, so a real `.` or `source` at command position is still
+  blocked, next to quotes too. The block message now names `source` and `.`.
+  Thanks to @andig for the report and the reproductions.
+
 ### Fixed — Claude Code's Bash sandbox no longer blocks every command (#1834)
 
 - With `sandbox.enabled`, Claude Code spawns each Bash call as
