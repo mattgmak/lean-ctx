@@ -148,10 +148,13 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// This machine's display label for the device overview (GL #387): the
-/// hostname, attached as `X-Device-Label` to every sync push. Display
-/// metadata only — the server treats it as an opaque, sanitized string and
-/// silently skips tracking when it is empty.
+/// This machine's label: the hostname, attached as `X-Device-Label` to every
+/// sync push and sent with `login`/`register`. It began as display metadata for
+/// the device overview (GL #387) and now carries weight — the server scopes the
+/// API key it issues to this label, so a sign-in replaces only this machine's
+/// credential instead of the whole account's. The server still treats it as an
+/// opaque string: it sanitizes it, and falls back to an unlabelled key when it
+/// is empty rather than rejecting the request.
 fn device_label() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
@@ -262,7 +265,9 @@ pub struct RegisterResult {
 
 pub fn register(email: &str, password: Option<&str>) -> Result<RegisterResult, String> {
     let url = format!("{}/api/auth/register", api_url());
-    let mut body = serde_json::json!({ "email": email });
+    // The label names the key this call issues, so the account page can tell
+    // one machine from another. Keys are per-device and additive.
+    let mut body = serde_json::json!({ "email": email, "device_label": device_label() });
     if let Some(pw) = password {
         body["password"] = serde_json::Value::String(pw.to_string());
     }
@@ -319,7 +324,11 @@ pub fn forgot_password(email: &str) -> Result<String, String> {
 
 pub fn login(email: &str, password: &str) -> Result<RegisterResult, String> {
     let url = format!("{}/api/auth/login", api_url());
-    let body = serde_json::json!({ "email": email, "password": password });
+    let body = serde_json::json!({
+        "email": email,
+        "password": password,
+        "device_label": device_label(),
+    });
 
     let resp = ureq::post(&url)
         .header("Content-Type", "application/json")

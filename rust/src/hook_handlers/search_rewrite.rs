@@ -15,7 +15,8 @@ pub(super) fn rewrite_search_command(cmd: &str, binary: &str) -> Option<String> 
     match parts.first().map(String::as_str) {
         // fgrep uses fixed-string matching; lean-ctx grep is regex-only → always -c wrap
         Some("fgrep") => None,
-        Some("grep" | "egrep") => rewrite_grep(&parts, binary),
+        Some("grep") => rewrite_grep(&parts, binary, PatternDialect::Basic),
+        Some("egrep") => rewrite_grep(&parts, binary, PatternDialect::Extended),
         Some("rg") => rewrite_rg(&parts, binary),
         Some("Select-String" | "sls") => rewrite_select_string(&parts, binary),
         _ => None,
@@ -54,11 +55,57 @@ const GREP_VALUE_FLAGS: &[&str] = &[
     "--context",
 ];
 
+/// Which regex dialect the invoked binary applies to its pattern.
+///
+/// `lean-ctx grep` compiles patterns with the Rust `regex` crate, whose syntax
+/// matches POSIX *extended* regular expressions closely enough to hand a
+/// pattern over verbatim. POSIX *basic* regular expressions — what plain
+/// `grep` uses — invert the meaning of seven metacharacters, so the same
+/// pattern text means something different on each side.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternDialect {
+    /// Plain `grep`: POSIX BRE, where `\|` alternates and a bare `|` is literal.
+    Basic,
+    /// `egrep`: POSIX ERE, which the Rust `regex` crate accepts as-is.
+    Extended,
+}
+
+/// Metacharacters whose meaning flips between POSIX BRE and the Rust `regex`
+/// crate — in *both* directions.
+///
+/// In BRE the escaped form is the operator and the bare form is a literal;
+/// `regex` reads it the other way round. Handing such a pattern to
+/// `lean-ctx grep` verbatim therefore does not fail loudly, it silently
+/// answers a different question (#1827):
+///
+/// * `grep 'a\|b'`  — BRE alternation, read by `regex` as the literal `a|b`
+///   → a real match is reported as `0 matches` (the reported symptom).
+/// * `grep 'a|b'`   — BRE literal `a|b`, read by `regex` as alternation
+///   → lines that native grep never matches are reported as hits.
+///
+/// Both are wrong answers that look like right ones, which is worse than an
+/// error. Declining the rewrite sends the command through the `lean-ctx -c`
+/// wrap instead, where the platform's own grep resolves the pattern — the same
+/// escape valve `fgrep` and the semantic flags (`-i`, `-w`, `-F`, …) already use.
+const BRE_AMBIGUOUS_METACHARS: &[char] = &['|', '+', '?', '(', ')', '{', '}'];
+
+/// True when `pattern` cannot be handed to `lean-ctx grep` without changing
+/// what it means.
+fn dialect_is_ambiguous(pattern: &str, dialect: PatternDialect) -> bool {
+    // ERE and the `regex` crate agree on these seven, escaped and bare alike.
+    if dialect == PatternDialect::Extended {
+        return false;
+    }
+    pattern
+        .chars()
+        .any(|c| BRE_AMBIGUOUS_METACHARS.contains(&c))
+}
+
 /// Rewrites `grep [-nirlcwHRs] [--include=...] <pattern> [path...]` to
 /// `lean-ctx grep <pattern> [path]`. Complex invocations (pipes as stdin,
 /// unsupported flags, multiple paths) fall through to the `lean-ctx -c` wrap
 /// via the `is_rewritable` fallback.
-fn rewrite_grep(parts: &[String], binary: &str) -> Option<String> {
+fn rewrite_grep(parts: &[String], binary: &str, dialect: PatternDialect) -> Option<String> {
     let mut pattern: Option<String> = None;
     let mut path: Option<String> = None;
     let mut has_context_flags = false;
@@ -120,6 +167,12 @@ fn rewrite_grep(parts: &[String], binary: &str) -> Option<String> {
     }
 
     let pattern = pattern?;
+
+    // A BRE pattern whose meaning would change under the Rust `regex` crate
+    // must not be handed to `lean-ctx grep` — see `BRE_AMBIGUOUS_METACHARS`.
+    if dialect_is_ambiguous(&pattern, dialect) {
+        return None;
+    }
 
     if has_context_flags {
         return None;

@@ -372,16 +372,17 @@ GRAPH (project analysis):
     lean-ctx graph symbol <spec>   Inspect a symbol (format: <file>::<symbol>, or bare <symbol>)
     lean-ctx graph context <query> Query the property graph for a concept
 
-HOSTED RESEARCH (unavailable unless LEAN_CTX_EXPERIMENTAL_HOSTED=1):
-    cloud status                   Development-only hosted status check
-    cloud upgrade                  Unavailable: hosted plans are not a public product path
-    login <email>                  Development-only account evaluation
-    register <email>               Development-only account evaluation
-    forgot-password <email>        Development-only account evaluation
-    sync                           Development-only hosted sync evaluation
-    sync index <push|pull|status>  Development-only hosted-index evaluation
-    cloud autosync <on|off|status> Development-only background-sync evaluation
-    contribute                     Development-only data-contribution evaluation
+ACCOUNT SYNC (accounts under an existing agreement; local tooling needs no account):
+    login <email>                  Sign in to your LeanCTX account on this machine
+    register <email>               Create a LeanCTX account
+    forgot-password <email>        Send a password reset email
+    sync                           Sync stats, plus your context when your plan includes synchronization
+    sync index <push|pull|status>  Encrypted cross-device retrieval index
+    cloud status                   Show account, plan and last sync
+    cloud pull                     Restore your synchronized knowledge onto this machine
+    cloud autosync <on|off|status> Daily background push of your synchronized context
+    cloud upgrade                  Unavailable: paid plans are application-only (hello@leanctx.com)
+    contribute                     Share anonymized compression data
 
 TROUBLESHOOTING:
     Commands broken?     lean-ctx-off             (fixes current session)

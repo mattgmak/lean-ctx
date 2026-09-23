@@ -82,7 +82,6 @@ mod theme_cmd;
 mod tools_health_cmd;
 mod triage_cmd;
 mod trust_cmd;
-mod upgrade_hint;
 mod value_report;
 mod verify_cache_cmd;
 mod verify_cmd;

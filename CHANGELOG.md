@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [3.10.3] — 2026-09-22
+
 ### Fixed — a task overview no longer lists facts that share only a generic verb (#1832)
 
 - `lean-ctx overview '<task>'` listed any fact that shared a single word with
@@ -117,6 +119,488 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   find the text on disk. An all-asterisk value now counts as a placeholder.
   Reported by @andig (#1831).
 
+### Fixed — lean-ctx builds on FreeBSD again, without relying on `renameat2`
+
+- **The FreeBSD build stopped at `engine_artifact/unix.rs`** with
+  `cannot find value result` (#1828, reported with a patch by @yurivict).
+  Engine artifacts are published with a rename that must never replace an
+  existing file; only Linux (`renameat2`) and macOS (`renameatx_np`) had one,
+  and the fallback branch for every other Unix did not compile.
+- The fix does not call `renameat2` by syscall number: FreeBSD only has it
+  since 16.0, and an unknown syscall on 14.x/15.x raises SIGSYS and kills the
+  process. Targets without a native no-replace rename now link the new name
+  (`linkat` fails with `EEXIST` if it exists, on every POSIX system) and then
+  remove the temporary name. A file system without hard links is reported as
+  unsupported by the existing capability probe instead of failing mid-publish.
+
+### Fixed — account sync is available again in the public build
+
+- **`login`, `register`, `sync`, `cloud` and `contribute` answered "unavailable"
+  unless `LEAN_CTX_EXPERIMENTAL_HOSTED=1` was set.** The gate was meant for
+  unreleased hosted research, but it also covered the account sync that paying
+  customers already use. A Pro account on a current build therefore had no
+  sync at all. The gate is gone, and these commands work by default again.
+- `cloud status` now reads "Connected to LeanCTX Cloud as <email>."
+- If your plan does not include synchronization, the message now says so
+  directly. It also confirms that local context is unchanged and points to
+  https://leanctx.com/account/billing/ and hello@leanctx.com, instead of a
+  generic upgrade pitch.
+- The help section `HOSTED RESEARCH` is now `ACCOUNT SYNC` and lists the
+  commands that actually work.
+
+### Fixed — a silent sign-out no longer looks like being offline
+
+- **Background Personal-Cloud sync treated a rejected credential as a network
+  problem.** `classify_outcomes` special-cased only HTTP 402 (the Pro gate);
+  an HTTP 401 fell through to `NetworkFailure`, which prints nothing and
+  deliberately leaves the day's sync slot open so the next cycle retries. A
+  machine whose API key had been revoked therefore retried forever, in
+  silence, while the user had every reason to believe sync was working.
+- Added `AutoSyncOutcome::Unauthenticated`, ranked above the Pro gate: a dead
+  credential makes every other signal moot. It prints once per process, says
+  that local data and server data are both intact, and names the fix
+  (`lean-ctx login`).
+- The slot rule is now the named predicate `consumes_daily_slot`, so "only a
+  network failure leaves the slot open" is stated in one place and tested.
+- `login` and `register` now send a device label, so the server can bind the
+  key it issues to this machine rather than to the account.
+
+### Fixed — logging in no longer signs out your other machines (server-side)
+
+Deployed with the Cloud API, so this reaches accounts independently of the CLI
+release.
+
+- **Every `login` deleted *all* of the account's API keys and issued one
+  replacement.** Signing in on a laptop — or merely opening the web account
+  page — silently revoked the key the desktop was syncing with. The desktop
+  then hit HTTP 401 forever, which the bug above rendered invisible.
+- API keys are now scoped to a device label. Signing in on a machine replaces
+  only that machine's key; other machines keep syncing. Keys are capped per
+  account, evicting the least recently used.
+- Revoking is explicit: the account page's **Forget** button now revokes that
+  device's key as well as its sync history, and `POST /api/auth/keys/revoke`
+  can drop a single key or every key but the caller's own.
+- `last_used_at` is finally written (at most hourly, best-effort), so a key
+  that stops being used is now visible as such.
+
+### Fixed — a `grep` pattern is no longer silently reinterpreted (#1827)
+
+- **The `PreToolUse` shell hook rewrote `grep` onto `lean-ctx grep` while
+  passing the pattern through verbatim — but the two sides do not speak the
+  same regex dialect.** Plain `grep` applies POSIX *basic* regular expressions,
+  where `\|` alternates and a bare `|` is a literal. `lean-ctx grep` compiles
+  with the Rust `regex` crate, which reads those exactly the other way round.
+- The report was a false negative: `grep -n "headroom\|HEADROOM" db.py` on a
+  file containing both answered `0 matches for 'headroom\|HEADROOM' in 1 files`
+  and exited 1. The same defect runs the other way too — `grep -n "a|b"` is a
+  literal search in BRE, but the rewrite reported every line containing `a` or
+  `b`. Seven metacharacters flip meaning this way: `|` `+` `?` `(` `)` `{` `}`.
+- Both directions produced a *wrong answer that looks like a right one*, with
+  no error to notice, which is the shape that matters for anyone scripting
+  against the output.
+- A `grep` invocation whose pattern contains one of those seven now declines
+  the rewrite and falls through to the `lean-ctx -c` wrap, where the platform's
+  own grep resolves the pattern — the same escape valve `fgrep` and the
+  semantic flags (`-i`, `-w`, `-F`, …) already used. Output is still
+  compressed; only the matching is handed back.
+- `egrep` and `rg` keep the fast path: POSIX *extended* regular expressions and
+  the Rust `regex` crate agree on all seven. So does a plain `grep` pattern that
+  contains none of them.
+- **Not a Windows defect.** The report came from Git Bash on Windows 11, but the
+  cause is platform-independent and reproduces identically on macOS and Linux.
+
+### Fixed — the proxy no longer forwards conversations it has emptied (#1789)
+
+- **On every forwarded route the proxy replaced each live-zone message with an
+  empty string.** Upstream received only the system message, so the model
+  answered a conversation it could not see — HTTP 200 on both sides, no error
+  anywhere, which is what let it ship in two releases.
+- The cause is a category error, not a faulty compressor. `compress_live_prose`
+  passes a task hint, which selects `CompressionStrategy::Aggressive`, and that
+  strategy *drops* any paragraph carrying neither a task nor a technical
+  keyword. Sound for a document, where the surviving sections still carry the
+  meaning; a chat turn is a single paragraph, so dropping its only section
+  deletes the message. `compress_text` then accepted the empty result because it
+  was shorter — exactly what a compressor is supposed to prefer.
+- Only the system turn survived, because `detect_live_zone` pins the frozen
+  boundary to `last_system + 1`. English technical conversations largely escaped
+  too, since they happen to hit the hardcoded keyword list, which is why a
+  French-language report is what finally surfaced it.
+- None of the three existing guards could observe this: the determinism guard
+  snapshots before the pipeline runs, the pipeline's guard proves the *cache
+  prefix* stable (untouched by emptying the live zone), and the savings floor
+  only reverts compressions that save too little — deleting all content sails
+  through as a perfect saving.
+- Fixed at three levels: conversation turns are pinned to
+  `CompressionStrategy::Light`; `compress_with_strategy` refuses to turn
+  non-empty input into empty output; and a new `destroys_content` invariant
+  reverts every stage when a message that arrived with text comes out empty,
+  covering both wire shapes (string content and block arrays). Tool output keeps
+  its section-dropping compressor, where whole-message deletion is not possible.
+
+### Fixed — a sub-agent is never served a cache stub it cannot resolve (#1801, #1804)
+
+- **Sub-agents silently received references to content they had never seen.** On
+  their first read of anything the parent had touched they got a
+  `[cross-agent cache · … tokens avoided]` or `unchanged, already in context`
+  stub instead of the data. Nothing in the stub signalled the loss, so an agent
+  that did not notice proceeded as if the file or directory were empty.
+- Two layers rested on one premise that is false in Claude Code. `subagent_scope`
+  resolves `proc:{pid}-{ts}` once per process on the reasoning that "each MCP
+  connection is a separate stdio process" — but Claude Code sub-agents reuse the
+  parent's connection and spawn no lean-ctx process, so parent and sub-agent
+  resolve the *identical* scope. And the content-dedup ledger is process-global
+  and keyed on path alone; `check_content` takes no session, conversation or
+  agent argument at all.
+- Both now fail closed, reusing the rule `multiple_conversations_recent` already
+  established for concurrent chats: when a matching id cannot be trusted to name
+  *this* caller, nothing is provably in context, so no stub is served.
+  Re-delivering costs tokens; delivering a dangling reference costs the caller
+  its data.
+- Scopes that do name one agent — Cursor's `task:` and an explicit `custom:`
+  override — keep deduplicating, as does the legacy transcript path where one
+  daemon serves one conversation.
+- Withheld stubs are recorded as misses, not hits, so `tools health` cannot
+  report savings that were not made.
+- Tests also stop inheriting the developer's ambient agent environment: running
+  the suite inside Claude Code resolved a `proc:` scope for every test and 31 of
+  them failed, while the same tests passed in CI where `CLAUDECODE` is unset.
+
+### Fixed — git decides corpus membership, not a leading dot (#1792)
+
+- **`lean-ctx find` returned nothing for a tracked dotfile** or a tracked file
+  under a hidden directory, while `ctx_glob` found the very same paths. The BM25
+  and graph corpus builders excluded them too, so `ctx_compose` and
+  `ctx_overview` answered "no match" for code that was present and tracked — an
+  incomplete index is indistinguishable from an empty result.
+- The walkers disagreed with no stated rule between them: `ctx_glob`,
+  `ctx_search` and one of the two walks in `search_index.rs` included hidden
+  paths; `find`, the other walk in that same file, BM25 and both graph walks
+  excluded them. `find` had no flag to change it, though `ls` has had `--all`
+  all along.
+- The rule now lives in `walk_filter` as `SKIP_HIDDEN_IN_CONTENT_WALK` with its
+  reasoning attached. A leading dot is a display convention, not a relevance
+  signal — `.github/`, `.agents/` and `.config/` routinely hold source-owned
+  automation a repository genuinely tracks.
+- Deliberately not a config key: a corpus that silently omits tracked files is a
+  correctness bug, not a preference.
+- Scope is content walks only. `ctx_tree` still hides dotfiles behind `--all`,
+  because a listing rendered for a person is where that convention belongs.
+- Two boundaries verified rather than assumed, both tested: `.gitignore` still
+  decides, so an ignored dotfile stays excluded; and `keep_entry` still prunes
+  `.claude` / `.cursor` and the other agent-copy directories (#1480).
+
+### Fixed — `auto_capture = false` is enforced at the store, not at each producer (#1802)
+
+- **With `auto_capture = false`, machine-derived facts kept appearing**, and
+  deleting them from `knowledge.json` did not help: one MCP call brought every
+  one back carrying its *original* `created_at`. A curated store could not be
+  kept clean — 11 curated facts against 150+ machine entries.
+- There are two producers of automatic facts and the flag reached only one.
+  `auto_capture::capture_finding` checks `is_enabled()`;
+  `session::state::extract_session_facts` does not, and it is reached from
+  `session::persistence::persist_session_facts` — the session save path, which
+  is why a single tool call sufficed. The stale dates came from
+  `auto_session_fact` copying the finding's own timestamp: the facts were
+  re-materialised from `sessions/<id>.json`, not re-derived.
+- The guard now sits at the store's ingestion points, `add_fact` and `remember`.
+  A check at a call site only covers the call sites that exist when it is
+  written — which is exactly how this defect arose. At the store, a producer
+  added later cannot bypass it.
+- The refusal sits before the coalescing branch, so a disabled run cannot even
+  refresh `last_confirmed` on facts an earlier enabled run left behind; they
+  would otherwise look perpetually fresh and never age out.
+- Session state is deliberately untouched: it is ephemeral, capped at
+  `MAX_FINDINGS`, and backs handoff, recap and metrics — none of which this key
+  claims to disable. Existing `auto:*` facts are not deleted either; removing
+  someone's data on a config flag is not this change's call. They can now be
+  deleted by hand and stay deleted, which before they did not.
+
+### Fixed — `ctx_shell` no longer fails outright on Windows hosts that validate env names (#1799)
+
+- **Every `ctx_shell` call failed before the command ran**, with
+  `Invalid bash env name: "COMMONPROGRAMFILES(X86)"`.
+- The Pi extension builds its own bash tool instances and forwards the whole
+  inherited environment through their spawn hook. Windows has carried
+  `ProgramFiles(x86)` / `CommonProgramFiles(x86)` since forever, and hosts
+  commonly validate names against `^[A-Za-z_][A-Za-z0-9_]*$` — the parentheses
+  are rejected, so the spawn was refused for *every* command, whether or not it
+  touched those variables.
+- The engine's MCP `ctx_shell` worked on the same machine because it runs
+  through lean-ctx's own executor and never hands the environment to a
+  validating host. That contrast is what located the defect in the wrapper
+  rather than in the engine.
+- Names outside the POSIX identifier shape are now dropped at that boundary, in
+  both spawn hooks, since `raw` bypasses lean-ctx but still spawns through the
+  host. Filtering here rather than in `leanCtxEnv` keeps the complete
+  environment for the MCP bridge and the engine's executor, which do not
+  validate. The filter runs last over the merged result, so it also covers
+  config-supplied `forwardedEnv`.
+- Dropping these names costs nothing in practice: a POSIX shell cannot expand
+  `$ProgramFiles(x86)` by name anyway, so the value was only ever reachable
+  through `env`/`printenv`.
+
+### Fixed — instruction files are classified by file, not by parent directory (#1794)
+
+- **`ctx_read(mode="map")` on ordinary TypeScript under a skill directory was
+  overridden to `full`** and answered with a large, truncated dump. The caller
+  lost both the structural map it asked for and the tail of the file, and the
+  workaround — guessing line windows — requires already knowing which sections
+  matter.
+- `is_instruction_file` matched on path *substrings*: any path containing
+  `/skills/`, `/.cursor/rules/` or `/.claude/rules/` counted, whatever the file
+  was. A skill ships its instructions as documents and its implementation as
+  source, so `.ts`, `.py`, `.rs` and `.sh` beneath one are ordinary code.
+- Classification is now by file: instruction documents by name anywhere, and
+  inside an instruction directory only document extensions (md, mdc, markdown,
+  txt, rst, adoc) or no extension at all — rule files are routinely named
+  without one, and no language ships source that way.
+- Also drops the redundant `lower.contains("/agents.md")`, which the filename
+  match already covers and which would additionally have matched a *directory*
+  named `agents.md`.
+- #1584 fixed a bounded mode being widened to `full` for instruction files; this
+  fixes the classification that decided what an instruction file is.
+
+### Fixed — `ctx_grep` bounds how wide a result line may be, not just how many (#1650)
+
+- **`limit: 1` with `context: 0` returned an entire minified JSON line** — a
+  ~100 KB payload for one match, almost all of it unrelated content that
+  happened to share the line. `limit` caps how many matches come back; nothing
+  capped how wide each one is, and the only size guard was a 512 KB cap on the
+  whole output, far above any single line.
+- ripgrep bounds this natively and, unlike a slice applied afterwards, knows
+  where the match sits, so it does the cutting: `-M/--max-columns` with
+  `--max-columns-preview`. The truncation is therefore explicit in the output
+  rather than a silently short answer, which is what made the original behaviour
+  hard to notice.
+- Recovery needs no new machinery: `path:line:` is still printed, so the full
+  line is one `ctx_read(path, mode="lines:N-N")` away. The new `maxLineChars`
+  parameter raises the budget and `0` removes it. 400 bytes comfortably fits a
+  real source line while keeping a minified blob out of the context window.
+- Measured against the reporter's fixture (a 100 KB single-line JSON): the same
+  search drops from 100042 to 434 bytes of output.
+
+### Fixed — the documented bare `-N` tail mode now works (#1813)
+
+- **The schema has advertised `-N=tail` all along, but only `lines:-N` was ever
+  implemented.** `mode="-3"` failed to parse as a mode and was answered with the
+  *head* of the file — no header, no warning, no sign that the requested view was
+  not the one delivered.
+- That is the worst of the available answers. On a 165-line file the reporter got
+  lines 1..~140 and then the token cap, so the tail was unreachable through the
+  mode that exists to reach it, and the truncation notice made a wrong answer
+  look like a size problem.
+- The rule lives beside `ReadMode`, which owns mode spelling, and canonicalizes
+  to the single internal form. Both entry points call it — the MCP handler and
+  `lean-ctx read` — because fixing only the MCP path would have left
+  `lean-ctx read --mode -3` still answering with the head, and two surfaces
+  disagreeing about a documented mode is how this class of defect starts.
+- Only a pure `-<digits>` payload is rewritten. `-x`, `-3-5`, `--3` and a bare
+  `-` still reach the normal unknown-mode handling instead of being silently
+  reinterpreted — the very failure this removes.
+
+### Fixed — `inline` gets the verbatim turn budget it shares with `raw` (#1812)
+
+- **`ctx_shell(inline=true)` truncated at ~4k tokens with no archive id, no path
+  and no `ctx_expand` reference.** The same command with `raw=true` returned all
+  4251 tokens. The tail was simply gone, and the notice pointed at a
+  file-oriented tool that needs a path command output does not have.
+- #1582 gave verbatim requests the larger turn budget precisely because the
+  ordinary backstop made a documented recovery path unreachable above ~16 KB.
+  `verbatim_requested` recognised `raw = true` and `mode = "raw"` but not
+  `inline = true`, although the schema calls that one "return verbatim output
+  inline" — the same request in different words.
+- The omission also removed the recovery route rather than merely shortening the
+  answer: the archive line is produced on the *compressed* path, which `inline`
+  skips by definition. Adding `inline` to the verbatim set fixes both halves —
+  the output fits, so no cut happens and no recovery line is needed.
+- Recorded because it is still true: `archive.inline_max_bytes` is referenced
+  only in the schema description and read nowhere in the code, so the "larger
+  output uses the archive/firewall" half of that sentence is unimplemented.
+
+### Fixed — the `ctx_shell` guard messages state the rule that actually fires (#1814, #1815)
+
+- **"never modifies project files" was false.** The write-redirect and tee
+  guards claimed `ctx_shell` is read-only for project files, while `cp`, `mkdir`,
+  `touch`, `rm -rf`, `git commit` and `git worktree add` all pass unblocked in
+  the same session. The rule that fires is narrower: no output *capture* (`>`,
+  `>>`, `| tee`, heredoc-write, download-to-file) into a project path, because
+  `ctx_shell` compresses what it returns and the captured bytes may not be the
+  command's own (#1303).
+- The overclaim cost twice over: it sent callers to native Write for a plain `cp`
+  that `ctx_shell` would have run, and it offered a safety property that does not
+  hold. All four messages now name the capture rule and say explicitly that other
+  commands are not restricted.
+- **A `$var` command word is a correct split, not a mis-split.** The diagnostic
+  blamed lean-ctx's parser, told the caller not to trust the split, suggested
+  re-quoting, and asked for a bug report — for behaviour working as designed;
+  `$var-as-command` is listed under ANTIPATTERN in the tool description, and no
+  quoting makes a variable command gateable. A `$`-prefixed base now gets its own
+  message explaining that the name is only known at run time and naming the form
+  that works. The genuine mis-split guidance stays for tokens that really are not
+  command names (#1646), with a test pinning both halves.
+
+### Fixed — a relative redirect target is judged where the command actually runs (#1811)
+
+- **The write guard says "the destination decides", then refused every relative
+  target without resolving it.** `cwd=<scratch> … > probe.txt` was blocked while
+  the identical `> <scratch>/probe.txt` was allowed — same destination, opposite
+  verdicts, under a message naming a rule it had not applied.
+- A relative target is now placed against the directory the command runs in. That
+  narrows as often as it widens: a relative target under a project cwd resolves
+  *into* the project and is refused on the same rule as an absolute one, instead
+  of by accident of its spelling.
+- The directory is the resolved one, not the `cwd` argument. A jail-rejected
+  `cwd` is silently replaced with the project root, so judging the raw argument
+  would let a caller name an out-of-project scratch dir, have the guard approve
+  `> probe.txt` against it, and then have the command run in the project root and
+  write there. `ctx_shell` resolves the run directory once and feeds the same
+  value to the guard and to the run. Without a session the directory is unknown
+  and the guard keeps its stricter earlier refusal.
+- Only the caller-supplied `cwd` is followed; an in-command `cd` is not. Deciding
+  the effective directory from command text means getting `cd a && cd b`,
+  conditional and quoted forms all right, and an error there would grant a write
+  the guard means to refuse.
+
+### Fixed — `[[ … ]]` is treated as a conditional construct, not a command (#1793)
+
+- **`ctx_shell` rejected ordinary read-only verification commands that used a
+  bash conditional**, e.g. `git status --short; if [[ -n x ]]; then …` →
+  `'[[' is not in the shell allowlist`.
+- Two independent defects, both needed for the reported shapes. `[[` was missing
+  from `SHELL_BUILTINS`, although its POSIX equivalents `test` and `[` were
+  already members and it is bash conditional *syntax* evaluated by the shell
+  itself. And `split_on_operators` shielded `( … )` and `{ … }` but had no notion
+  of `[[ … ]]`, so the `&&` inside a condition split the conditional into
+  fragments that resolve to no real command.
+- Both delimiters must be standalone words to take effect, mirroring bash.
+  Without that, a glob character class (`ls a[[:alpha:]]`) or an array subscript
+  would open a depth that never closes and would shield the rest of the line from
+  splitting — an under-block, which this walker must never do.
+- The shield is scoped to operator splitting only. It does not widen what may
+  run: a command after the conditional is still its own validated leaf, and a
+  substitution at *command* position stays hard-blocked.
+
+### Fixed — Codex is wired onto the rail its credential authenticates on (#1685)
+
+- **The shell export contradicted the Codex config.** `install_shell_exports`
+  wrote `OPENAI_BASE_URL=…/v1` into every shell rc unconditionally, while
+  `install_codex_env` deliberately writes nothing for a ChatGPT-subscription
+  login — that rail answers a subscription token with
+  `401 … Missing scopes: api.responses.write`, a message about organization roles
+  that names nothing real. The environment overrode the config decision, so the
+  careful answer never took effect and the 401 was what users saw.
+- Every other provider in that block was already gated on auth mode; OpenAI was
+  the only unconditional one. It is now gated the same way in all four shell
+  dialects, with an explanatory comment in place of the export so the omission is
+  visible rather than silent. The rule itself still lives in
+  `codex_uses_chatgpt_login`.
+- **The strip deleted a setting lean-ctx never wrote.**
+  `is_codex_proxy_model_provider_entry` counted `model_provider = "openai"` as
+  one of ours. lean-ctx writes `leanctx-chatgpt`, never `openai`, so that branch
+  could only ever remove a pin the user had set themselves — silently, on every
+  setup pass, with no test covering it. The generated pin is still stripped, so
+  flipping the ChatGPT rail back off still restores native Codex history (#597).
+- #1774 had closed the same report by appending an explanation to the 401 body.
+  Routing the subscription token to the rail it actually authenticates on
+  replaces that explanation with a working path.
+- The new shell tests pin `CODEX_HOME`, because the OpenAI line now depends on
+  Codex's auth state, which `resolve_codex_dir` otherwise reads from the real
+  `~/.codex` — a test that tracked the developer's own login would assert
+  nothing.
+
+### Fixed — the steering profiles say which tools the `ctx_*` mapping governs (#1788)
+
+- **The profiles told the agent "NEVER use built-in Read/Grep/Shell/Glob" and,
+  one line earlier, that the mapping "is NOT optional" — a claim with no stated
+  boundary.** Read literally it swallows every other MCP server's tools, so an
+  agent that takes it seriously stops using tools lean-ctx has no opinion about,
+  and an agent that notices the overclaim learns to discount the rule it was
+  supposed to follow.
+- The boundary is now stated where the rule is: the mapping governs the built-in
+  Read/Grep/Shell/Glob, and "Other MCP servers keep their own jobs."
+- It is paid for, not added. The dedicated rules profile has a hard 2400-char
+  budget (`injected_profiles_stay_lean`) because it costs tokens on every turn.
+  CRITICAL and NEVER stopped saying the same thing twice — and CRITICAL was
+  itself the unbounded claim — so one statement of the rule, with its scope, now
+  costs less than the two overlapping ones did. The profile lands at 2390/2400.
+- `RULES_VERSION` 9 → 10, with the regenerated `LEAN-CTX.md` and
+  `rust/LEAN-CTX.md`.
+- Two tests keep both halves honest:
+  `every_steering_profile_states_what_it_governs` requires every profile to name
+  the built-ins and carry the boundary sentence, and
+  `the_boundary_does_not_weaken_the_built_in_tool_rule` pins the prohibition and
+  MANDATORY MAPPING so the fix cannot be "solved" by deleting the rule.
+
+### Fixed — a stuck session save no longer wedges every later tool call (#1783)
+
+- **#1783 reported every `ctx_*` call hanging at once** — fast tools included,
+  sub-agent calls included — with no self-recovery short of restarting the
+  server. The report could not be reproduced, so the search was for a mechanism
+  that produces exactly that shape: one stuck operation, all tools, permanent.
+- `PreparedSave::write_to_disk` took the per-session file lock with
+  `fs2::lock_exclusive()`, which has no deadline. `resolve_roots_once` calls
+  `session.save()` — that same blocking write — while holding the `tokio` write
+  guard on `self.session`, and it runs pre-dispatch, before the handler watchdog,
+  which returns `None` for `ctx_shell`/`ctx_execute` anyway. `call_tool_guarded`
+  needs `session.read()` for every tool call, tokio's `RwLock` is
+  write-preferring, and the roots probe re-arms itself
+  (`roots_resolved.store(false, …)`) so it is reachable on an ordinary call.
+  Nothing in the process can end that wait: no timeout, no cancellation, no
+  watchdog.
+- **What this is not:** proof of what happened on the reporter's machine. It is a
+  concrete path from "one save cannot get a file lock" to "the whole server is
+  wedged forever", now removed.
+- The fix is the house pattern this file already used twice elsewhere. New
+  `file_lock::acquire_exclusive_timeout` bounds the acquire — the same
+  `try_lock_exclusive` + deadline loop `with_project_index_lock` ran 130 lines
+  above the offending call, now shared rather than duplicated, leaving that call
+  site 14 lines shorter. `write_to_disk` uses it with a 5s deadline; a save that
+  gives up is recoverable, because `save()` restores `unsaved_changes` on `Err`,
+  while a save that waits forever is not. `resolve_roots_once` serializes under
+  the guard (`prepare_save`), drops it, then writes in `spawn_blocking`.
+- `initialize` keeps its synchronous save on purpose — once per connection,
+  before any tool can run, and now bounded — with the reasoning in a comment.
+- Deliberately untouched: `check_idle_expiry`'s untimed guards. They are a
+  candidate, not evidence.
+
+### Added — `bm25_max_files` makes the BM25 corpus cap configurable (#1790)
+
+- The BM25 corpus walk stopped at a hardcoded `MAX_BM25_FILES = 5000` with no
+  config, env or CLI override, while the semantic index chunks the same corpus
+  (#737). On large monorepos — ~19k code files in the reported case —
+  bm25/dense/hybrid search was silently blind to everything past the first 5000
+  files in walk order, since the check fires before `files.sort()`.
+- New `bm25_max_files` key (u64, default 5000, `0` = unlimited), mirroring the
+  `graph_index_max_files` precedent (#206 → #790), with a schema entry and a
+  generated `config-keys.md` row. The cap warning now names the key, so it is
+  discoverable from the output that mentions it.
+
+### Hardened — nested lean-ctx shell spawns are bounded (#1795)
+
+- Nested spawns are capped at `MAX_EXEC_DEPTH = 8` via `LEAN_CTX_EXEC_DEPTH`, as
+  defence in depth against a shell hook re-firing inside a shell lean-ctx itself
+  spawned, which can otherwise fork-bomb the host (observed 2026-09-16).
+
+### Changed — Windows release engines are signed as Thinkery AG (#1820)
+
+- Release builds for `x86_64-pc-windows-msvc` and `x86_64-pc-windows-gnu` are
+  signed through Azure Trusted Signing before packaging, using the
+  `leanctx-public-trust` certificate profile in Switzerland North. Authentication
+  is secretless OIDC against the `windows-signing` GitHub environment — no
+  certificate or key material enters the repository or the runner.
+- Signatures are RFC3161-timestamped (`timestamp.acs.microsoft.com`, SHA256), so
+  they remain valid after the signing certificate expires. A verification step
+  runs `scripts/verify-windows-signature.ps1` on the signed binary, so an
+  unsigned or untimestamped artifact fails the job instead of shipping.
+- **v3.10.3 is the first release to exercise this path.** Unsigned binaries were
+  reported blocked by Smart App Control; whether a signed one passes on a clean
+  Windows 11 machine is tracked in #1825 and is not claimed here. Smart App
+  Control also weighs reputation that accrues with distribution, so a lag after
+  the first signed release would be expected rather than a defect.
+
+## [3.10.2] — 2026-09-16
+
 ### Fixed — the release gate now checks the Agent-Tools-SDK coupling before building
 
 - **v3.10.2's first release run failed on all nine build legs** with `SDK Engine
@@ -142,22 +626,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   verifier, alongside the release-tag, SDK-surface and package-version gates —
   so the contract that pins `release.yml` by digest also names the check that
   guards it. The two `release.yml` digests move with the workflow change.
-
-### Fixed — lean-ctx builds on FreeBSD again, without relying on `renameat2`
-
-- **The FreeBSD build stopped at `engine_artifact/unix.rs`** with
-  `cannot find value result` (#1828, reported with a patch by @yurivict).
-  Engine artifacts are published with a rename that must never replace an
-  existing file; only Linux (`renameat2`) and macOS (`renameatx_np`) had one,
-  and the fallback branch for every other Unix did not compile.
-- The fix does not call `renameat2` by syscall number: FreeBSD only has it
-  since 16.0, and an unknown syscall on 14.x/15.x raises SIGSYS and kills the
-  process. Targets without a native no-replace rename now link the new name
-  (`linkat` fails with `EEXIST` if it exists, on every POSIX system) and then
-  remove the temporary name. A file system without hard links is reported as
-  unsupported by the existing capability probe instead of failing mid-publish.
-
-## [3.10.2] — 2026-09-16
 
 ### Fixed — a transient file lock no longer looks like a content change (#1780)
 
