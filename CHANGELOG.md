@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — `init --help` prints help, and the rules name only tools the agent has (#1849)
+
+- `lean-ctx init --help` (and `-h`) ran a full `init` instead of printing the
+  help text, so a user checking the options rewrote their shell and agent
+  configuration. Both flags now print the usage and change nothing.
+- The session instructions and the injected rules files listed tools that
+  `tools/list` hides. With `disabled_tools = ["ctx_callgraph"]` the agent was
+  still told to use `ctx_callgraph`. With `prefer_native_editor`, or on a
+  native-editor client, it was told "if denied, use ctx_patch". The guidance
+  is now built from the same profile, `disabled_tools` list and client rules
+  that decide `tools/list`, one profile per rules target. The parallel-calls
+  and "ACTUALLY EMIT" lines mention `ctx_compose` only when the profile has
+  it, and the graph anti-pattern names only the graph tools still enabled.
+- The shadow-mode edit line said "native Edit/StrReplace". Codex edits with
+  `apply_patch`, so the line now says "the host's native edit tool". Rules
+  version 11 rewrites the installed files on the next start. The Codex guide
+  no longer tells Codex to use a native `Glob` it does not have.
+  Thanks to @skonebrant for the detailed report.
+
 ### Fixed — `_lc` shims and shell hooks survive package-manager installs and updates (#1851)
 
 - `lean-ctx init --global` wrote the `_lc`/`_lc_compress` PATH shims next to
