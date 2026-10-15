@@ -106,6 +106,21 @@ pub(crate) fn walk_hint(command: &str, cwd: &str) -> Option<String> {
     ))
 }
 
+/// `output` without a trailing hint from [`walk_hint`]. `ctx_shell(raw=true)`
+/// promises verbatim output and already drops its other hints (#2027); the
+/// executor appends this one before it knows the caller's mode.
+pub(crate) fn strip_walk_hint(output: &str) -> &str {
+    match output.rfind("[hint: ") {
+        Some(idx)
+            if output[idx..].contains("walked by grep/find")
+                && output[idx..].trim_end().ends_with("or use ctx_search.]") =>
+        {
+            &output[..idx]
+        }
+        _ => output,
+    }
+}
+
 /// The directories a recursive command was pointed at.
 ///
 /// For a grep-like the first non-flag word is the pattern and the rest are
@@ -114,12 +129,14 @@ pub(crate) fn walk_hint(command: &str, cwd: &str) -> Option<String> {
 fn walk_roots(command: &str, base: &Path) -> Vec<std::path::PathBuf> {
     let mut roots = Vec::new();
     for segment in command.split(|c| matches!(c, '|' | ';' | '&')) {
-        let mut words = segment.split_whitespace().skip_while(|w| w.contains('='));
-        let Some(tool) = words.next() else { continue };
-        let tool = tool.rsplit('/').next().unwrap_or(tool);
-        if !RECURSIVE_TOOLS.contains(&tool) {
+        // #2027: only an invocation that walks contributes roots. A later
+        // `grep` reading stdin (`…; echo x | grep -c x`) names no path, and
+        // treating that as "walks the cwd" blamed directories nothing entered.
+        let Some(tool) = recursive_tool(segment) else {
             continue;
-        }
+        };
+        let mut words = segment.split_whitespace().skip_while(|w| w.contains('='));
+        words.next();
         let is_find = tool == "find";
         let mut operands: Vec<&str> = Vec::new();
         for word in words {
@@ -155,36 +172,36 @@ fn walk_roots(command: &str, base: &Path) -> Vec<std::path::PathBuf> {
             roots.push(base.to_path_buf());
         }
     }
+    // Every walking path was a shell expansion (`"$DIR"`): the walk starts
+    // somewhere under the command directory, the closest honest guess.
     if roots.is_empty() {
         roots.push(base.to_path_buf());
     }
     roots
 }
 
-/// Does this command walk a tree without reading `.gitignore`?
+/// The tool of one pipeline segment when that invocation walks a tree without
+/// reading `.gitignore`: `find`, or a grep-like with its own `-r`/`-R`.
 ///
 /// `rg` is deliberately absent: it honours `.gitignore` already, so a slow `rg`
 /// is not explained by an ignored directory and the hint would mislead.
-fn is_recursive_walk(command: &str) -> bool {
-    for segment in command.split(|c| matches!(c, '|' | ';' | '&')) {
-        let mut words = segment.split_whitespace().skip_while(|w| w.contains('='));
-        let Some(base) = words.next() else { continue };
-        let base = base.rsplit('/').next().unwrap_or(base);
-        if !RECURSIVE_TOOLS.contains(&base) {
-            continue;
-        }
-        // `find` is always recursive; grep-likes need -r/-R.
-        if base == "find" {
-            return true;
-        }
-        if segment
-            .split_whitespace()
-            .any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains(['r', 'R']))
-        {
-            return true;
-        }
+fn recursive_tool(segment: &str) -> Option<&str> {
+    let mut words = segment.split_whitespace().skip_while(|w| w.contains('='));
+    let tool = words.next()?;
+    let tool = tool.rsplit('/').next().unwrap_or(tool);
+    if !RECURSIVE_TOOLS.contains(&tool) {
+        return None;
     }
-    false
+    let recursive = tool == "find"
+        || words.any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains(['r', 'R']));
+    recursive.then_some(tool)
+}
+
+/// Does any invocation in this command walk a tree without reading `.gitignore`?
+fn is_recursive_walk(command: &str) -> bool {
+    command
+        .split(|c| matches!(c, '|' | ';' | '&'))
+        .any(|segment| recursive_tool(segment).is_some())
 }
 
 /// Shallow search for bulk directories, recording each one's bounded file count.
@@ -525,5 +542,48 @@ mod gh1680 {
             &repo.path().to_string_lossy(),
         );
         assert!(hint.is_none(), "{hint:?}");
+    }
+
+    /// GH #2027: the reporter's control table. Each invocation is judged on its
+    /// own: a scoped `grep -r` followed by a stdin-reading `grep` walks only the
+    /// scope, so nothing under the cwd outside it may be named.
+    #[test]
+    fn a_later_stdin_grep_does_not_turn_a_scoped_walk_into_a_cwd_walk() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        for (rel, files) in [
+            (".claude/worktrees/a", 6),
+            ("node_modules/x", 6),
+            ("tariff", 2),
+        ] {
+            let dir = repo.path().join(rel);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            for i in 0..files {
+                std::fs::write(dir.join(format!("f{i}.go")), "x").expect("write");
+            }
+        }
+        let cwd = repo.path().to_string_lossy().to_string();
+
+        for quiet in [
+            "grep -rn 'func mergeRates' tariff",
+            "grep -rn 'func mergeRates' tariff | head -5",
+            "grep -rn 'func mergeRates' tariff; echo done",
+            "grep -n 'func mergeRates' tariff/f0.go; echo helper | grep -c helper",
+            "grep -rn 'func mergeRates' tariff; echo helper | grep -c helper",
+            "grep -rn 'func mergeRates' tariff; ls tariff | grep -c helper",
+            "grep -rn x tariff | grep -v _test",
+        ] {
+            assert!(walk_hint(quiet, &cwd).is_none(), "{quiet}");
+        }
+        // A second invocation that walks the cwd itself still earns the hint.
+        let hint = walk_hint("grep -rn x tariff; grep -rn y .", &cwd).expect("cwd walk");
+        assert!(hint.contains("node_modules/"), "{hint}");
+
+        // raw=true strips exactly that hint and nothing else.
+        let out = format!("tariff/a.go:1:x\n{hint}");
+        assert_eq!(strip_walk_hint(&out), "tariff/a.go:1:x\n");
+        assert_eq!(
+            strip_walk_hint("[hint: something else]"),
+            "[hint: something else]"
+        );
     }
 }

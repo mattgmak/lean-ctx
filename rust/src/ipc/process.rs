@@ -124,7 +124,7 @@ pub fn is_alive(pid: u32) -> bool {
                 return true;
             }
             let mut exit_code: u32 = 0;
-            GetExitCodeProcess(handle, &mut exit_code);
+            GetExitCodeProcess(handle, &raw mut exit_code);
             CloseHandle(handle);
             exit_code == STILL_ACTIVE as u32
         }
@@ -150,11 +150,90 @@ pub fn identity(pid: u32) -> Option<ProcessIdentity> {
     {
         windows_process_identity(pid)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    #[cfg(target_os = "freebsd")]
+    {
+        freebsd_process_identity(pid)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        windows
+    )))]
     {
         let _ = pid;
         None
     }
+}
+
+/// #1947: `kern.proc.pid.<pid>` carries the process start time (`ki_start`),
+/// which a reused PID cannot share, and `kern.proc.pathname.<pid>` the
+/// executable. Without this FreeBSD fell into the fail-closed branch above,
+/// and agent-bus registration refused every tool call.
+#[cfg(target_os = "freebsd")]
+fn freebsd_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+
+    let mut info = std::mem::MaybeUninit::<libc::kinfo_proc>::zeroed();
+    let mut info_len = std::mem::size_of::<libc::kinfo_proc>();
+    let mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // SAFETY: `mib` holds four valid ints, `info` is a writable buffer of
+    // `info_len` bytes, and no new value is written.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_ptr(),
+            4,
+            info.as_mut_ptr().cast(),
+            &mut info_len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 || info_len != std::mem::size_of::<libc::kinfo_proc>() {
+        return None;
+    }
+    // SAFETY: sysctl filled the full structure (checked above).
+    let info = unsafe { info.assume_init() };
+    if info.ki_pid != pid {
+        return None;
+    }
+    let start_marker = u64::try_from(info.ki_start.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000)?
+        .checked_add(u64::try_from(info.ki_start.tv_usec).ok()?)?;
+
+    let mut path = [0_u8; libc::PATH_MAX as usize];
+    let mut path_len = path.len();
+    let mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PATHNAME,
+        pid,
+    ];
+    // SAFETY: `path` is a writable buffer of `path_len` bytes.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_ptr(),
+            4,
+            path.as_mut_ptr().cast(),
+            &mut path_len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 || path_len == 0 {
+        return None;
+    }
+    // The returned length includes the trailing NUL.
+    let bytes = path.get(..path_len)?;
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(ProcessIdentity {
+        start_marker,
+        executable: String::from_utf8_lossy(bytes).into_owned(),
+    })
 }
 
 /// True only when the live process still has the identity captured at
@@ -286,13 +365,20 @@ fn windows_process_identity(pid: u32) -> Option<ProcessIdentity> {
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
     // SAFETY: all output pointers refer to initialized local storage.
-    let times_ok =
-        unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } != 0;
+    let times_ok = unsafe {
+        GetProcessTimes(
+            handle,
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    } != 0;
     let mut path = vec![0_u16; 32_768];
     let mut path_len = u32::try_from(path.len()).ok()?;
     // SAFETY: `path` is a writable UTF-16 buffer and `path_len` describes it.
     let path_ok =
-        unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut path_len) != 0 };
+        unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &raw mut path_len) != 0 };
     // SAFETY: `handle` was returned by OpenProcess and has not been closed yet.
     unsafe { CloseHandle(handle) };
     if !times_ok || !path_ok {
@@ -512,19 +598,64 @@ fn collect_pids(stdout: &[u8], protected: &std::collections::HashSet<u32>, out: 
     }
 }
 
-/// Returns PIDs that are NOT MCP stdio servers (safe to kill during `lean-ctx stop`).
+/// Returns PIDs that are safe to kill during `lean-ctx stop`: neither MCP stdio
+/// servers nor in-flight command runners.
+///
 /// MCP servers are child processes of the IDE and must not be killed — the IDE
 /// will immediately respawn them, causing a kill loop that requires a reboot.
+/// Command runners (`lean-ctx -c <cmd>`, `exec`, `--track`) are executing
+/// someone's command right now — another agent's `cargo test`, a commit hook.
+/// Killing one ends that work with SIGTERM/SIGKILL and holds nothing lean-ctx
+/// owns, so even a deliberate "stop everything" leaves them to finish (#1292).
 pub fn find_killable_pids(name: &str) -> Vec<u32> {
-    killable_excluding_mcp(find_pids_by_name(name), &find_mcp_server_pids(name))
+    let mut protected = find_mcp_server_pids(name);
+    protected.extend(find_command_runner_pids(name));
+    killable_excluding_mcp(find_pids_by_name(name), &protected)
 }
 
-/// Pure set-difference: every PID in `all` that is not an MCP server PID. Split
-/// out from [`find_killable_pids`] so the IDE-protection invariant — the
-/// MCP-stdio server is never returned as killable (#1036) — is unit-testable
-/// without spawning real processes.
-fn killable_excluding_mcp(all: Vec<u32>, mcp: &[u32]) -> Vec<u32> {
-    all.into_iter().filter(|p| !mcp.contains(p)).collect()
+/// Pure set-difference: every PID in `all` that is not a protected PID (MCP
+/// server or command runner). Split out from [`find_killable_pids`] so the
+/// protection invariant — a protected process is never returned as killable
+/// (#1036, #1292) — is unit-testable without spawning real processes.
+fn killable_excluding_mcp(all: Vec<u32>, protected: &[u32]) -> Vec<u32> {
+    all.into_iter().filter(|p| !protected.contains(p)).collect()
+}
+
+/// `lean-ctx` processes that are running a user's command (#1292).
+#[cfg(unix)]
+fn find_command_runner_pids(name: &str) -> Vec<u32> {
+    find_pids_by_name(name)
+        .into_iter()
+        .filter(|&pid| {
+            std::process::Command::new("ps")
+                .args(["-o", "command=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|out| is_command_runner_cmdline(&String::from_utf8_lossy(&out.stdout)))
+        })
+        .collect()
+}
+
+/// Windows keeps the running `.exe` locked, so `dev-install` and `uninstall`
+/// must still be able to stop a runner there before replacing the binary.
+#[cfg(not(unix))]
+fn find_command_runner_pids(_name: &str) -> Vec<u32> {
+    Vec::new()
+}
+
+/// True when `command` is a `lean-ctx` invocation that runs a user command:
+/// `-c`/`exec` (the shell wrapper) or `-t`/`--track`.
+// Only the Unix runner lookup calls this; the unit test runs on every target,
+// so the function is not gated, only its dead-code lint off Unix.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn is_command_runner_cmdline(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let Some(argv0) = words.next() else {
+        return false;
+    };
+    if argv0 != "lean-ctx" && !argv0.ends_with("/lean-ctx") {
+        return false;
+    }
+    matches!(words.next(), Some("-c" | "exec" | "-t" | "--track"))
 }
 
 #[cfg(unix)]
@@ -699,7 +830,10 @@ mod tests {
     fn current_process_identity_is_stable_and_matches() {
         let pid = std::process::id();
         let identity = identity(pid).expect("supported platform exposes process identity");
-        assert!(!identity.executable.is_empty());
+        assert!(
+            !identity.executable.is_empty(),
+            "`identity.executable` is empty"
+        );
         assert!(matches_identity(pid, &identity));
     }
 
@@ -709,6 +843,38 @@ mod tests {
             killable_excluding_mcp(vec![11, 17, 23], &[11, 23]),
             vec![17]
         );
+    }
+
+    /// #1292: `lean-ctx stop` SIGKILLed other agents' in-flight commands
+    /// (`lean-ctx -c "cargo test"`, a commit hook) as "orphans". A command
+    /// runner is never killable; daemons, proxies and dashboards still are.
+    #[test]
+    fn in_flight_command_runners_are_never_killable() {
+        for runner in [
+            "lean-ctx -c cargo test --lib",
+            "/Users/me/.local/bin/lean-ctx -c git commit -m x",
+            "/usr/local/bin/lean-ctx exec make",
+            "lean-ctx --track npm test",
+            "lean-ctx -t pytest",
+        ] {
+            assert!(
+                is_command_runner_cmdline(runner),
+                "must be protected: {runner}"
+            );
+        }
+        for stoppable in [
+            "lean-ctx serve --_foreground-daemon",
+            "/Users/me/.local/bin/lean-ctx proxy start --port 4444",
+            "lean-ctx dashboard",
+            "lean-ctx",
+            "/usr/bin/grep -c lean-ctx",
+            "",
+        ] {
+            assert!(
+                !is_command_runner_cmdline(stoppable),
+                "must stay stoppable: {stoppable}"
+            );
+        }
     }
 
     #[test]

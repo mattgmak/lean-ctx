@@ -4,8 +4,8 @@
 > integration promise.** Codex, Claude Code, and Cursor are the current
 > first-class local setup paths. Verify this generic Attach wiring against the
 > installed Gemini CLI version; compatibility alone is not a performance or
-> evidence guarantee. Product scope is governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> evidence guarantee. See the [canonical positioning](../POSITIONING_CANONICAL.md)
+> for current product scope and claim boundaries.
 
 Complete guide to setting up and optimally using lean-ctx with Gemini CLI (Google's AI coding agent).
 
@@ -59,7 +59,7 @@ Gemini CLI reads `~/.gemini/GEMINI.md` for global instructions. lean-ctx **appen
 # Your existing GEMINI.md content here
 ...
 
-# lean-ctx — Context Engineering Layer
+# LeanCTX — Context Gateway for AI Systems
 <!-- lean-ctx-rules -->
 
 ## Mode Selection
@@ -99,25 +99,24 @@ lean-ctx init --global
 
 ### Long Context Window
 
-Gemini models have large context windows (1M+ tokens). lean-ctx still provides value because:
-
-1. **Cost reduction** — fewer tokens = lower API costs, even if they fit in the window
-2. **Focus** — compressed context helps the model focus on relevant information
-3. **Speed** — less data to process = faster responses
-4. **Caching** — re-reads cost ~13 tokens regardless of file size
+For tasks where a structural view or focused search result is enough, those
+representations can reduce the context emitted by this integration. Provider
+usage, billing, latency, and answer quality depend on the model, route, request,
+and provider behavior; this guide makes no outcome guarantee. Eligible unchanged
+reads may use a compact cache reference whose size depends on the emitted result.
 
 ### Gemini's Thinking Mode
 
 When using Gemini's thinking mode with lean-ctx:
 
 ```
-# Provide structured context for better reasoning
+# Provide a structural view for this task
 ctx_overview("analyze the authentication flow for security vulnerabilities")
 
 # Use map mode to give Gemini structural understanding
 ctx_read("src/auth/mod.rs", "map")
 
-# Let Gemini's thinking work on the compressed, focused context
+# The host decides how this context is included in its request
 ```
 
 ### Multi-Turn Conversations
@@ -129,9 +128,9 @@ Gemini CLI supports multi-turn conversations. lean-ctx enhances this with sessio
 ctx_search("fn authenticate", "src/")
 ctx_read("src/auth/jwt.rs", "map")
 
-# Turn 2: Gemini remembers the lean-ctx context from Turn 1
-# Re-reads cost ~13 tokens
-ctx_read("src/auth/jwt.rs", "full")  # Almost free from cache
+# Turn 2: request the same file again; an eligible unchanged read may use
+# a compact cache reference, depending on mode and integration behavior
+ctx_read("src/auth/jwt.rs", "full")
 
 # Turn 3: Document findings
 ctx_knowledge(action="remember", category="insight", content="JWT uses HS256, should migrate to RS256")
@@ -212,19 +211,16 @@ Create a project-level configuration:
 shell_activation = "always"
 ```
 
-## Token Savings with Gemini
+## Context measurement
 
-Even with Gemini's large context window, lean-ctx provides measurable savings:
+Use `map` or `signatures` for structural context, and focused search or line
+modes when the task needs a smaller slice. Shell summaries and unchanged-read
+references depend on the installed integration and observed output.
 
-| Operation | Raw | With lean-ctx | Savings |
-|-----------|-----|---------------|---------|
-| File read (cached) | ~2000 tok | ~13 tok | 99.4% |
-| File read (map) | ~2000 tok | ~400 tok | 80% |
-| `git status` | ~800 tok | ~120 tok | 85% |
-| `git log -20` | ~600 tok | ~150 tok | 75% |
-| `npm test` output | ~3000 tok | ~400 tok | 87% |
-
-Monitor in real-time:
+`lean-ctx gain --live` reports local usage and token/cost estimates for activity
+it observes. Provider-reported usage is available only for supported routed
+paths that record it; estimates do not establish invoice savings or answer
+quality.
 
 ```bash
 lean-ctx gain --live

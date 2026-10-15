@@ -28,7 +28,7 @@ fn file_read_cat_declines_multi_file_and_flags() {
     // A quoted path with spaces is one token — still rewritten.
     assert_eq!(
         rewrite_file_read_command("cat 'my file.md'", "lean-ctx"),
-        Some("lean-ctx read \"my file.md\"".to_string())
+        Some("lean-ctx read 'my file.md'".to_string())
     );
 }
 
@@ -148,19 +148,22 @@ fn rewrite_skip_reason_tracks_candidate_none_branches() {
 
     let already = "lean-ctx read x";
     assert!(rewrite_candidate(already, binary).is_none());
-    assert_eq!(rewrite_skip_reason(already), "already a lean-ctx command");
+    assert_eq!(
+        rewrite_skip_reason(already, binary),
+        "already a lean-ctx command"
+    );
 
     let heredoc = "cat <<EOF\nhi\nEOF";
     assert!(rewrite_candidate(heredoc, binary).is_none());
     assert_eq!(
-        rewrite_skip_reason(heredoc),
+        rewrite_skip_reason(heredoc, binary),
         "heredoc cannot be rewritten safely"
     );
 
     let unknown = "echo hello";
     assert!(rewrite_candidate(unknown, binary).is_none());
     assert_eq!(
-        rewrite_skip_reason(unknown),
+        rewrite_skip_reason(unknown, binary),
         "not a known read/search/list command"
     );
 
@@ -169,7 +172,7 @@ fn rewrite_skip_reason_tracks_candidate_none_branches() {
     let heredoc_compound = "git log | cat <<EOF\nhi\nEOF";
     assert!(rewrite_candidate(heredoc_compound, binary).is_none());
     assert_eq!(
-        rewrite_skip_reason(heredoc_compound),
+        rewrite_skip_reason(heredoc_compound, binary),
         "heredoc cannot be rewritten safely"
     );
 }
@@ -432,6 +435,19 @@ fn is_outside_project_path_tests() {
     assert!(!is_outside_project_path("./Cargo.toml"));
     assert!(!is_outside_project_path("../sibling/file.rs"));
     assert!(!is_outside_project_path("file.txt"));
+
+    // #1903: anything the jailed `lean-ctx read` refuses stays native. With the
+    // `no-jail` feature nothing is refused, so those reads are rewritten.
+    let jailed = !cfg!(feature = "no-jail");
+    assert_eq!(
+        is_outside_project_path("../../../../../../../../etc/hosts"),
+        jailed
+    );
+    assert_eq!(is_outside_project_path("/etc/hosts"), jailed);
+    assert_eq!(
+        rewrite_file_read_command("cat ../../../../../../../../etc/hosts", "lean-ctx").is_none(),
+        jailed
+    );
 }
 
 #[test]

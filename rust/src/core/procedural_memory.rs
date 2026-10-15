@@ -464,6 +464,10 @@ pub mod tests {
 
     #[test]
     fn max_procedures_enforced() {
+        // Eviction archives the dropped procedures and keeps them all when the
+        // archive write fails (lossless, #995); in the shared test sandbox that
+        // write competed with every parallel memory test and lost.
+        let _data = crate::core::data_dir::isolated_data_dir();
         let policy = ProceduralPolicy::default();
         let mut store = ProceduralStore::new("test");
         for i in 0..110 {

@@ -412,6 +412,11 @@ fn cmd_savings_verify_batch(file: Option<&str>) {
             batch.totals.total_events
         );
         println!("  Chain head: {}", batch.last_entry_hash);
+        if let Some(tally) = &batch.security {
+            for phrase in core::value::format::security_phrases(&tally.counts) {
+                println!("  Security:   {phrase} (signed, audit trail)");
+            }
+        }
         if !batch.chain_valid {
             println!("  NOTE: the ledger chain was already broken when this batch was signed.");
         }
@@ -465,7 +470,7 @@ fn format_savings_summary() -> String {
     out.push(String::new());
     out.push(format!(
         "  {}",
-        t.box_top_labeled(w, "VERIFIED SAVINGS LEDGER")
+        t.box_top_labeled(w, "SIGNED SAVINGS LEDGER")
     ));
     out.push(sl(&format!(
         "  {bold}Events{rst}      {m}{}{rst}",

@@ -167,6 +167,44 @@ pub fn root_from_env() -> Option<String> {
     None
 }
 
+/// The session's project root from the host env and the server's working dir.
+///
+/// `LEAN_CTX_PROJECT_ROOT` is a pin. Placed in a user-global agent config (as
+/// builds before the pin heal did) it names one project for *every* session,
+/// so a Codex session started in repo B silently ran against repo A. When the
+/// server was started inside a different real project, that working directory
+/// is this session's project and outranks the pin. Host-specific signals
+/// (`CLAUDE_PROJECT_DIR`, workspace folders, …) are session-scoped already and
+/// keep precedence; a cwd inside the pinned tree keeps the pin.
+pub fn session_root(env_root: Option<String>, cwd_root: Option<String>) -> Option<String> {
+    let pin = std::env::var("LEAN_CTX_PROJECT_ROOT")
+        .ok()
+        .map(|v| v.trim().to_string());
+    let env_is_pin = env_root.is_some() && env_root == pin;
+    reconcile_session_root(env_root, env_is_pin, cwd_root)
+}
+
+fn reconcile_session_root(
+    env_root: Option<String>,
+    env_is_pin: bool,
+    cwd_root: Option<String>,
+) -> Option<String> {
+    if let (true, Some(pin), Some(cwd)) = (env_is_pin, env_root.as_deref(), cwd_root.as_deref()) {
+        let pin_path = crate::core::pathutil::safe_canonicalize_or_self(Path::new(pin));
+        let cwd_path = crate::core::pathutil::safe_canonicalize_or_self(Path::new(cwd));
+        let unrelated = !cwd_path.starts_with(&pin_path) && !pin_path.starts_with(&cwd_path);
+        if unrelated && has_project_marker(&cwd_path) {
+            tracing::warn!(
+                "LEAN_CTX_PROJECT_ROOT pins {pin}, but this session started in project {cwd} — \
+                 using {cwd}. Remove the pin from the agent's global MCP config \
+                 (`lean-ctx doctor --fix`)."
+            );
+            return cwd_root;
+        }
+    }
+    env_root.or(cwd_root)
+}
+
 /// Split a `WORKSPACE_FOLDER_PATHS` value into individual paths.
 ///
 /// Cursor separates entries with `,` (observed). We also tolerate the OS
@@ -512,6 +550,46 @@ mod tests {
         let raw = format!("{},{}", a.display(), b.display());
         let got = best_root_from_paths(split_workspace_paths(&raw)).unwrap();
         assert!(got.contains("ws_b"), "marker workspace must win: {got}");
+    }
+
+    #[test]
+    fn stale_global_pin_yields_to_the_sessions_real_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pinned = tmp.path().join("thinkery");
+        let actual = tmp.path().join("lean-ctx");
+        for dir in [&pinned, &actual] {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+        }
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+
+        // Pin from a global config + server started in another real project.
+        assert_eq!(
+            reconcile_session_root(Some(s(&pinned)), true, Some(s(&actual))),
+            Some(s(&actual))
+        );
+        // A host-specific (session-scoped) env root is never overridden.
+        assert_eq!(
+            reconcile_session_root(Some(s(&pinned)), false, Some(s(&actual))),
+            Some(s(&pinned))
+        );
+        // A cwd inside the pinned tree keeps the pin (monorepo subdir).
+        let sub = pinned.join("crates/a");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+        assert_eq!(
+            reconcile_session_root(Some(s(&pinned)), true, Some(s(&sub))),
+            Some(s(&pinned))
+        );
+        // A markerless cwd is no evidence against the pin.
+        let bare = tmp.path().join("scratch");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            reconcile_session_root(Some(s(&pinned)), true, Some(s(&bare))),
+            Some(s(&pinned))
+        );
+        assert_eq!(
+            reconcile_session_root(None, false, Some(s(&actual))),
+            Some(s(&actual))
+        );
     }
 
     #[test]

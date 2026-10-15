@@ -1,18 +1,12 @@
 # LeanCTX Runtime
 
-> **Status: implementation guide.** LeanCTX is **The Context SDK for AI
-> Agents**: a local context-performance layer for existing agents. It selects,
-> shapes, reuses, recovers, and measures context before inference. This directory
-> contains the Runtime that powers the available local CLI, MCP server, proxy,
-> context primitives, and local evidence/offline-verification paths.
->
-> It is not a generic agent builder, agent platform, hosted execution service,
-> marketplace, control plane, or organization product. Python SDK v1 and its
-> declared OpenAI Agents reference wrapper are **Preview**. Performance
-> Benchmark, Profiles, first-class Context Kits, AutoTune, public rankings, and
-> Cloud/managed/team/SSO surfaces are **Research** or unavailable. Product scope
-> and status are governed by
-> [`docs/internal/README.md`](../docs/internal/README.md).
+> **Status: implementation guide.** LeanCTX is the **Context Gateway for AI Systems**.
+> **Control what your AI can see.** LeanCTX Engine is the runtime in this
+> directory; LeanCTX SDK is the separate application integration surface.
+> Local CLI, MCP, hooks, supported proxy paths, and bounded context evidence
+> are available. Standalone SDK stable and Preview namespaces have their own
+> released contracts. Commercial Enterprise capabilities have separate scope
+> and licensing. See [current positioning](../docs/POSITIONING_CANONICAL.md).
 
 ## Build locally
 
@@ -52,9 +46,10 @@ task is not a gain.
 - **Attach:** use the installed CLI, MCP server, or local proxy.
 - **Wrap:** use the declared adapter path where available; discover capabilities
   and report typed limitations when a capability is unavailable.
-- **Embed:** a custom application/agent integration remains a bounded Preview
-  target, not a general-purpose agent-building surface.
+- **Embed:** use the standalone LeanCTX SDK's released lifecycle and Agent Tools
+  contracts. Its Python Preview namespace and older in-tree experiments retain
+  their separate limits.
 
 See the repository [README](../README.md) for installation and current public
-orientation. See [`docs/internal/vision/PRODUCT-ARCHITECTURE.md`](../docs/internal/vision/PRODUCT-ARCHITECTURE.md)
-for the canonical status map.
+orientation. See [canonical positioning](../docs/POSITIONING_CANONICAL.md)
+and [SDK boundaries](../docs/reference/sdk-surface.md) for current scope.

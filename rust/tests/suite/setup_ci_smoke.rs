@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use std::process::Command;
 
 use lean_ctx::core::setup_report::SetupReport;
@@ -60,13 +61,18 @@ fn setup_bootstrap_doctor_status_json_smoke() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
+    // `bootstrap` starts a daemon under this HOME on purpose (GL #1291).
+    let _daemon = super::hermetic_env::SandboxDaemon(&home);
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
+    let config_dir = tmp.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
     let bin_dir = tmp.path().join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
 
     let home_str = home.to_string_lossy().to_string();
     let data_str = data_dir.to_string_lossy().to_string();
+    let config_str = config_dir.to_string_lossy().to_string();
 
     // Fake claude binary so we can verify `claude mcp add-json` integration.
     // It writes stdin JSON to $HOME/claude-mcp.json and exits 0.
@@ -90,6 +96,7 @@ fn setup_bootstrap_doctor_status_json_smoke() {
     let mut envs = vec![
         ("HOME", home_str.as_str()),
         ("LEAN_CTX_DATA_DIR", data_str.as_str()),
+        ("LEAN_CTX_CONFIG_DIR", config_str.as_str()),
         ("LEAN_CTX_ACTIVE", "1"),
         ("LEAN_CTX_DISABLED", "1"),
     ];
@@ -121,12 +128,14 @@ fn setup_bootstrap_doctor_status_json_smoke() {
     });
     assert_eq!(setup.schema_version, 1);
 
-    // bootstrap should create env.sh in LEAN_CTX_DATA_DIR for Docker/CI shells.
+    // env.sh is a config artifact; an explicit config override wins over the
+    // legacy data-directory fallback and must not inherit the test runner's dir.
     // env.sh is Unix-only (shell script); skip assertion on Windows.
     #[cfg(not(windows))]
     {
-        let env_sh = data_dir.join("env.sh");
+        let env_sh = config_dir.join("env.sh");
         let env_sh_content = std::fs::read_to_string(&env_sh).expect("env.sh exists");
+        assert!(!data_dir.join("env.sh").exists());
         assert!(
             env_sh_content.contains("lean-ctx docker self-heal"),
             "env.sh missing docker self-heal snippet"
@@ -427,7 +436,7 @@ fn init_claude_installs_dedicated_rules_file_without_claude_md() {
     // v7 (#1091): Replace-mode write guidance corrected; shared tag bumped.
     // v8 (#1228): auto memory + edit gate keep native Read; file:// MCP resources guided away.
     assert!(
-        claude_md.contains("lean-ctx-claude-v9"),
+        claude_md.contains("lean-ctx-claude-v10"),
         "CLAUDE.md must carry the v9 block version"
     );
     assert!(
@@ -513,7 +522,7 @@ fn rules_sync_claude_repairs_compact_pointer_block() {
     let content = std::fs::read_to_string(&claude_md).unwrap();
     assert!(content.contains("# user notes"));
     assert_eq!(content.matches("<!-- lean-ctx -->").count(), 1);
-    assert!(content.contains("lean-ctx-claude-v9"));
+    assert!(content.contains("lean-ctx-claude-v10"));
     assert!(!content.contains("<!-- lean-ctx-rules -->"));
 
     let second = command.output().expect("second rules sync claude");

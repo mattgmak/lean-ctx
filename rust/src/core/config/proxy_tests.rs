@@ -919,7 +919,10 @@ fn compress_protect_unset_is_a_noop() {
     // #1150: the default protects nothing, so compression stays on for all.
     let cfg = ProxyConfig::default();
     assert!(!cfg.is_path_compress_protected("tests/golden/output.snap"));
-    assert!(cfg.compress_protect_globs().is_empty());
+    {
+        let found = &cfg.compress_protect_globs();
+        assert!(found.is_empty(), "{found:?}");
+    }
 }
 
 #[test]
@@ -953,4 +956,59 @@ fn compress_protect_skips_malformed_globs_without_disabling_rest() {
         ..Default::default()
     };
     assert!(cfg.is_path_compress_protected("Cargo.lock"));
+}
+
+#[test]
+fn history_mode_default_is_cache_aware() {
+    // #1895: an empty config with no env must not fall through the implicit
+    // `Token` proxy-mode default into the cache-hostile rolling pruner.
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::remove_var("LEAN_CTX_PROXY_HISTORY_MODE");
+    crate::test_env::remove_var("LEAN_CTX_PROXY_MODE");
+    assert_eq!(
+        ProxyConfig::default().resolved_history_mode(),
+        HistoryMode::CacheAware
+    );
+    let typo = ProxyConfig {
+        history_mode: Some("rollin".into()),
+        proxy_mode: Some("bogus".into()),
+        ..Default::default()
+    };
+    assert_eq!(typo.resolved_history_mode(), HistoryMode::CacheAware);
+}
+
+#[test]
+fn history_mode_follows_explicit_proxy_mode_and_overrides() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::remove_var("LEAN_CTX_PROXY_HISTORY_MODE");
+    crate::test_env::remove_var("LEAN_CTX_PROXY_MODE");
+    let token = ProxyConfig {
+        proxy_mode: Some("token".into()),
+        ..Default::default()
+    };
+    assert_eq!(token.resolved_history_mode(), HistoryMode::Rolling);
+    let cache = ProxyConfig {
+        proxy_mode: Some("cache".into()),
+        ..Default::default()
+    };
+    assert_eq!(cache.resolved_history_mode(), HistoryMode::CacheAware);
+    let explicit_off = ProxyConfig {
+        proxy_mode: Some("token".into()),
+        history_mode: Some("off".into()),
+        ..Default::default()
+    };
+    assert_eq!(explicit_off.resolved_history_mode(), HistoryMode::Off);
+
+    crate::test_env::set_var("LEAN_CTX_PROXY_MODE", "token");
+    assert_eq!(
+        ProxyConfig::default().resolved_history_mode(),
+        HistoryMode::Rolling
+    );
+    crate::test_env::set_var("LEAN_CTX_PROXY_HISTORY_MODE", "off");
+    assert_eq!(
+        ProxyConfig::default().resolved_history_mode(),
+        HistoryMode::Off
+    );
+    crate::test_env::remove_var("LEAN_CTX_PROXY_HISTORY_MODE");
+    crate::test_env::remove_var("LEAN_CTX_PROXY_MODE");
 }

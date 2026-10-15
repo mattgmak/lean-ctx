@@ -47,6 +47,13 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
+    /// The registry's own `'static` key for `name`, if it is a registered tool.
+    /// Telemetry counts per tool only under these keys, so a caller-supplied
+    /// string never reaches a counter.
+    pub fn static_name(&self, name: &str) -> Option<&'static str> {
+        self.tools.get_key_value(name).map(|(key, _)| *key)
+    }
+
     /// Returns MCP Tool definitions in the official public surface.
     ///
     /// Deprecated aliases and local-only collaboration compatibility tools
@@ -195,6 +202,7 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(registered::ctx_fill::CtxFillTool));
     registry.register(Box::new(registered::ctx_glob::CtxGlobTool));
     registry.register(Box::new(registered::ctx_shell::CtxShellTool));
+    registry.register(Box::new(registered::ctx_shape::CtxShapeTool));
     registry.register(Box::new(registered::shell_alias::ShellAliasTool));
     registry.register(Box::new(registered::ctx_search::CtxSearchTool));
     registry.register(Box::new(registered::ctx_url_read::CtxUrlReadTool));
@@ -244,6 +252,7 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(registered::ctx_task::CtxTaskTool));
     registry.register(Box::new(registered::ctx_handoff::CtxHandoffTool));
     registry.register(Box::new(registered::ctx_workflow::CtxWorkflowTool));
+    registry.register(Box::new(registered::ctx_work_graph::CtxWorkGraphTool));
     registry.register(Box::new(registered::ctx_load_tools::CtxLoadToolsTool));
 
     // #509: deprecated aliases — hidden from tools/list but stay registered so
@@ -269,6 +278,31 @@ mod tests {
         let arc = registry.get_arc("ctx_tree");
         assert!(arc.is_some(), "ctx_tree must be registered");
         assert_eq!(arc.unwrap().name(), "ctx_tree");
+    }
+
+    #[test]
+    fn work_graph_is_registered_and_publicly_advertised() {
+        let registry = build_registry();
+        assert!(registry.contains("ctx_work_graph"));
+        let tools = registry.tool_defs();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "ctx_work_graph")
+            .expect("work graph must be advertised");
+        assert_eq!(
+            tool.input_schema.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        let actions = tool.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(actions.iter().any(|action| action == "execute"));
+        assert!(
+            tool.input_schema["properties"]
+                .get("execution_fence")
+                .is_some()
+        );
+        assert!(tool.input_schema["properties"].get("connector").is_some());
     }
 
     #[test]

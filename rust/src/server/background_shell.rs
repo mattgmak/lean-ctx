@@ -30,6 +30,13 @@ struct Job {
     // #1217: shared buffer the worker streams captured output into while the
     // job runs, so `status` can report progress before the job completes.
     live: Arc<Mutex<String>>,
+    // #1876: identical launches coalesce onto one entry, so several foreground
+    // calls can wait on it at once. Each reads its result from the entry, so it
+    // is removed only once the last waiter has read it, and never while a
+    // background caller (explicit or detached) may still poll it by id.
+    foreground_waiters: usize,
+    background_owned: bool,
+    telemetry_recorded: bool,
 }
 
 static JOBS: LazyLock<Mutex<HashMap<String, Job>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -53,12 +60,15 @@ fn prune_finished_jobs_with_limits(
     max_completed_bytes: usize,
 ) {
     jobs.retain(|_, job| {
-        job.finished_at
-            .is_none_or(|finished_at| now.duration_since(finished_at) < COMPLETED_JOB_TTL)
+        job.foreground_waiters > 0
+            || job
+                .finished_at
+                .is_none_or(|finished_at| now.duration_since(finished_at) < COMPLETED_JOB_TTL)
     });
 
     let mut completed: Vec<_> = jobs
         .iter()
+        .filter(|(_, job)| job.foreground_waiters == 0)
         .filter_map(|(id, job)| {
             let finished_at = job.finished_at?;
             let output_bytes = match &job.state {
@@ -91,6 +101,16 @@ pub fn start(
     extra_env: std::collections::HashMap<String, String>,
     timeout_ms: Option<u64>,
 ) -> String {
+    start_inner(command, cwd, extra_env, timeout_ms, false)
+}
+
+fn start_inner(
+    command: String,
+    cwd: String,
+    extra_env: std::collections::HashMap<String, String>,
+    timeout_ms: Option<u64>,
+    foreground: bool,
+) -> String {
     // IDs are content-addressed so tool responses stay deterministic (#498).
     // An identical in-flight launch coalesces onto the same job instead of
     // creating duplicate expensive builds/tests.
@@ -118,10 +138,17 @@ pub fn start(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         prune_finished_jobs(&mut jobs, Instant::now());
-        if matches!(
-            jobs.get(&id).map(|job| &job.state),
-            Some(JobState::Running { .. })
-        ) {
+        // A finished entry that a foreground waiter has not read yet is joined
+        // too (#1876): replacing it would hand that waiter's release to the new
+        // job, which then disappears under its own waiter.
+        if let Some(job) = jobs.get_mut(&id)
+            && (matches!(job.state, JobState::Running { .. }) || job.foreground_waiters > 0)
+        {
+            if foreground {
+                job.foreground_waiters += 1;
+            } else {
+                job.background_owned = true;
+            }
             return id;
         }
         jobs.insert(
@@ -133,6 +160,9 @@ pub fn start(
                 },
                 finished_at: None,
                 live,
+                foreground_waiters: usize::from(foreground),
+                background_owned: !foreground,
+                telemetry_recorded: false,
             },
         );
     }
@@ -157,12 +187,28 @@ pub fn start(
         let Some(job) = jobs.get_mut(&worker_id) else {
             return;
         };
-        job.state = if worker_cancel.load(Ordering::Acquire) {
+        let cancelled = worker_cancel.load(Ordering::Acquire);
+        job.state = if cancelled {
             JobState::Cancelled { output }
         } else {
             JobState::Completed { output, exit_code }
         };
         job.finished_at = Some(Instant::now());
+        // Only a background-owned job is counted here, so a failure nobody
+        // polls still reaches telemetry. A foreground run is classified once by
+        // the call pipeline, which knows that exit 1 with output (grep, diff,
+        // test) is not an error; counting it here as well filed every failing
+        // inline command twice, the second time as a LeanCTX-internal error.
+        if !cancelled && exit_code != 0 && job.background_owned {
+            let category = if exit_code == 124 {
+                crate::core::telemetry_v2::ErrorCategory::Timeout
+            } else {
+                crate::core::telemetry_v2::ErrorCategory::Command
+            };
+            if crate::core::telemetry_aggregate::record_error_category(category).is_ok() {
+                job.telemetry_recorded = true;
+            }
+        }
         prune_finished_jobs(&mut jobs, Instant::now());
     });
     id
@@ -170,8 +216,8 @@ pub fn start(
 
 /// Outcome of a foreground run that is allowed to detach on a soft cap.
 pub enum ForegroundResult {
-    /// The command finished within the soft cap; output is returned inline and
-    /// the job has been removed from the registry.
+    /// The command finished within the soft cap; output is returned inline.
+    /// Other coalesced foreground/background callers retain their result.
     Finished { output: String, exit_code: i32 },
     /// The command was still running at the soft cap and was left running as a
     /// pollable background job (#1106).
@@ -198,21 +244,21 @@ pub fn run_foreground_or_detach(
     on_tick: Option<&dyn Fn(Duration)>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> ForegroundResult {
-    let id = start(command, cwd, extra_env, timeout_ms);
+    let id = start_inner(command, cwd, extra_env, timeout_ms, true);
     let started = Instant::now();
     let deadline = started + soft_cap;
     let mut next_tick = started + TICK;
     loop {
         match status(&id) {
             Some(JobState::Completed { output, exit_code }) => {
-                remove(&id);
+                release_foreground(&id, false);
                 return ForegroundResult::Finished { output, exit_code };
             }
             // A cancel can only be requested via background_action once the job
             // is detached, so an inline wait realistically only sees Completed;
             // handle Cancelled defensively with the timeout exit code.
             Some(JobState::Cancelled { output }) => {
-                remove(&id);
+                release_foreground(&id, false);
                 return ForegroundResult::Finished {
                     output,
                     exit_code: 130,
@@ -230,10 +276,12 @@ pub fn run_foreground_or_detach(
         // Detaching rather than killing keeps the job alive under its id, which
         // the caller already knows how to poll and cancel.
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            release_foreground(&id, true);
             return ForegroundResult::Detached { job_id: id };
         }
         let now = Instant::now();
         if now >= deadline {
+            release_foreground(&id, true);
             return ForegroundResult::Detached { job_id: id };
         }
         if let Some(tick) = on_tick
@@ -246,17 +294,40 @@ pub fn run_foreground_or_detach(
     }
 }
 
-/// Drop a finished job from the registry so inline foreground runs do not
-/// accumulate completed entries.
-fn remove(id: &str) {
+/// One foreground waiter is done with `id` (#1876). A detached waiter hands the
+/// id to its caller, so the entry becomes background-owned and stays pollable.
+/// Otherwise the entry is removed once no waiter and no background caller is
+/// left; a waiter that still polls it must not find it gone.
+fn release_foreground(id: &str, detached: bool) {
+    let mut jobs = JOBS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(job) = jobs.get_mut(id) else {
+        return;
+    };
+    job.foreground_waiters = job.foreground_waiters.saturating_sub(1);
+    if detached {
+        job.background_owned = true;
+    } else if job.foreground_waiters == 0 && !job.background_owned {
+        jobs.remove(id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn remove_for_test(id: &str) {
     JOBS.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(id);
 }
 
-#[cfg(all(test, not(windows)))]
-pub(crate) fn remove_for_test(id: &str) {
-    remove(id);
+/// Jobs whose command is still running. An idle MCP server with one of these
+/// is not idle: it holds the child and the output the agent will poll for.
+pub fn running_count() -> usize {
+    JOBS.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .filter(|job| matches!(job.state, JobState::Running { .. }))
+        .count()
 }
 
 pub fn status(id: &str) -> Option<JobState> {
@@ -278,6 +349,29 @@ pub fn status(id: &str) -> Option<JobState> {
     })
 }
 
+/// Persist one aggregate for a terminal failed job, then mark that concrete
+/// retained job instance. A later execution may reuse the content-addressed ID,
+/// but replaces the `Job` and therefore starts with a fresh marker.
+pub fn record_error_telemetry_once(
+    id: &str,
+    category: crate::core::telemetry_v2::ErrorCategory,
+) -> Result<bool, String> {
+    let mut jobs = JOBS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(job) = jobs.get_mut(id) else {
+        return Ok(false);
+    };
+    if job.telemetry_recorded
+        || !matches!(job.state, JobState::Completed { exit_code, .. } if exit_code != 0)
+    {
+        return Ok(false);
+    }
+    crate::core::telemetry_aggregate::record_error_category(category)?;
+    job.telemetry_recorded = true;
+    Ok(true)
+}
+
 pub fn cancel(id: &str) -> Option<JobState> {
     let mut jobs = JOBS
         .lock()
@@ -295,6 +389,148 @@ mod tests {
         ForegroundResult, JobState, TICK, cancel, run_foreground_or_detach, start, status,
     };
     use std::time::Duration;
+
+    fn completed_job(exit_code: i32) -> super::Job {
+        super::Job {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            state: JobState::Completed {
+                output: "opaque output".into(),
+                exit_code,
+            },
+            finished_at: Some(std::time::Instant::now()),
+            live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            foreground_waiters: 0,
+            background_owned: true,
+            telemetry_recorded: false,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_job_telemetry_is_once_per_execution_even_when_id_is_reused() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let id = "shell_same_content";
+        super::JOBS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.into(), completed_job(2));
+
+        assert!(
+            super::record_error_telemetry_once(
+                id,
+                crate::core::telemetry_v2::ErrorCategory::Internal
+            )
+            .expect("record first execution")
+        );
+        assert!(
+            !super::record_error_telemetry_once(
+                id,
+                crate::core::telemetry_v2::ErrorCategory::Internal
+            )
+            .expect("deduplicate repeated poll")
+        );
+
+        super::JOBS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.into(), completed_job(2));
+        assert!(
+            super::record_error_telemetry_once(
+                id,
+                crate::core::telemetry_v2::ErrorCategory::Internal
+            )
+            .expect("record replacement execution")
+        );
+
+        let batch = crate::core::telemetry_aggregate::preview_daily_batch().expect("preview");
+        let count = batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                crate::core::telemetry_v2::TelemetryEventV2::ErrorCategoryAggregate(metrics)
+                    if metrics.category == crate::core::telemetry_v2::ErrorCategory::Internal =>
+                {
+                    Some(metrics.count)
+                }
+                _ => None,
+            });
+        assert_eq!(count, Some(2));
+        super::remove_for_test(id);
+    }
+
+    fn queued_error_count(category: crate::core::telemetry_v2::ErrorCategory) -> Option<u64> {
+        // A preview fails fast while another test's send holds the state lock;
+        // that is transient, so wait it out instead of failing this test.
+        let mut attempt = 0;
+        let batch = loop {
+            match crate::core::telemetry_aggregate::preview_daily_batch() {
+                Ok(batch) => break batch,
+                Err(_) if attempt < 100 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("preview: {error}"),
+            }
+        };
+        batch
+            .events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                crate::core::telemetry_v2::TelemetryEventV2::ErrorCategoryAggregate(metrics)
+                    if metrics.category == category =>
+                {
+                    Some(metrics.count)
+                }
+                _ => None,
+            })
+    }
+
+    /// A failing inline command is classified once, by the call pipeline; the
+    /// worker counts only background-owned jobs, and as a failed command, never
+    /// as a LeanCTX-internal error.
+    #[test]
+    #[serial_test::serial]
+    #[cfg_attr(windows, ignore)]
+    fn worker_counts_only_background_failures_and_as_commands() {
+        use crate::core::telemetry_v2::ErrorCategory;
+        let _iso = crate::core::data_dir::isolated_data_dir();
+
+        let result = run_foreground_or_detach(
+            "exit 3".to_string(),
+            ".".to_string(),
+            std::collections::HashMap::default(),
+            Some(10_000),
+            Duration::from_secs(10),
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            ForegroundResult::Finished { exit_code: 3, .. }
+        ));
+        assert_eq!(queued_error_count(ErrorCategory::Command), None);
+        assert_eq!(queued_error_count(ErrorCategory::Internal), None);
+
+        let id = start(
+            "exit 4".to_string(),
+            ".".to_string(),
+            std::collections::HashMap::default(),
+            Some(10_000),
+        );
+        for _ in 0..200 {
+            if matches!(status(&id), Some(JobState::Completed { .. })) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(matches!(
+            status(&id),
+            Some(JobState::Completed { exit_code: 4, .. })
+        ));
+        assert_eq!(queued_error_count(ErrorCategory::Command), Some(1));
+        assert_eq!(queued_error_count(ErrorCategory::Internal), None);
+        super::remove_for_test(&id);
+    }
 
     #[test]
     fn completed_job_retention_is_bounded() {
@@ -314,6 +550,9 @@ mod tests {
                             .unwrap(),
                     ),
                     live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+                    foreground_waiters: 0,
+                    background_owned: true,
+                    telemetry_recorded: false,
                 },
             );
         }
@@ -330,6 +569,9 @@ mod tests {
                         .unwrap(),
                 ),
                 live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+                foreground_waiters: 0,
+                background_owned: true,
+                telemetry_recorded: false,
             },
         );
 
@@ -358,6 +600,9 @@ mod tests {
                             .unwrap(),
                     ),
                     live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+                    foreground_waiters: 0,
+                    background_owned: true,
+                    telemetry_recorded: false,
                 },
             );
         }
@@ -475,7 +720,10 @@ mod tests {
         token.cancel();
         let started = std::time::Instant::now();
         let result = run_foreground_or_detach(
-            "sleep 30".to_string(),
+            // Distinct from the progress test's `sleep 30`: identical commands
+            // coalesce onto one job (#1876), so a shared one would be cancelled
+            // under the other test's feet.
+            "sleep 31".to_string(),
             ".".to_string(),
             std::collections::HashMap::default(),
             Some(60_000),
@@ -561,5 +809,172 @@ mod tests {
             saw_partial,
             "status never surfaced the running job's early output"
         );
+    }
+
+    /// #1876: identical foreground calls coalesce onto one job. The first to
+    /// see it finish used to remove the shared entry, so every other caller
+    /// polled a missing id until the host timed out. Each must get the output.
+    #[test]
+    #[cfg_attr(windows, ignore)]
+    fn identical_concurrent_foreground_calls_all_observe_completion() {
+        const CALLERS: usize = 3;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CALLERS));
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    run_foreground_or_detach(
+                        "sleep 0.2; printf GH1876_ALL_OK".to_string(),
+                        ".".to_string(),
+                        std::collections::HashMap::default(),
+                        Some(10_000),
+                        Duration::from_secs(10),
+                        None,
+                        None,
+                    )
+                })
+            })
+            .collect();
+        for handle in handles {
+            match handle.join().expect("foreground caller panicked") {
+                ForegroundResult::Finished { output, exit_code } => {
+                    assert_eq!(exit_code, 0);
+                    assert!(output.contains("GH1876_ALL_OK"), "got: {output}");
+                }
+                ForegroundResult::Detached { job_id } => {
+                    cancel(&job_id);
+                    panic!("a coalesced caller lost the shared job and detached");
+                }
+            }
+        }
+    }
+
+    /// #1876: a foreground call that joins an explicit background job must
+    /// not remove the entry the background caller still polls by id.
+    #[test]
+    #[cfg_attr(windows, ignore)]
+    fn foreground_join_keeps_a_background_job_pollable() {
+        let command = "sleep 0.2; printf GH1876_BG_OK".to_string();
+        let id = start(
+            command.clone(),
+            ".".to_string(),
+            std::collections::HashMap::default(),
+            Some(10_000),
+        );
+        let result = run_foreground_or_detach(
+            command,
+            ".".to_string(),
+            std::collections::HashMap::default(),
+            Some(10_000),
+            Duration::from_secs(10),
+            None,
+            None,
+        );
+        assert!(matches!(result, ForegroundResult::Finished { .. }));
+        match status(&id) {
+            Some(JobState::Completed { output, .. }) => assert!(output.contains("GH1876_BG_OK")),
+            other => panic!("background job vanished after a foreground join: {other:?}"),
+        }
+        super::remove_for_test(&id);
+    }
+
+    /// #1876: a call that arrives after the job finished but before its waiter
+    /// read the result must join that entry. Replacing it let the first
+    /// waiter's release delete the second caller's job.
+    #[test]
+    #[cfg_attr(windows, ignore)]
+    fn a_caller_joins_a_finished_entry_its_waiter_has_not_read() {
+        let launch = || {
+            super::start_inner(
+                "printf GH1876_WINDOW".to_string(),
+                ".".to_string(),
+                std::collections::HashMap::default(),
+                Some(10_000),
+                true,
+            )
+        };
+        let id = launch();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(status(&id), Some(JobState::Completed { .. })) {
+            assert!(std::time::Instant::now() < deadline, "job never completed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(launch(), id);
+        super::release_foreground(&id, false);
+        match status(&id) {
+            Some(JobState::Completed { output, .. }) => assert!(output.contains("GH1876_WINDOW")),
+            other => panic!("the joined caller lost its result: {other:?}"),
+        }
+        super::release_foreground(&id, false);
+        assert!(status(&id).is_none(), "the last waiter removes the entry");
+    }
+
+    /// #1876: fast identical commands finish inside one poll interval, which
+    /// is where callers used to replace an unread entry.
+    #[test]
+    #[cfg_attr(windows, ignore)]
+    fn fast_identical_concurrent_foreground_calls_all_return() {
+        const CALLERS: usize = 8;
+        for _ in 0..5 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(CALLERS));
+            let handles: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        run_foreground_or_detach(
+                            "printf GH1876_FAST".to_string(),
+                            ".".to_string(),
+                            std::collections::HashMap::default(),
+                            Some(10_000),
+                            Duration::from_secs(5),
+                            None,
+                            None,
+                        )
+                    })
+                })
+                .collect();
+            for handle in handles {
+                match handle.join().expect("foreground caller panicked") {
+                    ForegroundResult::Finished { output, .. } => {
+                        assert!(output.contains("GH1876_FAST"), "got: {output}");
+                    }
+                    ForegroundResult::Detached { job_id } => {
+                        cancel(&job_id);
+                        panic!("a fast identical caller lost its job and detached");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pruning_keeps_finished_jobs_that_a_waiter_has_not_read() {
+        let now = std::time::Instant::now();
+        let mut jobs = std::collections::HashMap::new();
+        jobs.insert(
+            "waited".to_string(),
+            super::Job {
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                state: JobState::Completed {
+                    output: "x".repeat(64),
+                    exit_code: 0,
+                },
+                finished_at: Some(
+                    now.checked_sub(super::COMPLETED_JOB_TTL + Duration::from_secs(1))
+                        .unwrap(),
+                ),
+                live: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+                foreground_waiters: 1,
+                background_owned: false,
+                telemetry_recorded: false,
+            },
+        );
+
+        super::prune_finished_jobs_with_limits(&mut jobs, now, 0, 0);
+
+        assert!(jobs.contains_key("waited"));
     }
 }

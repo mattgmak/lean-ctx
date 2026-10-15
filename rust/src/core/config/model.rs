@@ -43,7 +43,7 @@ pub struct Config {
     pub slow_command_threshold_ms: u64,
     #[serde(default = "serde_defaults::default_theme")]
     pub theme: String,
-    /// Anonymous opt-in telemetry heartbeat (version, OS, arch — no code/PII).
+    /// Privacy-safe default-on telemetry with explicit and environment opt-outs.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
@@ -78,9 +78,16 @@ pub struct Config {
     pub response_shaping: ResponseShapingConfig,
     #[serde(default)]
     pub ocla: OclaConfig,
+    /// Global-only, explicit consent and independent pins for optional local code.
+    #[serde(default)]
+    pub intelligence_runtime: IntelligenceRuntimeConfig,
     /// Counterfactual Shadow Mode reporting (`[shadow]`), opt-in.
     #[serde(default)]
     pub shadow: ShadowConfig,
+    /// User-only value display (`[value_display]`): status line, recaps,
+    /// prompt segment, milestones. Never reaches the model context.
+    #[serde(default)]
+    pub value_display: ValueDisplayConfig,
     /// Generalized L1/L2/L3 cache settings (`[cache]`).
     #[serde(default)]
     pub cache: CacheConfig,
@@ -159,6 +166,8 @@ pub struct Config {
     pub buddy_enabled: bool,
     #[serde(default = "serde_defaults::default_true")]
     pub enable_wakeup_ctx: bool,
+    /// File globs delivered verbatim: native reads skip the hook redirect and
+    /// automatic `ctx_read` modes return them in full (#60).
     #[serde(default)]
     pub redirect_exclude: Vec<String>,
     /// Tools to exclude from the MCP tool list returned by list_tools.
@@ -187,11 +196,10 @@ pub struct Config {
     /// Override via LCTX_NO_DEGRADE=1 env var.
     #[serde(default)]
     pub no_degrade: bool,
-    /// Serve explicit `full`/`lines:N-M` re-reads of session-cached files as
-    /// deltas: when the file changed on disk since it was cached, the read
-    /// returns `mode=diff` instead of re-emitting content the model already
-    /// holds. First reads are unaffected; `fresh=true` always bypasses.
-    /// Opt-in. Override via LCTX_DELTA_EXPLICIT=1/0 env var.
+    /// Legacy opt-in delta preference. Concrete per-call full/lines requests
+    /// take precedence and stay fresh; this cannot replace their content with
+    /// a delta. Use mode=auto or mode=diff for reduced re-reads.
+    /// Retained for configuration compatibility. LCTX_DELTA_EXPLICIT=1/0 overrides.
     #[serde(default)]
     pub delta_explicit: bool,
     /// Persistent profile name. Checked after LEAN_CTX_PROFILE env var.
@@ -423,10 +431,10 @@ pub struct Config {
     /// Override via LEAN_CTX_NO_HOOK env var.
     #[serde(default)]
     pub shell_hook_disabled: bool,
-    /// Shadow mode (default: true): denies native Read/Grep/Glob at the
-    /// permission level, forcing agents to use ctx_* MCP tools for maximum
-    /// compression. Without this, many harnesses silently prefer native tools,
-    /// negating lean-ctx's token savings. Disable with `shadow_mode = false`.
+    /// Shadow mode (default: true): lean-ctx steers agents to ctx_* MCP tools,
+    /// and an explicit `hook_mode = "replace"` may deny native Grep/Glob.
+    /// `shadow_mode = false` caps every agent at Hybrid, so native tools are
+    /// never denied.
     /// Native Shell/Bash coverage is governed separately by `shell_hook_mode`.
     #[serde(default = "serde_defaults::default_true")]
     pub shadow_mode: bool,
@@ -452,11 +460,12 @@ pub struct Config {
     #[serde(default)]
     pub prompt_reinject: Option<String>,
     /// Global hook mode override. When set, overrides the per-agent auto-detection.
-    /// - `replace`: Native Read/Grep/Glob/Shell denied, lean-ctx MCP is the only path
-    /// - `hybrid`: MCP + shell hooks for compression (legacy)
+    /// - `replace`: native Grep/Glob (and non-rewritable shell where the host
+    ///   supports it) denied, lean-ctx MCP is the only path — opt-in only
+    /// - `hybrid`: MCP + shell hooks; native tools keep working
     /// - `mcp`: MCP server only, no hooks
-    ///
-    /// Default: unset (auto-detect per agent via `recommend_hook_mode`)
+    /// - `auto`/unset: Hybrid for hook-capable agents, else MCP
+    ///   (`recommend_hook_mode`)
     #[serde(default)]
     pub hook_mode: Option<String>,
     /// MCP tool surface mode. Controls how many tools `tools/list` advertises.
@@ -525,6 +534,11 @@ pub struct Config {
     /// 0 = unlimited (default). Set >0 to cap for constrained systems.
     #[serde(default = "serde_defaults::default_graph_index_max_files")]
     pub graph_index_max_files: u64,
+    /// Maximum number of files indexed into the BM25 corpus; the semantic index
+    /// chunks the same corpus (#737), so this bounds semantic coverage too.
+    /// 0 = unlimited. Default 5000 (MAX_BM25_FILES).
+    #[serde(default = "serde_defaults::default_bm25_max_files")]
+    pub bm25_max_files: u64,
     /// Controls RAM vs feature trade-off. Values: "low", "balanced" (default), "performance".
     /// Override via LEAN_CTX_MEMORY_PROFILE env var.
     #[serde(default)]
@@ -534,12 +548,39 @@ pub struct Config {
     /// Override via LEAN_CTX_MEMORY_CLEANUP env var.
     #[serde(default)]
     pub memory_cleanup: MemoryCleanup,
+    /// How the code graph uses local semantic backends (language servers, a
+    /// live JetBrains IDE). Values: "off", "auto" (default: only backends that
+    /// are already running), "eager" (may start language servers).
+    /// Override via LEAN_CTX_SEMANTIC_MODE env var.
+    #[serde(default)]
+    pub semantic_mode: SemanticMode,
     /// Soft process-RSS target as a percentage of system RAM (default: 5).
     /// The guardian throttles and evicts above it, but this is not an OS hard cap.
     /// Use a cgroup/container MemoryMax when strict isolation is required.
     /// Override via LEAN_CTX_MAX_RAM_PERCENT env var.
     #[serde(default = "serde_defaults::default_max_ram_percent")]
     pub max_ram_percent: u8,
+    /// Per-process RSS target (MB) of each stdio MCP server; the guardian uses
+    /// the lower of this and `max_ram_percent` (default 512, 0 = percent only).
+    /// Hosts like the Codex app-server keep one server per loaded thread alive
+    /// for days, so a percentage of a large machine's RAM alone is too loose.
+    /// Override via LEAN_CTX_MCP_MAX_RSS_MB env var.
+    #[serde(default = "serde_defaults::default_mcp_max_rss_mb")]
+    pub mcp_max_rss_mb: u64,
+    /// Process RSS target (MB) of the background daemon; the guardian uses the
+    /// lower of this and `max_ram_percent` (default 2048, 0 = percent only).
+    /// One daemon serves every session and project root on the machine for
+    /// days, so a percentage of a large machine's RAM alone is too loose (#2075).
+    /// Override via LEAN_CTX_DAEMON_MAX_RSS_MB env var.
+    #[serde(default = "serde_defaults::default_daemon_max_rss_mb")]
+    pub daemon_max_rss_mb: u64,
+    /// Exit a stdio MCP server after this many minutes without a tool call
+    /// (0 = never, the default). Off by default because some hosts (Codex)
+    /// do not restart an exited server: the resumed thread then loses
+    /// lean-ctx until the host restarts. Idle servers release their caches
+    /// either way (`memory_cleanup`). Override via LEAN_CTX_MCP_IDLE_EXIT_MINUTES.
+    #[serde(default)]
+    pub mcp_idle_exit_minutes: u64,
     /// Simplified disk budget (MB). When set and detail values are at defaults,
     /// distributes proportionally: archive=25%, bm25=10%, remainder for stores.
     /// 0 = disabled (use individual settings). Override via LEAN_CTX_MAX_DISK_MB.
@@ -561,7 +602,7 @@ pub struct Config {
     #[serde(default)]
     pub max_index_threads: usize,
     /// Controls visibility of token savings footers in tool output.
-    /// Values: "always" (default, show on every response), "never", "auto" (legacy compatibility).
+    /// Values: "never" (default), "always" (show on every response), "auto" (legacy compatibility).
     /// Override via LEAN_CTX_SAVINGS_FOOTER or LEAN_CTX_SHOW_SAVINGS=1|0 env var.
     #[serde(default)]
     pub savings_footer: SavingsFooter,
@@ -658,6 +699,11 @@ pub struct Config {
     /// Disabled by default → fully no-op until `sensitivity.enabled = true`.
     #[serde(default)]
     pub sensitivity: crate::core::sensitivity::SensitivityConfig,
+    /// Context Gateway admission (`[context_gateway]`): built-in detectors
+    /// that run on every governed source before caching or compression.
+    /// On by default. Global-only: a project-local file cannot weaken it.
+    #[serde(default)]
+    pub context_gateway: crate::core::context_admission::ContextGatewayConfig,
     /// MCP Tool-Catalog Gateway (#210): aggregate + query-route downstream MCP
     /// servers. Global-only (never merged from project-local config) and a full
     /// no-op until `gateway.enabled = true`.
@@ -696,6 +742,11 @@ pub struct Config {
     /// (The former `LEAN_CTX_NO_JAIL=1` env override was removed in v3.7.3.)
     #[serde(default)]
     pub path_jail: Option<bool>,
+    /// What the enforced jail admits besides the project + allow-lists:
+    /// `home` (default — every project below `$HOME`, read-only, except dot
+    /// entries, `~/Library`, `~/AppData`) or `project`. See `core::pathjail_scope`.
+    #[serde(default)]
+    pub path_jail_scope: Option<String>,
     /// Sandbox level for code execution (ctx_exec).
     /// 0 = subprocess only (current), 1 = OS-level restriction (Seatbelt/Landlock).
     /// Override via LEAN_CTX_SANDBOX_LEVEL env var.
@@ -729,6 +780,16 @@ pub struct Config {
     /// Default false preserves backward compatibility — set true for maximum security.
     #[serde(default)]
     pub shell_strict_mode: bool,
+
+    /// GH #1419 follow-up: scope a multi-word `shell_allowlist`/
+    /// `shell_allowlist_extra` entry to the exact subcommand/prefix it names
+    /// (`"git status"` no longer grants the whole `git` binary). Default
+    /// `true` (the secure grammar); set `false` to fall back to the old
+    /// base-binary-only matching as a compat/rollback path. Trust-gated: an
+    /// untrusted workspace cannot weaken this via a local override. Override
+    /// via `LEAN_CTX_SHELL_ALLOWLIST_SUBCOMMAND_SCOPING`.
+    #[serde(default = "serde_defaults::default_true")]
+    pub shell_allowlist_subcommand_scoping: bool,
 
     /// Shell-security mode for ctx_shell / `lean-ctx -c` command gating (GL #788):
     /// `enforce` (default, secure), `warn` (run checks, log violations, never

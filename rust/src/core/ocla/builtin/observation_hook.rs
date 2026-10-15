@@ -1,15 +1,16 @@
-//! BuiltinObservationHook — emits structured observations to OclaBus.
+// SPDX-License-Identifier: Apache-2.0
+//! BuiltinObservationHook — keeps structured observations per session.
 //!
-//! Wraps the proxy observation path. Each `observe` call appends to a
-//! bounded per-session ring buffer and emits a CompressionApplied event
-//! (the closest existing event type for observation signals).
+//! Wraps the proxy observation path. Each `observe` call enriches the
+//! observation with delivered tokens and compression ratio and appends it to a
+//! bounded per-session ring buffer. File-access heatmap recording belongs to
+//! the unified execution lifecycle, so the hook has no side effects.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use crate::core::ocla::traits::{ObservationHook, OclaService};
 use crate::core::ocla::types::{Observation, OclaCapability, OclaCapabilityKind, OclaResult};
-use crate::core::ocla_bus::{self, OclaEvent};
 use crate::core::savings_ledger::event::SavingsEvent;
 
 const MAX_OBSERVATIONS: usize = 512;
@@ -46,17 +47,10 @@ impl BuiltinObservationHook {
         ring.iter().skip(start).cloned().collect()
     }
 
-    /// Classify compression quality from the fraction of tokens saved.
+    /// Compression band from the fraction of tokens saved — the same bands the
+    /// savings ledger records, so `quality_signal` has one meaning per event.
     pub fn quality_signal_for_compression(ratio: f64) -> String {
-        if ratio >= 0.8 {
-            "excellent".into()
-        } else if ratio >= 0.5 {
-            "good".into()
-        } else if ratio >= 0.2 {
-            "moderate".into()
-        } else {
-            "marginal".into()
-        }
+        crate::core::savings_ledger::compression_band(ratio).into()
     }
 
     /// Attach compression quality context to a savings event.
@@ -91,23 +85,6 @@ impl BuiltinObservationHook {
             .insert(COMPRESSION_RATIO_MILLI.into(), ratio.to_string());
         (original, saved)
     }
-
-    fn project_heatmap(observation: &Observation, original: u64, saved: u64) {
-        let Some(path) = observation.context.content_ref.strip_prefix("file:") else {
-            return;
-        };
-        if path.is_empty() || original == 0 {
-            return;
-        }
-        let original = usize::try_from(original).unwrap_or(usize::MAX);
-        let saved = usize::try_from(saved).unwrap_or(usize::MAX);
-        crate::core::heatmap::record_file_access_with_agent(
-            path,
-            original,
-            saved.min(original),
-            Some(&observation.context.agent_id),
-        );
-    }
 }
 
 impl Default for BuiltinObservationHook {
@@ -117,6 +94,10 @@ impl Default for BuiltinObservationHook {
 }
 
 impl OclaService for BuiltinObservationHook {
+    fn manifest(&self) -> crate::core::ocla::OclaResult<lean_ctx_protocol::CapabilityManifestV1> {
+        crate::core::ocla::capability_fabric::builtin_manifest(&self.capability())
+    }
+
     fn capability(&self) -> OclaCapability {
         OclaCapability::available(OclaCapabilityKind::ObservationHook)
     }
@@ -125,22 +106,8 @@ impl OclaService for BuiltinObservationHook {
 #[async_trait::async_trait]
 impl ObservationHook for BuiltinObservationHook {
     async fn observe(&self, mut observation: Observation) -> OclaResult<()> {
-        let (original, saved) = Self::enrich(&mut observation);
+        Self::enrich(&mut observation);
         let session_id = observation.context.session_id.clone();
-        let name = observation.name.clone();
-        let path = observation
-            .context
-            .content_ref
-            .strip_prefix("file:")
-            .map(str::to_string);
-        let ratio = if original == 0 {
-            0.0
-        } else {
-            saved as f64 / original as f64
-        };
-        let quality_signal = Self::quality_signal_for_compression(ratio);
-        Self::project_heatmap(&observation, original, saved);
-
         let mut state = self
             .state
             .lock()
@@ -148,20 +115,13 @@ impl ObservationHook for BuiltinObservationHook {
 
         let ring = state
             .ring
-            .entry(session_id.clone())
+            .entry(session_id)
             .or_insert_with(|| VecDeque::with_capacity(MAX_OBSERVATIONS));
 
         if ring.len() >= MAX_OBSERVATIONS {
             ring.pop_front();
         }
         ring.push_back(observation);
-
-        ocla_bus::emit(OclaEvent::CompressionApplied {
-            path,
-            before_tokens: original,
-            after_tokens: original.saturating_sub(saved),
-            strategy: format!("observation:{name};quality:{quality_signal}"),
-        });
 
         Ok(())
     }
@@ -202,7 +162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observe_enriches_tokens_and_projects_file_access() {
+    async fn observe_enriches_tokens_without_projecting_side_effects() {
         let hook = BuiltinObservationHook::new();
         let mut context = ctx("s1");
         context.content_ref = "file:src/observed.rs".into();
@@ -282,26 +242,6 @@ mod tests {
         let stored = state.ring.get("s1").unwrap().back().unwrap();
         assert_eq!(stored.attributes[DELIVERED_TOKENS], "0");
         assert_eq!(stored.attributes[COMPRESSION_RATIO_MILLI], "1000");
-    }
-
-    #[test]
-    fn compression_quality_signal_uses_expected_thresholds() {
-        assert_eq!(
-            BuiltinObservationHook::quality_signal_for_compression(0.8),
-            "excellent"
-        );
-        assert_eq!(
-            BuiltinObservationHook::quality_signal_for_compression(0.5),
-            "good"
-        );
-        assert_eq!(
-            BuiltinObservationHook::quality_signal_for_compression(0.2),
-            "moderate"
-        );
-        assert_eq!(
-            BuiltinObservationHook::quality_signal_for_compression(0.19),
-            "marginal"
-        );
     }
 
     #[test]

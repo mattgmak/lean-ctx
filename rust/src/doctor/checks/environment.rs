@@ -530,6 +530,32 @@ pub(crate) fn docker_env_outcomes() -> Vec<Outcome> {
 
     outcomes
 }
+/// The optional lean-ctx Claude Code mod: shown when Claude Code is present,
+/// never a failure when absent (it is opt-in). File-only — no `claude` spawn.
+pub(crate) fn claude_mod_outcome() -> Option<Outcome> {
+    use crate::hooks::agents::claude_mod;
+    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
+    if !claude_dir.is_dir() {
+        return None;
+    }
+    let versions = claude_mod::cached_versions(&claude_dir);
+    let want = claude_mod::mod_version();
+    let line = if versions.contains(&claude_mod::cache_dir_name(&want)) {
+        format!("{BOLD}Claude Code mod{RST}  {GREEN}installed ({want}){RST}")
+    } else if let Some(old) = versions.last() {
+        format!(
+            "{BOLD}Claude Code mod{RST}  {YELLOW}{old} — this engine ships {want}{RST}  {DIM}(run: lean-ctx claude-mod install){RST}"
+        )
+    } else {
+        format!(
+            "{BOLD}Claude Code mod{RST}  {DIM}not installed — optional: wake-not-poll, Bash shaping, /leanctx (run: lean-ctx claude-mod install){RST}"
+        )
+    };
+    Some(Outcome { ok: true, line })
+}
+
 pub(crate) fn skill_files_outcome() -> Outcome {
     let Some(home) = dirs::home_dir() else {
         return Outcome {
@@ -676,31 +702,100 @@ pub(crate) fn config_parity_outcome() -> Outcome {
         }
     }
 }
+/// A user-global agent MCP entry that pins `LEAN_CTX_PROJECT_ROOT` /
+/// `LEAN_CTX_EXTRA_ROOTS` binds every session of that agent — in any repo — to
+/// one project. Builds before the pin heal wrote these themselves.
+pub(crate) fn project_pin_outcome() -> Outcome {
+    let pinned = dirs::home_dir()
+        .map(|home| crate::hooks::project_pins::pinned_agent_configs(&home))
+        .unwrap_or_default();
+    if pinned.is_empty() {
+        return Outcome {
+            ok: true,
+            line: format!(
+                "{BOLD}Project binding{RST}  {GREEN}per session{RST}  {DIM}(no agent config pins a project){RST}"
+            ),
+        };
+    }
+    let list = pinned
+        .iter()
+        .map(|(agent, path)| format!("{agent} ({})", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Outcome {
+        ok: false,
+        line: format!(
+            "{BOLD}Project binding{RST}  {YELLOW}pinned globally in {list}{RST}  {DIM}-> every session of that agent opens the same project; run: lean-ctx doctor --fix, then restart the agent{RST}"
+        ),
+    }
+}
+
+/// How the code graph uses the language servers listed below.
+pub(crate) fn semantic_mode_outcome() -> Outcome {
+    use crate::core::config::{Config, SemanticMode};
+    let explain = match SemanticMode::effective(&Config::load()) {
+        SemanticMode::Off => "off  — structural graph only, no semantic backend is queried",
+        SemanticMode::Auto => {
+            "auto — verifies graph edges with servers that are already running or a live IDE; never starts one in the background"
+        }
+        SemanticMode::Eager => {
+            "eager — background graph enrichment may start the language servers below (trusted workspaces only; others run as auto)"
+        }
+    };
+    Outcome {
+        ok: true,
+        line: format!("{BOLD}semantic_mode{RST}  {explain}"),
+    }
+}
+
+/// Per-language verified share of the current project's call edges, when the
+/// project has a property graph. Opening a graph is read-only here: doctor
+/// never builds one.
+pub(crate) fn semantic_coverage_outcomes() -> Vec<Outcome> {
+    let Some(root) = crate::core::config::Config::find_project_root() else {
+        return Vec::new();
+    };
+    if !crate::core::property_graph::graph_dir(&root)
+        .join("graph.db")
+        .exists()
+    {
+        return Vec::new();
+    }
+    let Ok(graph) = crate::core::property_graph::CodeGraph::open(&root) else {
+        return Vec::new();
+    };
+    use crate::core::semantic::coverage::{coverage_by_language, coverage_lines};
+    coverage_lines(&coverage_by_language(&graph), &root)
+        .into_iter()
+        .map(|line| Outcome {
+            ok: true,
+            line: format!("{BOLD}coverage{RST} {}", line.trim_start()),
+        })
+        .collect()
+}
+
 pub(crate) fn lsp_server_outcomes() -> Vec<Outcome> {
-    use crate::lsp::config::{KNOWN_SERVERS, find_binary_in_path};
+    use crate::lsp::config::{KNOWN_SERVERS, resolve_server};
 
     KNOWN_SERVERS
         .iter()
-        .map(|info| {
-            let found = find_binary_in_path(info.binary);
-            match found {
-                Some(path) => Outcome {
-                    ok: true,
-                    line: format!(
-                        "{BOLD}{}{RST}  {GREEN}✓ {}{RST}  {DIM}{}{RST}",
-                        info.language,
-                        info.binary,
-                        path.display()
-                    ),
-                },
-                None => Outcome {
-                    ok: false,
-                    line: format!(
-                        "{BOLD}{}{RST}  {DIM}not installed{RST}  {YELLOW}{}{RST}",
-                        info.language, info.install_hint
-                    ),
-                },
-            }
+        .map(|info| match resolve_server(info.language, None) {
+            Some(server) => Outcome {
+                ok: true,
+                line: format!(
+                    "{BOLD}{}{RST}  {GREEN}✓ {}{RST}  {DIM}{}{RST}",
+                    info.language,
+                    server.binary_name(),
+                    server.binary_path().display()
+                ),
+            },
+            None => Outcome {
+                ok: false,
+                line: format!(
+                    "{BOLD}{}{RST}  {DIM}not installed{RST}  {YELLOW}{}{RST}",
+                    info.language, info.install_hint
+                ),
+            },
         })
         .collect()
 }

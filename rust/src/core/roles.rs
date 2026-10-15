@@ -200,6 +200,32 @@ fn builtin_coder() -> Role {
     }
 }
 
+/// A role used when an inherited source view has closed or lost its authority.
+/// Returning a denying role prevents stale worker state from falling through
+/// to a more permissive process-wide active role.
+pub(crate) fn closed_source_view_role() -> Role {
+    Role {
+        role: RoleMeta {
+            name: "closed-source-view".into(),
+            inherits: None,
+            description: "closed source policy view".into(),
+            shell_policy: "deny".into(),
+        },
+        tools: ToolPolicy {
+            allowed: Vec::new(),
+            denied: vec!["*".into()],
+        },
+        io: IoPolicy::default(),
+        limits: RoleLimits {
+            max_context_tokens: 0,
+            max_shell_invocations: 0,
+            max_cost_usd: 0.0,
+            warn_at_percent: 0,
+            block_at_percent: 0,
+        },
+    }
+}
+
 fn builtin_reviewer() -> Role {
     Role {
         role: RoleMeta {
@@ -350,7 +376,15 @@ fn roles_dir_global() -> Option<PathBuf> {
 }
 
 fn roles_dir_project() -> Option<PathBuf> {
-    roles_dir_project_from(None)
+    match crate::core::policy::runtime::REQUEST_PROJECT.try_with(|slot| slot.borrow().clone()) {
+        Ok(Some(project_root)) => {
+            let candidate = project_root.join(".lean-ctx").join("roles");
+            candidate.is_dir().then_some(candidate)
+        }
+        // An explicit unbound scope must not fall back to the process CWD.
+        Ok(None) => None,
+        Err(_) => roles_dir_project_from(None),
+    }
 }
 
 fn roles_dir_project_from(project_root: Option<&str>) -> Option<PathBuf> {
@@ -502,8 +536,63 @@ pub fn active_role_name() -> String {
 }
 
 pub fn active_role() -> Role {
+    if let Some(role) = crate::core::policy::runtime::pinned_role() {
+        return role;
+    }
+    #[cfg(test)]
+    if let Ok(Some(role)) = TEST_ACTIVE_ROLE.try_with(|slot| slot.borrow().clone()) {
+        return role;
+    }
     let name = active_role_name();
     load_role(&name).unwrap_or_else(builtin_coder)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_ACTIVE_ROLE: std::cell::RefCell<Option<Role>>;
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_active_role<T>(role: Role, operation: impl FnOnce() -> T) -> T {
+    TEST_ACTIVE_ROLE.sync_scope(std::cell::RefCell::new(Some(role)), operation)
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_active_role(role: Role) {
+    TEST_ACTIVE_ROLE.with(|slot| *slot.borrow_mut() = Some(role));
+}
+
+/// Held by every test that changes the process-wide role with
+/// [`set_active_role`]: serializes them and restores the previous role on
+/// drop, so a switch to `reviewer` or `admin` neither races another such test
+/// nor leaks into unrelated tests. Tests that only need a role for their own
+/// thread use [`with_test_active_role`] instead.
+#[cfg(test)]
+pub(crate) struct GlobalRoleGuard {
+    previous: String,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) fn lock_global_role() -> GlobalRoleGuard {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    GlobalRoleGuard {
+        previous: active_role_name(),
+        _lock: lock,
+    }
+}
+
+#[cfg(test)]
+impl Drop for GlobalRoleGuard {
+    fn drop(&mut self) {
+        let slot = ACTIVE_ROLE_NAME.get_or_init(|| std::sync::Mutex::new(String::new()));
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = self.previous.clone();
+    }
 }
 
 /// Roles that grant elevated privileges and cannot be activated via MCP tool calls.
@@ -775,7 +864,7 @@ pub mod tests {
     #[test]
     fn default_role_is_coder() {
         let name = active_role_name();
-        assert!(!name.is_empty());
+        assert!(!name.is_empty(), "`name` is empty");
     }
 
     #[test]
@@ -797,6 +886,7 @@ pub mod tests {
 
     #[test]
     fn runtime_escalation_to_admin_blocked() {
+        let _role = lock_global_role();
         let result = set_active_role("admin");
         assert!(
             result.is_err(),
@@ -811,12 +901,14 @@ pub mod tests {
 
     #[test]
     fn runtime_escalation_to_ops_blocked() {
+        let _role = lock_global_role();
         let result = set_active_role("ops");
         assert!(result.is_err(), "runtime escalation to ops must be blocked");
     }
 
     #[test]
     fn config_escalation_to_admin_allowed() {
+        let _role = lock_global_role();
         let result = set_active_role_with_source("admin", true);
         assert!(
             result.is_ok(),
@@ -826,12 +918,14 @@ pub mod tests {
 
     #[test]
     fn runtime_switch_to_coder_allowed() {
+        let _role = lock_global_role();
         let result = set_active_role("coder");
         assert!(result.is_ok(), "switching to coder must always work");
     }
 
     #[test]
     fn runtime_switch_to_reviewer_allowed() {
+        let _role = lock_global_role();
         let result = set_active_role("reviewer");
         assert!(result.is_ok(), "switching to reviewer must always work");
     }
@@ -874,6 +968,7 @@ pub mod tests {
 
     #[test]
     fn invalid_role_name_rejected_at_set() {
+        let _role = lock_global_role();
         let result = set_active_role("../../evil");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid role name"));
@@ -901,6 +996,7 @@ pub mod tests {
 
     #[test]
     fn debugger_runtime_switch_allowed() {
+        let _role = lock_global_role();
         let result = set_active_role("debugger");
         assert!(
             result.is_ok(),

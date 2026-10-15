@@ -158,7 +158,8 @@ fn new_event(tool: &str) -> SavingsEvent {
         evidence_class: Some(evidence_class),
         confidence: None,
         request_id: None,
-        session_id: None,
+        // Committed into the v7 hash, so per-session totals are chain-backed.
+        session_id: crate::core::value::current_session(),
         trace_id: None,
         solution_decision: None,
         loc_added: None,
@@ -223,13 +224,19 @@ fn compression_quality_signal(original: usize, compressed: usize) -> Option<Stri
         return None;
     }
     let ratio = 1.0 - (compressed as f64 / original as f64);
-    let signal = match ratio {
+    Some(compression_band(ratio).to_owned())
+}
+
+/// Band of the fraction of tokens removed, stored as `SavingsEvent::quality_signal`.
+/// The single definition for every writer of that field; a compression measure, not
+/// a quality one.
+pub(crate) fn compression_band(removed_fraction: f64) -> &'static str {
+    match removed_fraction {
         r if r >= 0.7 => "excellent",
         r if r >= 0.5 => "good",
         r if r >= 0.3 => "moderate",
         _ => "marginal",
-    };
-    Some(signal.to_owned())
+    }
 }
 
 /// Best-effort append of one auditable savings event for a value-producing read.
@@ -315,53 +322,6 @@ pub fn record_tool_event_with_stream(
     event.is_first_inject = Some(is_first_inject);
     event.cache_read_per_m_usd = Some(quote.cost.cache_read_per_m);
     event.cache_write_per_m_usd = Some(quote.cost.cache_write_per_m);
-    append_with_unified(&path, event, None);
-}
-
-/// Best-effort append of a *routing* savings event (enterprise#13/#19): the gateway served
-/// the request with a cheaper model than requested. Unlike compression events the saving is
-/// a **rate** difference on the same tokens, so the caller passes the measured input tokens
-/// plus both models; the event is valued with the shared ledger attribution formula
-/// (`eval_ab::routing_eval::routing_saving_usd`). Negative-value routes (an upgrade) are
-/// recorded too — the ledger never hides regressions. Skips only true no-ops.
-pub fn record_routing_event(requested_model: &str, serving_model: &str, input_tokens: u64) {
-    if input_tokens == 0 || requested_model == serving_model || !enabled() {
-        return;
-    }
-    let Some(path) = store::default_path() else {
-        return;
-    };
-
-    let pricing = crate::core::gain::model_pricing::ModelPricing::load();
-    let saved_usd = crate::core::eval_ab::routing_eval::routing_saving_usd(
-        &pricing,
-        requested_model,
-        serving_model,
-        input_tokens,
-    );
-    if saved_usd == 0.0 {
-        return; // same rate — nothing to attribute
-    }
-
-    let mut event = new_event("proxy_route");
-    event.mechanism = event::MECHANISM_ROUTING.to_string();
-    event.attribution_group = Some(
-        crate::core::attribution::attribution_group_for_mechanism(event::MECHANISM_ROUTING)
-            .to_string(),
-    );
-    // The event is denominated in the *serving* model (what actually ran); the
-    // rate delta to the requested model is captured in saved_usd.
-    let quote = pricing.quote(Some(serving_model));
-    event.model_id = quote.model_key;
-    event.unit_price_per_m_usd = quote.cost.input_per_m;
-    event.model_original = Some(requested_model.to_string());
-    event.model_routed = Some(serving_model.to_string());
-    event.baseline_tokens = input_tokens;
-    event.actual_tokens = input_tokens;
-    event.routing_savings = Some(event.baseline_tokens.saturating_sub(event.actual_tokens));
-    // saved_tokens stays 0: routing saves dollars at equal tokens. Token
-    // savings remain the compression mechanism's dimension.
-    event.saved_usd = saved_usd;
     append_with_unified(&path, event, None);
 }
 
@@ -623,49 +583,6 @@ mod tests {
         assert_eq!(unified.event_hash, ev.entry_hash);
         assert_eq!(unified.agent_id.as_deref(), Some(ev.agent_id.as_str()));
         assert_eq!(unified.attribution_id, ev.repo_hash);
-    }
-
-    /// enterprise#19: a gateway route (requested ≠ serving) lands as a
-    /// `routing`-mechanism event valued with the shared rate-delta formula,
-    /// denominated in the serving model; no-ops are skipped.
-    #[test]
-    fn record_routing_event_appends_rate_delta() {
-        let _lock = crate::core::data_dir::test_env_lock();
-        let dir = std::env::temp_dir().join(format!("lctx-ledger-route-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        crate::test_env::set_var("LEAN_CTX_DATA_DIR", dir.to_str().unwrap());
-
-        record_routing_event("claude-opus-4.5", "claude-opus-4.5", 10_000); // no-op
-        record_routing_event("claude-opus-4.5", "phi-4", 0); // no tokens
-        record_routing_event("claude-opus-4.5", "phi-4", 10_000);
-
-        let ledger = dir.join("savings").join("ledger.jsonl");
-        let content = std::fs::read_to_string(&ledger).expect("ledger written");
-        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert_eq!(
-            content.lines().count(),
-            1,
-            "only the real route is recorded"
-        );
-        let ev: SavingsEvent =
-            serde_json::from_str(content.lines().next().unwrap()).expect("valid JSON");
-        assert_eq!(ev.tool, "proxy_route");
-        assert_eq!(ev.mechanism, MECHANISM_ROUTING);
-        assert_eq!(ev.model_id, "phi-4", "denominated in the serving model");
-        assert_eq!(ev.model_original.as_deref(), Some("claude-opus-4.5"));
-        assert_eq!(ev.model_routed.as_deref(), Some("phi-4"));
-        assert_eq!(ev.routing_savings, Some(0));
-        assert_eq!(
-            ev.measurement_method,
-            Some(event::MeasurementMethod::DirectCount)
-        );
-        assert_eq!(ev.evidence_class, Some(event::EvidenceClass::Approximated));
-        assert_eq!(ev.saved_tokens, 0, "routing saves dollars, not tokens");
-        // 10k tokens × (5.00 − 0.125)/MTok = $0.04875.
-        assert!((ev.saved_usd - 0.048_75).abs() < 1e-9);
     }
 
     #[test]

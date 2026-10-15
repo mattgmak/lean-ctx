@@ -2,8 +2,8 @@
 
 > **Status: Available first-class local setup path.** LeanCTX attaches to
 > Codex through local Runtime wiring; its coverage is limited to observable
-> context behavior. Product scope and claim discipline are governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> context behavior. See the [canonical positioning](../POSITIONING_CANONICAL.md)
+> for current product scope and claim boundaries.
 
 Complete guide to setting up and optimally using lean-ctx with Codex CLI (OpenAI's terminal-based coding agent).
 
@@ -15,6 +15,52 @@ Complete guide to setting up and optimally using lean-ctx with Codex CLI (OpenAI
 | Config file | `~/.codex/config.toml` |
 | Rules file | `~/.codex/instructions.md` (shared block) |
 | Setup command | `lean-ctx init --agent codex` |
+
+## Protected project session
+
+For a session whose controlled context must pass the project's LeanCTX policy,
+use the explicit protected setup. The qualified combination is currently macOS
+and Codex CLI **0.156.1**; other versions/platforms are refused. Interactive login,
+refresh and consent still require release qualification.
+
+For a project without `.lean-ctx/policy.toml`, first review a built-in pack:
+
+```bash
+lean-ctx policy list
+lean-ctx policy show baseline --toml
+lean-ctx setup codex-protected --project /path/to/project --policy-pack baseline
+```
+
+This creates that selected policy with owner-only permissions and checks the
+protected session configuration. It never replaces an existing policy. Review
+and customize the file for your data: a preset does not identify your customer
+number format automatically. If a later check fails, the created policy remains
+available for review; no Codex session is started.
+
+For a project with an existing policy, omit `--policy-pack`:
+
+```bash
+lean-ctx setup codex-protected --project /path/to/project --check
+```
+
+Checks do not read Codex login credentials or start model calls. `--check` cannot
+be combined with policy creation or session start. After reviewing the policy,
+log in through your normal Codex installation if needed, then start explicitly:
+
+```bash
+codex login
+lean-ctx setup codex-protected --project /path/to/project --start
+```
+
+`--codex /path/to/codex` selects an executable; the same version check applies.
+The protected path creates a temporary isolated Codex home and workspace, routes
+project access through LeanCTX MCP, and removes the temporary session on normal
+exit. Missing credentials or failed checks stop the launch. It does not alter
+global editor configuration or start/restart the global daemon or proxy.
+
+This is a controlled-context boundary, not general network isolation for arbitrary
+programs or separately exposed unauthenticated services. The ordinary hybrid
+setup below remains available; hooks alone do not provide this protected path.
 
 ## Quick Setup
 
@@ -53,7 +99,7 @@ If the file already exists, lean-ctx merges the `[mcp_servers.lean-ctx]` section
 Codex CLI shares its rules infrastructure with Claude Code. lean-ctx creates dedicated rules at the Claude rules directory:
 
 ```markdown
-# lean-ctx — Context Engineering Layer
+# LeanCTX — Context Gateway for AI Systems
 <!-- lean-ctx-rules -->
 
 ## Mode Selection
@@ -69,8 +115,8 @@ Anti-pattern: NEVER use `full` for files you won't edit — use `map` or `signat
 ## File Editing
 Anchored editing: `ctx_read(mode="anchored")` → `ctx_patch(path, op, line, hash, new_text)` —
 never echo old text; batch via `ops:[…]`; `op=create` for new files. Stale anchor → CONFLICT
-with fresh anchors (retry once). Native Edit/StrReplace stay fine; `ctx_edit` is the legacy
-power-profile fallback. Write, Delete, Glob → use normally.
+with fresh anchors (retry once). Codex's own `apply_patch` stays fine; `ctx_edit` is the legacy
+power-profile fallback.
 
 ## Proactive (use without being asked)
 - `ctx_overview(task)` at session start
@@ -228,17 +274,17 @@ export CODEX_HOME=/custom/path
 lean-ctx init --agent codex  # Writes to /custom/path/config.toml
 ```
 
-## Token Savings
+## Context selection and measurement
 
-| Operation | Without lean-ctx | With lean-ctx | Savings |
-|-----------|-----------------|---------------|---------|
-| File read (cached) | ~2000 tokens | ~13 tokens | 99.4% |
-| File read (map) | ~2000 tokens | ~400 tokens | 80% |
-| `git diff` | ~1200 tokens | ~200 tokens | 83% |
-| `cargo test` | ~2000 tokens | ~300 tokens | 85% |
-| `npm run build` | ~1500 tokens | ~250 tokens | 83% |
+Use `map` or `signatures` when structure is enough, focused line modes for a
+specific region, and `full` when the task needs the source. Shell hooks can
+summarize supported command output. The representation and resulting context
+depend on the file, task, integration, and recovery behavior.
 
-Monitor savings:
+`lean-ctx gain --live` reports local usage and token/cost estimates for activity
+it observes. Provider-reported usage is available only for supported routed
+paths that record it; estimates do not establish invoice savings or answer
+quality.
 
 ```bash
 lean-ctx gain --live

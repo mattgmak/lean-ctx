@@ -10,10 +10,15 @@
 //! - **idle-evicted**: a session unused for `IDLE_TTL` is dropped on the next
 //!   access (closing the child's stdin → the server exits), swept opportunistically
 //!   on every [`acquire`],
-//! - **liveness-checked**: [`acquire`] also drops any session whose transport has
-//!   closed (the child exited/crashed) *before* handing one out, so a request is
-//!   never sent into a dead pipe — and callers never have to blindly re-send a
-//!   request to recover (which could double-execute a non-idempotent tool).
+//! - **self-healing**: [`acquire`] drops a session that was cancelled before
+//!   handing one out. A child that died *between* calls is not visible through
+//!   rmcp's `RunningService` (its `is_closed` only reports cancellation), so the
+//!   first call on it fails, [`super::client`] evicts it, and the next call
+//!   reopens a fresh child. A failed request is never re-sent blindly, which
+//!   could double-execute a non-idempotent tool,
+//! - **driven by one runtime**: every gateway caller runs on the process-lifetime
+//!   [`super::runtime`], so a pooled session's transport tasks outlive the call
+//!   that opened it (#2040).
 //!
 //! The map lock is a `std::sync::Mutex` held only for short, await-free critical
 //! sections (the slow `open()` runs outside the lock), which keeps [`clear`]
@@ -66,8 +71,9 @@ fn pool_identity(transport: &ResolvedTransport) -> String {
             url,
             headers,
             secret_fingerprints,
+            oauth,
         } => format!(
-            "http|url={url:?}|headers={:?}|secrets={:?}",
+            "http|url={url:?}|headers={:?}|secrets={:?}|oauth={oauth}",
             public_values_case_insensitive(headers, secret_fingerprints),
             normalized_secret_fingerprints(secret_fingerprints)
         ),
@@ -195,6 +201,7 @@ mod tests {
             url: "https://gitlab.example/mcp".into(),
             headers: headers.clone(),
             secret_fingerprints: secrets.clone(),
+            oauth: false,
         };
         assert!(!pool_identity(&first).contains("raw-token-one"));
         headers.insert("Authorization".into(), "Bearer raw-token-two".into());
@@ -202,6 +209,7 @@ mod tests {
             url: "https://gitlab.example/mcp".into(),
             headers,
             secret_fingerprints: secrets.clone(),
+            oauth: false,
         };
         assert_eq!(key(&first), key(&same_fingerprint));
         secrets.insert("Authorization".into(), "fp-two".into());
@@ -209,6 +217,7 @@ mod tests {
             url: "https://gitlab.example/mcp".into(),
             headers: BTreeMap::from([("Authorization".into(), "Bearer raw-token-two".into())]),
             secret_fingerprints: secrets,
+            oauth: false,
         };
         assert_ne!(key(&first), key(&rotated));
     }
@@ -219,11 +228,13 @@ mod tests {
             url: "https://example.com/mcp".into(),
             headers: BTreeMap::from([("Authorization".into(), "private-token".into())]),
             secret_fingerprints: BTreeMap::from([("Authorization".into(), "fingerprint".into())]),
+            oauth: false,
         };
         let lower_fingerprint = ResolvedTransport::Http {
             url: "https://example.com/mcp".into(),
             headers: BTreeMap::from([("Authorization".into(), "private-token".into())]),
             secret_fingerprints: BTreeMap::from([("authorization".into(), "fingerprint".into())]),
+            oauth: false,
         };
 
         assert!(!pool_identity(&lower_fingerprint).contains("private-token"));

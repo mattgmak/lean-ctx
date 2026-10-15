@@ -19,6 +19,7 @@ Top-level configuration keys
 - `auto_mode_learning` (bool, default `false` — env `LEAN_CTX_AUTO_MODE_LEARNING`) — Opt-in: let adaptive learning signals (predictor, bandit, heatmap, adaptive policy, bounce/path memory) influence `auto` mode. Off by default for a deterministic, I/O-light cascade (capability guards + size/task heuristic only) that keeps output byte-stable for prompt caching. Override via LEAN_CTX_AUTO_MODE_LEARNING
 - `behavior_nudges` (String, default `auto`) — In-band behavior hints (heavy full/raw reads, search→read→search chains): auto (default, one hint per pattern per session) or off. Detections are always counted for `tools health`.
 - `bm25_max_cache_mb` (u64, default `128` — env `LEAN_CTX_BM25_MAX_CACHE_MB`) — Maximum BM25 cache file size in MB
+- `bm25_max_files` (u64, default `5000`) — Maximum files in the BM25 corpus (the semantic index chunks the same corpus). 0 = unlimited
 - `buddy_enabled` (bool, default `true`) — Enable the experimental local buddy helper. It does not enable a public multi-agent product or MCP surface.
 - `bypass_hints` (enum: on | off | aggressive, default `on` — env `LEAN_CTX_BYPASS_HINTS`) — Bypass-hint mode: when agents use native Read/Grep instead of lean-ctx tools, a hint is appended to the next tool response. on (default), off, aggressive (hint on every call, no cooldown). Override via LEAN_CTX_BYPASS_HINTS
 - `cache_max_tokens` (usize, default `0` — env `LEAN_CTX_CACHE_MAX_TOKENS`) — Token budget for the in-memory ctx_read cache (0 = built-in default 500k). When exceeded, least-valuable entries are evicted immediately via RRF (recency x frequency x size) so reads never block; eviction is not deferred to the staleness TTL
@@ -30,10 +31,11 @@ Top-level configuration keys
 - `content_defined_chunking` (bool, default `false`) — Enable Rabin-Karp chunking for cache-optimal output ordering
 - `crush_verbatim_json` (bool, default `false` — env `LEAN_CTX_CRUSH_VERBATIM_JSON`) — Opt-in: losslessly crush array-heavy JSON from verbatim data commands (gh api, jq, kubectl get -o json, curl). Off by default keeps them verbatim. Reshapes only when it at least halves the payload; fully reconstructible
 - `custom_aliases` (array, default `[]`) — Custom command aliases (array of {command, alias} entries)
+- `daemon_max_rss_mb` (u64, default `2048` — env `LEAN_CTX_DAEMON_MAX_RSS_MB`) — Process RSS target (MB) of the background daemon; the guardian evicts above the lower of this and max_ram_percent (default 2048, 0 = percent only)
 - `dashboard_auth` (bool, default `true`) — Require Bearer-token auth for the dashboard (default true). Set false for no-auth mode protected by Sec-Fetch-Site/Origin/Host checks. Override per-run with --no-auth or LEAN_CTX_DASHBOARD_AUTH
 - `debug_log` (bool, default `false` — env `LEAN_CTX_DEBUG_LOG`) — Opt-in (default off): write a human-readable debug log of intercepted MCP tool calls and hook routing decisions (lean-ctx vs native, with the reason) to <state_dir>/logs/debug.log. View with `lean-ctx debug-log`
 - `default_tool_categories` (string[], default `[]`) — Tool categories active by default. `core` is the default; `session` enables experimental local collaboration tools only when explicitly listed. Override via LCTX_DEFAULT_CATEGORIES
-- `delta_explicit` (boolean, default `false`) — Serve explicit full/lines re-reads of changed cached files as diffs (opt-in). Override via LCTX_DELTA_EXPLICIT=1
+- `delta_explicit` (boolean, default `false`) — Legacy delta preference (opt-in); concrete per-call full/lines requests remain fresh and exact. Use mode=auto or mode=diff for reduced re-reads. Override via LCTX_DELTA_EXPLICIT=1
 - `disabled_tools` (string[], default `[]`) — Tools to exclude from the MCP tool list
 - `enable_wakeup_ctx` (bool, default `true`) — Append wakeup briefing (facts, session summary) to ctx_overview output. Set false to reduce context bloat when calling ctx_overview frequently.
 - `excluded_commands` (string[], default `[]`) — Commands to exclude from shell hook interception
@@ -41,18 +43,22 @@ Top-level configuration keys
 - `extra_roots` (string[], default `[]` — env `LEAN_CTX_EXTRA_ROOTS`) — Extra project roots for multi-root workspaces (auto-added to PathJail allow-list)
 - `graph_index_max_files` (u64, default `15000`) — Maximum files in graph index. 0 = unlimited (default). Set >0 to cap for constrained systems
 - `hook_binary` (string?, default `null` — env `LEAN_CTX_HOOK_BINARY`) — Verbatim binary path/expression for generated agent-hook commands (e.g. $HOME/.local/bin/lean-ctx) — for settings files synced across machines with different usernames. Shell-expanded by the hook host at run time; doctor accepts it as current. Empty = automatic absolute-path resolution
+- `hook_mode` (enum: auto | hybrid | replace | mcp, default `auto` — env `LEAN_CTX_HOOK_MODE`) — How lean-ctx integrates with agents. auto (default): Hybrid for every hook-capable agent — native calls are not refused, known commands are rewritten through lean-ctx; Claude Code's tool list leaves out native Grep/Glob (no refusals, searches stay compressed). hybrid: the same, with Grep/Glob back in Claude Code. replace: deny native Grep/Glob (and non-rewritable shell where the host supports it) so ctx_* MCP tools are the only path; also set by `lean-ctx harden --hard`. mcp: MCP server only, no hooks
 - `journal_enabled` (bool, default `true`) — Write human-readable activity journal to ~/.lean-ctx/journal.md
 - `max_disk_mb` (u64, default `0` — env `LEAN_CTX_MAX_DISK_MB`) — Simplified disk budget in MB (0 = disabled). Distributes: archive ~25%, BM25 ~10%
 - `max_index_threads` (usize, default `0` — env `LEANCTX_INDEX_THREADS`) — Cap rayon threads for the CPU-heavy index build (0 = all cores). Bounds per-instance CPU so concurrent sessions don't saturate the host on startup
 - `max_ram_percent` (u8, default `5` — env `LEAN_CTX_MAX_RAM_PERCENT`) — Soft process-RSS target as % of system RAM (1-50, default 5); eviction/throttling policy, not an OS hard cap
 - `max_staleness_days` (u32, default `0` — env `LEAN_CTX_MAX_STALENESS_DAYS`) — Auto-purge data older than N days (0 = disabled). Flows into archive.max_age_hours
+- `mcp_idle_exit_minutes` (u64, default `0` — env `LEAN_CTX_MCP_IDLE_EXIT_MINUTES`) — Exit a stdio MCP server after this many minutes without a tool call (0 = never, default). Hosts that do not restart servers (Codex) lose lean-ctx in a resumed thread
+- `mcp_max_rss_mb` (u64, default `512` — env `LEAN_CTX_MCP_MAX_RSS_MB`) — Per-process RSS target (MB) of each stdio MCP server; the guardian evicts above the lower of this and max_ram_percent (default 512, 0 = percent only)
 - `memory_cleanup` (enum: aggressive | shared, default `aggressive` — env `LEAN_CTX_MEMORY_CLEANUP`) — Controls how aggressively memory is freed when idle
 - `memory_profile` (enum: low | balanced | performance, default `performance` — env `LEAN_CTX_MEMORY_PROFILE`) — Controls RAM vs feature trade-off (performance = max quality)
 - `minimal_overhead` (bool, default `true` — env `LEAN_CTX_MINIMAL`) — Skip session/knowledge/gotcha blocks in MCP instructions
 - `no_degrade` (boolean, default `false`) — Disable all automatic read-mode degradation. Override via LCTX_NO_DEGRADE=1
 - `output_density` (enum: normal | terse | ultra, default `normal` — env `LEAN_CTX_OUTPUT_DENSITY`) — Controls how dense/compact MCP tool output is formatted
 - `passthrough_urls` (string[], default `[]`) — URLs to pass through without proxy interception
-- `path_jail` (bool?, default `null`) — Filesystem path jail. null/true = enforced (tools confined to the project root + allow_paths). false = the blanket "any path" opt-out — every tool path is allowed (for containers/sandboxes where the boundary is external). Compression and secret redaction are unaffected. Flip both planes at once with `lean-ctx yolo` / `lean-ctx secure`
+- `path_jail` (bool?, default `null`) — Filesystem path jail. null/true = enforced (what it admits is set by path_jail_scope). false = the blanket "any path" opt-out — every tool path is allowed (for containers/sandboxes where the boundary is external). Compression and secret redaction are unaffected. Flip both planes at once with `lean-ctx yolo` / `lean-ctx secure`
+- `path_jail_scope` (string?, default `null` — env `LEAN_CTX_PATH_JAIL_SCOPE`) — What the enforced path jail admits. null/"home" (default since 3.11.3) = everything below your home directory, read and write, except protected zones: top-level dot entries (~/.ssh, ~/.aws, ~/.config, other agents' dirs), ~/Library, ~/AppData, ~/snap. "projects" (the default of 3.11.1–3.11.2) = every project below ~ is readable (a path counts when a folder between it and ~ holds .git, Cargo.toml, package.json, …; loose personal files do not); writes stay in the session's project + allow entries. "project" = only the active project + allow_paths/extra_roots/read_only_roots. Open one more dir with `lean-ctx allow-path <dir>`. Falls back to "project" for an implausible $HOME. Global-only
 - `permission_inheritance` (enum: off | on, default `on` — env `LEAN_CTX_PERMISSION_INHERITANCE`) — Mirror the host IDE's permission rules onto lean-ctx tools (v1: OpenCode). When on, ctx_shell honors your bash/rm * rules instead of bypassing them
 - `persona` (string, default `coding` — env `LEAN_CTX_PERSONA`) — Active context persona (persona-spec-v1): selects the domain bundle — tool surface, read-mode/compressor/chunker defaults, intent taxonomy, sensitivity floor. Built-ins: coding (default), research, lead-gen, support, data-analysis; or a custom <name>.toml from the personas dir. Override via LEAN_CTX_PERSONA
 - `prefer_native_editor` (bool, default `false`) — Disable lean-ctx edit tools (ctx_edit, ctx_patch) so the host's native editor handles edits (#454)
@@ -70,19 +76,21 @@ Top-level configuration keys
 - `read_only_roots` (string[], default `[]` — env `LEAN_CTX_READ_ONLY_ROOTS`) — Read-only sibling roots: reads allowed, writes always denied (edit/refactor/export)
 - `read_redirect` (enum: auto | on | off, default `auto` — env `LEAN_CTX_READ_REDIRECT`) — Controls the native-Read → ctx_read redirect hook. auto (default): redirect everywhere except hosts with a native read-before-write guard (Claude Code / CodeBuddy), where rewriting Read to a temp copy breaks native Write/Edit (#637). on: always redirect. off: never redirect native Read (ctx_read MCP tool + Grep/Glob redirect stay active)
 - `recovery_hints` (enum: off | minimal | full, default `minimal`) — Verbosity of the reactive recovery footer on compressed output (path-first, MCP-optional)
-- `redirect_exclude` (string[], default `[]`) — URL patterns to exclude from proxy redirection
+- `redirect_exclude` (string[], default `[]`) — File globs lean-ctx delivers verbatim: native reads skip the hook redirect and automatic ctx_read modes return them in full (e.g. ["docs/**", "*.json"]). LEAN_CTX_HOOK_EXCLUDE (comma-separated) takes precedence.
 - `reference_results` (bool, default `false` — env `LEAN_CTX_REFERENCE_RESULTS`) — Store large tool outputs as references instead of inline content
 - `response_verbosity` (enum: normal | compact | minimal, default `normal` — env `LEAN_CTX_RESPONSE_VERBOSITY`) — Controls how verbose tool responses are
 - `rules_injection` (enum: shared | dedicated | off, default `shared`) — How rules load for CLAUDE.md/AGENTS.md/GEMINI.md agents: shared block, dedicated (no shared-file edits; SessionStart hook / instructions[] / context.fileName), or off (write no rules file — for hosts that supply their own steering or phase-isolated/non-caching harnesses). Override via LEAN_CTX_RULES_INJECTION
 - `rules_scope` (enum: both | global | project, default `both`) — Where agent rule files are installed. Override via LEAN_CTX_RULES_SCOPE
 - `sandbox_level` (u8, default `0` — env `LEAN_CTX_SANDBOX_LEVEL`) — Sandbox strictness level (0=default, 1=strict, 2=paranoid)
-- `savings_footer` (enum: auto | always | never, default `always` — env `LEAN_CTX_SAVINGS_FOOTER`) — Controls visibility of token savings footers: always (default, show on every response), never, auto (context-dependent). Also: LEAN_CTX_SHOW_SAVINGS=1|0
+- `savings_footer` (enum: auto | always | never, default `never` — env `LEAN_CTX_SAVINGS_FOOTER`) — Controls visibility of token savings footers: never (default), always (show on every response), auto (context-dependent). Also: LEAN_CTX_SHOW_SAVINGS=1|0
+- `semantic_mode` (enum: off | auto | eager, default `auto` — env `LEAN_CTX_SEMANTIC_MODE`) — Semantic code intelligence: off, auto (use only running language servers / a live IDE), eager (may start language servers; trusted workspaces only)
 - `session_retention_days` (u32, default `7` — env `LEAN_CTX_SESSION_RETENTION_DAYS`) — Retention window for explicit session cleanup; independent from archive retention and preserves the newest session per project
-- `shadow_mode` (bool, default `true` — env `LEAN_CTX_SHADOW_MODE`) — Default on: denies native tools at the permission level, forcing agents to use ctx_* MCP tools for maximum compression. Disable with shadow_mode = false if you prefer native tools.
+- `shadow_mode` (bool, default `true` — env `LEAN_CTX_SHADOW_MODE`) — Default on: lean-ctx steers agents to ctx_* MCP tools, and an explicit hook_mode = "replace" may deny native tools. shadow_mode = false caps every agent at Hybrid — native tools are never denied.
 - `shell_activation` (enum: always | agents-only | off, default `agents-only` — env `LEAN_CTX_SHELL_ACTIVATION`) — Controls when the shell hook auto-activates aliases (agents-only since #699: transparent in plain human terminals)
 - `shell_allow_writes` (bool, default `false` — env `LEAN_CTX_SHELL_ALLOW_WRITES`) — Allow ctx_shell file-write redirects (>, >>, tee, heredoc-to-file, curl -o, wget default mode). Default false — prefer the native Write/Edit tool. The real command gating (allowlist, dangerous-pattern, interpreter-eval) still applies
 - `shell_allowlist` (array, default `[]` — env `LEAN_CTX_SHELL_ALLOWLIST`) — Optional shell command allowlist. When non-empty, only listed binaries are permitted
 - `shell_allowlist_extra` (array, default `[]`) — Commands merged on top of shell_allowlist without replacing the defaults. Managed via `lean-ctx allow <cmd>`
+- `shell_allowlist_subcommand_scoping` (bool, default `true`) — Scope a multi-word shell_allowlist entry to the exact subcommand/prefix it names (GH #1419). Default true; set false to fall back to base-binary-only matching.
 - `shell_heavy_timeout_secs` (u64?, default `null` — env `LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS`) — Shell command timeout (seconds) for heavy commands (cargo build/test, make, docker build, git commit/push). null = built-in 10-minute ceiling
 - `shell_hook_disabled` (bool, default `false` — env `LEAN_CTX_NO_HOOK`) — Disable shell hook injection
 - `shell_hook_mode` (enum: auto | rewrite | deny, default `auto` — env `LEAN_CTX_SHELL_HOOK_MODE`) — How the PreToolUse shell hook treats native Bash/Shell calls (#1278). rewrite: rewrite known read/search/list commands, unknown commands pass through raw. deny: block native shell outright so every command goes through ctx_shell (fail-opens: lean-ctx disabled, MCP daemon dead, explicit shadow-only surface). auto (default): currently rewrite
@@ -103,7 +111,15 @@ Top-level configuration keys
 - `tools_enabled` (string[], default `[]`) — Explicit list of enabled tool names. Used only when no tool_profile is pinned (tool_profile takes precedence); leave tool_profile unset to apply this list. The universal invoker ctx_call stays advertised so unlisted tools remain reachable — add it to disabled_tools (disabled_tools = ["ctx_call"]) to make this allowlist authoritative.
 - `ultra_compact` (bool, default `false`) — Legacy flag for maximum compression (use compression_level instead)
 - `update_check_disabled` (bool, default `false` — env `LEAN_CTX_NO_UPDATE_CHECK`) — Disable the daily version check
-- `write_allow_paths` (string[], default `[]`) — Absolute paths allowed for ctx_shell redirects and tee output; empty = OS temp directories
+- `write_allow_paths` (string[], default `[]`) — Extra absolute paths for ctx_shell redirects, tee output and downloads, beyond the scratch dirs. Capture into the session's project and allow_paths/extra_roots is always allowed; empty = OS temp directories only
+
+## `[agents]`
+
+Build handling for ctx_shell in multi-agent setups. All opt-in; by default lean-ctx neither queues, throttles nor relocates your builds
+
+- `cargo_build_jobs` (usize, default `0`) — Opt-in: CARGO_BUILD_JOBS for builds run through ctx_shell. 0 (default) leaves cargo's own setting alone
+- `serialize_build_commands` (bool, default `false`) — Opt-in: run only one cargo/npm build or test at a time across all lean-ctx sessions on this machine; ctx_shell waits for the slot. Off by default
+- `shared_cargo_target` (bool, default `false`) — Opt-in: builds run through ctx_shell use one machine-wide CARGO_TARGET_DIR (<data dir>/build-cache/cargo-target) instead of ./target. Off by default — when on, a binary run from ./target is stale. An explicit CARGO_TARGET_DIR always wins
 
 ## `[archive]`
 
@@ -162,6 +178,20 @@ Fixed-context budget accounting (#964)
 - `proactive_expansion_max_age_secs` (u64, default `3600`) — Maximum age of CCR content eligible for proactive expansion
 - `proactive_expansion_threshold` (f64, default `0.6`) — Minimum normalized BM25 score for proactive expansion
 
+## `[context_gateway]`
+
+Context Gateway admission: built-in detectors, on by default, global-only
+
+- `classification` (enum: off | warn | redact | block, default `warn`) — Action for explicit markings such as CONFIDENTIAL (redact = withhold)
+- `detector_timeout_ms` (u64, default `2000`) — Per-detector time budget; a detector that runs out reports timed_out, never clean
+- `enabled` (bool, default `true` — env `LEAN_CTX_CONTEXT_GATEWAY`) — Run context admission on every governed source before caching or compression
+- `hud` (enum: auto | in_band | status_line, default `auto`) — Where redaction counts appear: auto keeps them out of the model's context when the Claude Code status line shows lean-ctx
+- `injection` (enum: off | warn | redact | block, default `warn`) — Action for prompt-injection heuristic (OWASP LLM01)
+- `max_inspected_bytes` (usize, default `8388608`) — Bytes each detector inspects per object; beyond it coverage is partial (withheld in governed/sovereign mode)
+- `mode` (enum: developer | governed | sovereign, default `developer`) — Governed and sovereign treat unclassified content as internal, never public
+- `pii` (enum: off | warn | redact | block, default `redact`) — Action for checksum-validated PII: AHV, IBAN, payment cards
+- `secrets` (enum: off | warn | redact | block, default `redact`) — Action for credentials and keys (patterns from [secret_detection])
+
 ## `[cost]`
 
 Model declaration for measured-vs-estimated cost reporting
@@ -200,7 +230,7 @@ Semantic-embedding engine settings (model selection for ctx_semantic_search)
 - `auto_download` (bool, default `null` — env `LEAN_CTX_EMBEDDINGS_AUTO_DOWNLOAD`) — Download the embedding model in the background on first semantic need (default: allowed). Set false for air-gapped machines; semantic features then stay off until a model is provided manually.
 - `deterministic` (bool, default `null` — env `LEAN_CTX_EMBEDDING_DETERMINISTIC`) — Pin embedding inference to a single CPU thread with no GPU provider so vectors are bit-identical across machines (default: off, multi-threaded GPU-capable path). Extractive prose ranking is already deterministic via score quantization; enable this only for cross-machine reproducibility, at a throughput cost.
 - `dimensions` (integer, default `null`) — Declared embedding width for hf: custom models (fallback only — the real width is probed from the ONNX graph at load time). Built-in models ignore this key.
-- `model` (string, default `minilm` — env `LEAN_CTX_EMBEDDING_MODEL`) — Local ONNX embedding model for ctx_semantic_search. One of: minilm (all-MiniLM-L6-v2, 384d, default), nomic (768d) — or any HuggingFace repo with an ONNX export via hf:org/repo[@revision] (e.g. hf:jinaai/jina-embeddings-v2-base-code for code). Switching models re-indexes once on the next search.
+- `model` (string, default `minilm` — env `LEAN_CTX_EMBEDDING_MODEL`) — Local embedding model for ctx_semantic_search. Unset: minilm where ONNX Runtime is installed, potion-code otherwise. One of: minilm (all-MiniLM-L6-v2, 384d), potion-code (potion-code-16M, 256d static model2vec, pure Rust — no ONNX Runtime, indexes thousands of chunks per second), nomic (768d) — or any HuggingFace repo with an ONNX export via hf:org/repo[@revision] (e.g. hf:jinaai/jina-embeddings-v2-base-code for code). Switching models re-indexes once on the next search.
 
 ## `[gain]`
 
@@ -264,6 +294,22 @@ Index-time file filters: declare the retrieval corpus explicitly (BM25 + graph +
 - `exclude` (string[], default `[]`) — Globs dropped from the index corpus (root-relative, forward slashes), e.g. ["**/*.csv", "fixtures/**"]. Wins over include. CLI --exclude appends per run. Excluded files produce no chunks, graph nodes, or embeddings.
 - `include` (string[], default `[]`) — When non-empty, ONLY matching files enter the index corpus, e.g. ["**/*.rs", "**/*.ts"]. Empty = no restriction. CLI --include replaces this set per run.
 - `respect_gitignore` (bool, default `true`) — Honor .gitignore / global gitignore / .git/info/exclude during index walks. false indexes ignored files too (the vendor-directory guard still applies). CLI override: --no-gitignore / --respect-gitignore.
+
+## `[intelligence_runtime]`
+
+Global-only optional runtime consent and independent staging pins; project overrides never apply
+
+- `accept_proprietary` (bool, default `false`) — Explicit user acceptance of the separately licensed runtime
+- `channel_root_key_hex` (string, default `""`) — Independently provisioned catalog root; never learned from a download
+- `channel_signature_url` (string, default `""`) — Detached staging catalog signature URL
+- `channel_url` (string, default `""`) — Explicit staging catalog URL; fetched only after consent
+- `context_policy_apply` (bool, default `false`) — Apply the promoted read-strategy policy in planning instead of recording it in shadow; security and explicit choices still win
+- `enabled` (bool, default `false`) — Opt in to the verified local runtime
+- `license_configuration` (string, default `""`) — Explicit user-global path to private license configuration; saved after installed device provisioning
+- `manifest_sha256` (string, default `""`) — Independently selected manifest digest
+- `root` (string, default `""`) — Absolute private installation root
+- `staging` (bool, default `false`) — Staging-only delivery; not production release approval
+- `trust_key_hex` (string, default `""`) — Independently provisioned Ed25519 public key, lowercase hex
 
 ## `[llm]`
 
@@ -408,6 +454,7 @@ Proxy upstream configuration for API routing
 - `codex_chatgpt_proxy` (bool, default `false` — env `LEAN_CTX_CODEX_CHATGPT_PROXY`) — Opt-in routing of a Codex ChatGPT-subscription login through the proxy for model-turn compression (#603/#616). Default false leaves Codex native (history visible, cloud/remote intact, no #597). When true, setup pins model_provider = leanctx-chatgpt + chatgpt_base_url + a [model_providers.leanctx-chatgpt] block, so model turns route through /backend-api/codex/responses (the proxy strips the responses-lite marker so every model incl. gpt-5.5 works); pinning a provider scopes Codex history to it (#597), hence opt-in. Toggle durably with `lean-ctx proxy codex-chatgpt on|off|status`. Default false
 - `cold_prefix_repack` (bool, default `true` — env `LEAN_CTX_PROXY_COLD_PREFIX_REPACK`) — Opt-in big-gap cold-prefix repack (#480): on a session-resume request the proxy may predict (from idle time vs the provider cache TTL) that the client-cached prefix has already expired, then prune that now-cold prefix to re-seed a leaner cache and keep applying the same deterministic compression on later turns so warm follow-ups hit it (sticky; baselines persist across restarts, #499). A wrong guess re-bills cache reads as writes (~12x), so default false
 - `compress_protect` (string[], default `[]`) — File-path globs whose reads are never compressed (#1150): a matching path is returned verbatim (full) by the read tools, for files where exact bytes matter more than token savings (golden snapshots, byte-asserted fixtures, security-sensitive configs). Globs (*/**/?) match the path and its file name, so *.snap, **/golden/**, tests/fixtures/* all work. Empty (default) protects nothing — the lossless crushers and beneficial gate already keep compression safe; this is an explicit escape hatch
+- `compression_holdout` (f64, default `0.0` — env `LEAN_CTX_PROXY_COMPRESSION_HOLDOUT`) — Fraction 0.0-1.0 of conversations placed in the input-compression control arm (#1905). 0 (default) = no holdout. When > 0, a deterministic cohort (salted independently of output_holdout) puts ~this fraction in a control arm forwarded without any of the proxy's input compression (tool-output compression, history pruning, prose rewriting, cold-prefix repack) but still metered, so the input-token reduction is measured against a real uncompressed baseline (lean-ctx output-savings). Answer quality is not measured by this holdout and is reported as unknown
 - `cost_response_header` (string, default `null`) — Extra response header carrying the upstream gateway's billed USD for the turn (e.g. a corporate gateway's cost header). LiteLLM's x-litellm-response-cost is always recognized. Measured header costs beat table estimates; body-reported costs (OpenRouter usage.cost) beat headers
 - `counterfactual_metering` (bool, default `false` — env `LEAN_CTX_PROXY_COUNTERFACTUAL`) — Opt-in counterfactual savings metering (#701): each rewritten Anthropic /v1/messages request fires a free count_tokens probe with the original, uncompressed body, concurrently with the real forward. The provider-counted answer is paired with the same response's billed usage — provider-authoritative savings receipts ('would have cost N, billed M') instead of local tokenizer estimates, shown as verified_savings on /status. The probe never mutates or delays the forwarded request; failures degrade to the estimate. Default false (one extra free HTTP call per compressed request)
 - `effort` (enum: off | minimal | low | medium | high, default `off` — env `LEAN_CTX_PROXY_EFFORT`) — Cache-safe cross-provider reasoning-effort control (#834). off (default) = no-op. minimal|low|medium|high pins the model's reasoning depth across providers: lean-ctx translates it to OpenAI reasoning_effort / reasoning.effort, Anthropic output_config.effort, and Gemini thinkingConfig (thinkingLevel on 3.x, thinkingBudget on 2.5 pro/flash), only on models that accept it and only when the client didn't set its own value. The level is a constant, so it never breaks the provider prompt cache (unlike per-turn effort routing). Anthropic is dialed only when the client already requested adaptive thinking
@@ -463,6 +510,7 @@ Controls what lean-ctx injects during setup and updates. Fresh installs default 
 - `auto_inject_rules` (bool?, default `null`) — Inject agent rule files during setup/update. null=auto (inject if already present), true=always, false=never
 - `auto_inject_skills` (bool?, default `null`) — Install SKILL.md files during setup/update. null=auto (install if rules present), true=always, false=never
 - `auto_update_mcp` (bool, default `true`) — Register lean-ctx MCP server in editor configs during setup/update
+- `manage_hooks` (bool, default `true`) — Refresh already-installed agent hooks, permissions.deny and status line on MCP server start. false = only explicit setup/init/doctor --fix writes them
 
 ## `[skillify]`
 
@@ -519,9 +567,10 @@ AI session summaries: periodic, semantically-recallable session digests
 
 ## `[telemetry]`
 
-Anonymous opt-in telemetry heartbeat
+Privacy-safe default-on telemetry with explicit opt-out
 
-- `enabled` (bool, default `false`) — Enable anonymous telemetry heartbeat (version, OS, arch, random install ID — no code or PII)
+- `enabled` (bool, default `true`) — Enable anonymous product telemetry (cumulative daily aggregates — no code, paths or PII)
+- `preference` (enum: default_on | explicitly_enabled | explicitly_disabled, default `default_on`) — Whether telemetry is using the v4 default or an explicit user choice
 
 ## `[updates]`
 
@@ -530,4 +579,15 @@ Automatic update configuration
 - `auto_update` (bool, default `false`) — Enable automatic updates (requires explicit opt-in)
 - `check_interval_hours` (u64, default `6`) — How often to check for updates (hours)
 - `notify_only` (bool, default `false`) — Only notify about updates, don't install automatically
+- `pinned_version` (string|null, default `null`) — Release version used by update commands and scheduled updates; unset follows latest
+
+## `[value_display]`
+
+User-only value surface: status line, recaps, prompt segment, milestones. Every number is backed by `lean-ctx value`.
+
+- `git_trailer` (bool, default `false`) — Opt-in `lean-ctx:` trailer in commit messages (default false)
+- `mode` (enum: off | minimal | milestones | verbose, default `minimal` — env `LEAN_CTX_VALUE_DISPLAY`) — How lean-ctx shows its measured value to you (never to the model): off, minimal (default: status line + threshold recaps), milestones (+ OS notifications), verbose (every recap window)
+- `notifications` (bool, default `true`) — OS notifications for milestones in mode milestones or verbose, at most one per day (default true)
+- `recap_every_turns` (u32, default `5`) — A turn recap is considered every N agent turns (default 5)
+- `recap_min_tokens` (u64, default `10000`) — Show a turn recap only when the window saved at least this many tokens or a security event happened (default 10000)
 

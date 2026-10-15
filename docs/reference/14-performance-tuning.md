@@ -127,6 +127,9 @@ profile-derived default":
 |------|--------------|---------|
 | `max_disk_mb` | `LEAN_CTX_MAX_DISK_MB` | total on-disk budget across caches/indexes |
 | `max_ram_percent` | `LEAN_CTX_MAX_RAM_PERCENT` | soft process-RSS target as % of system memory (default 5) |
+| `mcp_max_rss_mb` | `LEAN_CTX_MCP_MAX_RSS_MB` | per-process RSS target of each stdio MCP server; the lower of this and `max_ram_percent` applies (default 512, `0` = percent only) |
+| `daemon_max_rss_mb` | `LEAN_CTX_DAEMON_MAX_RSS_MB` | RSS target of the background daemon; the lower of this and `max_ram_percent` applies (default 2048, `0` = percent only) |
+| `mcp_idle_exit_minutes` | `LEAN_CTX_MCP_IDLE_EXIT_MINUTES` | exit a stdio MCP server after N minutes without a tool call (default `0` = never) |
 | `max_staleness_days` | `LEAN_CTX_MAX_STALENESS_DAYS` | auto-prune entries older than N days |
 
 `config show` warns if `max_disk_mb` is set lower than
@@ -138,6 +141,47 @@ kernel-enforced ceiling and RSS can temporarily exceed it. For a strict
 per-process boundary, run lean-ctx in a cgroup/container with `MemoryMax` (or
 equivalent). At sustained pressure, reduce `memory_profile`, disable
 `auto_preload`/`cognition_loop_enabled`, or provision more RAM.
+
+### Long-lived MCP servers
+
+A stdio MCP server ends when its host closes stdin or exits. Some hosts do
+neither: the Codex app-server keeps one `lean-ctx mcp` per loaded thread alive
+for days. Two mechanisms bound what such a fleet holds:
+
+- **Per-process ceiling.** `mcp_max_rss_mb` (512 MB) lowers the guardian's
+  target for each server. The usual ladder then applies: output trimming above
+  1×, index unloading above 1.5× (768 MB) and an emergency cache drop above
+  2× (1 GB).
+- **Idle release.** After the `memory_cleanup` TTL without a tool call (1 h
+  `shared`, 5 min `aggressive`) the server drops its read cache and resident
+  indexes and returns free pages to the OS. Both reload on the next call. A
+  running call or background shell job keeps the server busy.
+
+On macOS the guardian measures physical footprint, the "Memory" column in
+Activity Monitor, rather than resident size, which compressed pages leave.
+A live heap of roughly 65–90 MB (tokenizer tables, parsers, the tool
+registry) stays after every eviction, so a cap below ~150 MB only keeps the
+guardian busy. Each release logs its before and after figures
+(`[mcp-idle] released: RSS … → … MB, heap … → … MB`). On macOS the footprint
+falls more slowly than the heap: the allocator hands freed pages back with
+`MADV_FREE`, and the kernel takes them only when it needs memory. They count
+until then, but they are reclaimable. One measured release: heap 163 → 89 MB,
+footprint 275 MB, falling to 225 MB over the following minute.
+
+`mcp_idle_exit_minutes` additionally ends idle servers. It is off by default
+because Codex does not restart an exited server: the resumed thread then loses
+lean-ctx until the Codex app restarts. Enable it for hosts that respawn their
+servers, or when you accept that trade-off.
+
+### The background daemon
+
+One daemon (`lean-ctx serve --_foreground-daemon`) builds the indexes for
+every session and project root on the machine and runs for days. It keeps the
+search index of at most eight roots resident (least recently used first out),
+like the graph cache, and `daemon_max_rss_mb` (2048 MB) caps its guardian
+target on large machines. After each build phase it returns freed allocator
+pages to the OS; tree-sitter's parser memory goes through the same allocator,
+so it is returned as well.
 
 ---
 
@@ -217,6 +261,22 @@ depends on the harness and the provider:
 On a phase-isolated **and** non-caching workload the cached-re-read lever has no
 surface and the injected prefix is pure re-billed overhead. That is an
 architecture–surface fit, not a failure mode — but you should tune for it.
+
+### Claude Code: re-read stubs are withheld by default
+
+Claude Code sub-agents reuse their parent's MCP connection, so the parent and
+every sub-agent talk to the **same** lean-ctx process. The only scope lean-ctx
+can derive there is process-wide (`proc:`), and a match on it cannot prove the
+content is in the *asking* agent's window. lean-ctx therefore fails closed:
+unchanged re-reads, same-variant `map`/`signatures` re-reads and cross-agent
+delivery stubs are **not** collapsed under Claude Code — each re-read returns
+the (compressed) content again. Cold-read compression is unaffected.
+
+`LEAN_CTX_SCOPE=<name>` opts back in for an integration that can guarantee one
+agent per lean-ctx process (e.g. a headless loop that never spawns
+sub-agents). Do **not** set it for interactive Claude Code sessions that use
+sub-agents: every sub-agent would inherit the same scope and could receive a
+back-reference to content it never saw.
 
 ### Win vs. break-even at a glance
 

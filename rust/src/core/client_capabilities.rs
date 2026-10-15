@@ -37,8 +37,11 @@ impl ClientMcpCapabilities {
             _ => client_name.to_lowercase(),
         };
         let id = identify_client(&effective);
+        // Capabilities follow the established classes; the finer `id` only
+        // names the host (telemetry, summaries) and never changes behaviour.
+        let class = capability_class(&effective);
 
-        match id.as_str() {
+        match class {
             "cursor" | "kiro" => Self {
                 client_id: id,
                 resources: true,
@@ -157,40 +160,147 @@ impl ClientMcpCapabilities {
     }
 }
 
-fn identify_client(lower: &str) -> String {
+/// The capability class a client name has always mapped to. Kept separate
+/// from [`identify_client`] so naming more hosts never changes what LeanCTX
+/// offers them over MCP.
+fn capability_class(lower: &str) -> &'static str {
     if lower.contains("cursor") {
-        "cursor".to_string()
+        "cursor"
     } else if lower.contains("codebuddy") {
-        "codebuddy".to_string()
+        "codebuddy"
     } else if lower.contains("codewhale") {
-        // #1402. Matched on the product name only — CodeWhale's legacy config
-        // dir is `~/.deepseek`, but "deepseek" is a *model* family name that
-        // shows up in unrelated clients' identifiers, so it is not a client
-        // discriminator here.
-        "codewhale".to_string()
+        "codewhale"
     } else if lower.contains("claude") {
-        "claude-code".to_string()
+        "claude-code"
     } else if lower.contains("windsurf") || lower.contains("codeium") {
-        "windsurf".to_string()
+        "windsurf"
     } else if lower.contains("zed") {
-        "zed".to_string()
+        "zed"
     } else if lower.contains("copilot")
         || lower.contains("github")
         || lower.contains("visual studio code")
         || lower.contains("vscode")
     {
-        "vscode-copilot".to_string()
+        "vscode-copilot"
     } else if lower.contains("kiro") {
-        "kiro".to_string()
+        "kiro"
     } else if lower.contains("codex") || lower.contains("openai") {
-        "codex".to_string()
+        "codex"
     } else if lower.contains("antigravity") {
-        "antigravity".to_string()
+        "antigravity"
     } else if lower.contains("gemini") {
-        "gemini-cli".to_string()
+        "gemini-cli"
     } else {
-        "unknown".to_string()
+        "unknown"
     }
+}
+
+fn identify_client(lower: &str) -> String {
+    // Hosts whose names contain another host's keyword come first: Kilo Code
+    // and Roo Code before Cline, the Copilot CLI before VS Code Copilot,
+    // Claude Desktop before Claude Code, Visual Studio before VS Code.
+    let has = |words: &[&str]| words.iter().any(|word| lower.contains(word));
+    let id = if lower.contains("cursor") {
+        "cursor"
+    } else if lower.contains("codebuddy") {
+        "codebuddy"
+    } else if lower.contains("codewhale") {
+        // #1402. Matched on the product name only — CodeWhale's legacy config
+        // dir is `~/.deepseek`, but "deepseek" is a *model* family name that
+        // shows up in unrelated clients' identifiers, so it is not a client
+        // discriminator here.
+        "codewhale"
+    } else if has(&["claude-ai", "claude desktop", "claude-desktop"]) {
+        "claude-desktop"
+    } else if lower.contains("claude") {
+        "claude-code"
+    } else if lower.contains("windsurf") || lower.contains("codeium") {
+        "windsurf"
+    } else if lower.contains("zed") {
+        "zed"
+    } else if has(&["copilot-cli", "copilot cli"]) {
+        "copilot-cli"
+    } else if has(&["visual-studio", "visualstudio"])
+        || (lower.contains("visual studio") && !lower.contains("visual studio code"))
+    {
+        "visual-studio"
+    } else if lower.contains("kilo") {
+        "kilo-code"
+    } else if has(&["roo-code", "roo code", "roocode", "roo-cline"]) {
+        "roo-code"
+    } else if lower.contains("cline") {
+        "cline"
+    } else if lower.contains("copilot")
+        || lower.contains("github")
+        || lower.contains("visual studio code")
+        || lower.contains("vscode")
+    {
+        "vscode-copilot"
+    } else if lower.contains("kiro") {
+        "kiro"
+    } else if lower.contains("chatgpt") {
+        "chatgpt"
+    } else if lower.contains("codex") || lower.contains("openai") {
+        "codex"
+    } else if lower.contains("antigravity") {
+        "antigravity"
+    } else if lower.contains("gemini") {
+        "gemini-cli"
+    } else if lower.contains("qwen") {
+        "qwen-code"
+    } else if lower.contains("opencode") {
+        "opencode"
+    } else if lower.contains("goose") {
+        "goose"
+    } else if lower == "amp" || lower.starts_with("amp-") || lower.starts_with("amp ") {
+        "amp"
+    } else if lower.contains("augment") {
+        "augment"
+    } else if has(&[
+        "jetbrains",
+        "intellij",
+        "pycharm",
+        "webstorm",
+        "goland",
+        "junie",
+    ]) {
+        "jetbrains"
+    } else if lower.contains("warp") {
+        "warp"
+    } else if lower == "trae" || lower.starts_with("trae-") || lower.starts_with("trae ") {
+        "trae"
+    } else if lower.contains("crush") {
+        "crush"
+    } else if has(&["lm studio", "lm-studio", "lmstudio"]) {
+        "lm-studio"
+    } else if has(&["neovim", "nvim", "mcphub"]) {
+        "neovim"
+    } else if has(&["emacs", "gptel"]) {
+        "emacs"
+    } else if has(&["factory-droid", "factory droid", "factory.ai"]) || lower == "factory" {
+        "factory"
+    } else if lower.contains("continue") {
+        "continue"
+    } else {
+        "unknown"
+    };
+    id.to_string()
+}
+
+/// Whether any process recorded an MCP handshake within `max_age_secs`,
+/// recognised or not. Separates "no MCP client" (CLI and shell hooks only)
+/// from "a client LeanCTX does not recognise" for telemetry.
+pub(crate) fn handshake_seen(max_age_secs: u64) -> bool {
+    let Some(content) = persisted_path().and_then(|path| std::fs::read_to_string(path).ok()) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|val| val.get("ts").and_then(serde_json::Value::as_u64))
+        .is_some_and(|ts| now.saturating_sub(ts) <= max_age_secs)
 }
 
 static GLOBAL: OnceLock<Mutex<ClientMcpCapabilities>> = OnceLock::new();
@@ -354,6 +464,62 @@ mod tests {
         let caps = ClientMcpCapabilities::detect_with_hint("Cursor", Some(""));
         assert_eq!(caps.client_id, "cursor");
         assert_eq!(caps.tier(), 1);
+    }
+
+    #[test]
+    fn more_hosts_are_named_without_changing_their_capabilities() {
+        for (name, id, same_caps_as) in [
+            ("Cline", "cline", "unknown-editor"),
+            ("Roo Code", "roo-code", "unknown-editor"),
+            ("Kilo Code", "kilo-code", "unknown-editor"),
+            ("continue-client", "continue", "unknown-editor"),
+            ("opencode", "opencode", "unknown-editor"),
+            ("goose", "goose", "unknown-editor"),
+            ("amp", "amp", "unknown-editor"),
+            ("JetBrains AI Assistant", "jetbrains", "unknown-editor"),
+            ("claude-ai", "claude-desktop", "claude-code"),
+            ("GitHub Copilot CLI", "copilot-cli", "vscode-copilot"),
+            ("Visual Studio", "visual-studio", "unknown-editor"),
+            ("LM Studio", "lm-studio", "unknown-editor"),
+            ("Qwen Code", "qwen-code", "unknown-editor"),
+        ] {
+            let caps = ClientMcpCapabilities::detect_with_hint(name, None);
+            let reference = ClientMcpCapabilities::detect_with_hint(same_caps_as, None);
+            assert_eq!(caps.client_id, id, "{name}");
+            assert_eq!(
+                (
+                    caps.resources,
+                    caps.prompts,
+                    caps.elicitation,
+                    caps.sampling,
+                    caps.dynamic_tools,
+                    caps.max_tools
+                ),
+                (
+                    reference.resources,
+                    reference.prompts,
+                    reference.elicitation,
+                    reference.sampling,
+                    reference.dynamic_tools,
+                    reference.max_tools
+                ),
+                "{name}"
+            );
+            assert!(
+                crate::core::telemetry_v2::ClientFamily::from_client_id(id).is_some(),
+                "{id} has a wire family"
+            );
+            // A persisted id is re-detected as the same host.
+            assert_eq!(identify_client(id), id, "{id}");
+        }
+        assert_eq!(
+            ClientMcpCapabilities::detect_with_hint("Visual Studio Code", None).client_id,
+            "vscode-copilot"
+        );
+        assert_eq!(
+            ClientMcpCapabilities::detect_with_hint("claude-code", None).client_id,
+            "claude-code"
+        );
     }
 
     #[test]

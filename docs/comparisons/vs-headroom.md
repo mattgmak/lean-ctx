@@ -1,9 +1,9 @@
 # LeanCTX and Headroom
 
-> **Status: historical comparison note — not canonical product copy.** Current
-> LeanCTX scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository). This note does not claim
-> savings, quality preservation, provider compatibility, or business outcomes.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 Both products can be considered when inspecting or reducing model-context
 overhead. LeanCTX's available local Runtime primitives are designed to be used

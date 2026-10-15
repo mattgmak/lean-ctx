@@ -13,6 +13,13 @@ use crate::core::tokens::count_tokens;
 use crate::tools::CrpMode;
 
 pub(crate) const MAX_FILE_SIZE: u64 = 512_000;
+/// Size cap when `path` names one regular file (#1917). [`MAX_FILE_SIZE`]
+/// bounds a directory walk; a file the caller named explicitly is the whole
+/// question, so skipping it would turn "not searched" into "0 matches". This
+/// cap only guards memory against pathological inputs.
+const MAX_EXPLICIT_FILE_SIZE: u64 = 64 * 1024 * 1024;
+/// How many size-skipped files the notes name before collapsing to `+N more`.
+const MAX_NAMED_SKIPS: usize = 3;
 pub(crate) const MAX_WALK_DEPTH: usize = 20;
 const MAX_MATCH_LINE_WIDTH: usize = 150;
 
@@ -107,8 +114,49 @@ pub fn handle(
 ///
 /// `exclude` (path glob, complement of `include`) and `exclude_pattern` (regex
 /// on result lines, like `grep -v`) are the negative filters added in #870.
+///
+/// A pattern that is not valid regex syntax (`foo(`, `a[0`, `fn x(&self`) is
+/// almost always code the agent wants to find verbatim, so it is searched
+/// literally with a one-line note instead of failing the call. Size-limit
+/// errors still fail: escaping cannot make an oversized pattern smaller.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_filtered(
+    pattern: &str,
+    dir: &str,
+    include: Option<&str>,
+    max_results: usize,
+    crp_mode: CrpMode,
+    respect_gitignore: bool,
+    allow_secret_paths: bool,
+    anchored: bool,
+    exclude: Option<&str>,
+    exclude_pattern: Option<&str>,
+) -> SearchOutcome {
+    let literal = matches!(regex::Regex::new(pattern), Err(regex::Error::Syntax(_)))
+        .then(|| regex::escape(pattern));
+    let mut outcome = search_compiled_pattern(
+        literal.as_deref().unwrap_or(pattern),
+        dir,
+        include,
+        max_results,
+        crp_mode,
+        respect_gitignore,
+        allow_secret_paths,
+        anchored,
+        exclude,
+        exclude_pattern,
+    );
+    if literal.is_some() && !outcome.text.starts_with("ERROR:") {
+        outcome.text = format!(
+            "note: '{pattern}' is not valid regex — searched for it literally.\n{}",
+            outcome.text
+        );
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_compiled_pattern(
     pattern: &str,
     dir: &str,
     include: Option<&str>,
@@ -134,6 +182,13 @@ pub fn handle_filtered(
     const MAX_REGEX_SIZE: usize = 1 << 20; // 1 MiB DFA limit
 
     let redact = crate::core::redaction::redaction_enabled_for_active_role();
+    let protected = crate::core::policy::runtime::active().is_some();
+    let protected_root = crate::core::policy::diagnostics::project();
+    // Observed before any resident store is consulted: a changed admission
+    // policy drops the content cache and trigram index first (G5).
+    let admission = crate::core::context_admission::stores::StoreAdmission::current();
+    let mut protected_budget = crate::core::limits::max_read_bytes()
+        .min(crate::core::policy::content::MAX_PROTECTED_CONTENT_BYTES);
     if pattern.len() > MAX_PATTERN_LEN {
         return SearchOutcome::error(format!(
             "ERROR: pattern too long ({} > {MAX_PATTERN_LEN} chars)",
@@ -161,20 +216,30 @@ pub fn handle_filtered(
 
     let root = Path::new(dir);
     if !root.exists() {
-        return SearchOutcome::error(format!("ERROR: {dir} does not exist"));
+        let hint = crate::core::path_suggest::hint(root);
+        return SearchOutcome::error(format!("ERROR: {dir} does not exist{hint}"));
     }
     // Broad-root guard (#356 class): with cwd == $HOME a defaulted `path`
     // would walk the whole home dir and trip macOS TCC privacy prompts.
     if let Some(err) = crate::tools::walk_guard::deny_unsafe_walk_root(dir) {
         return SearchOutcome::error(err);
     }
+    let size_limit = if std::fs::metadata(root).is_ok_and(|m| m.is_file()) {
+        MAX_EXPLICIT_FILE_SIZE
+    } else {
+        MAX_FILE_SIZE
+    };
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut matches = Vec::new();
     let mut raw_tokens_accum: usize = 0;
     let mut files_searched = 0u32;
     let mut files_skipped_size = 0u32;
+    // Which files the size cap skipped, so the note names them instead of only
+    // counting them (#1917).
+    let mut skipped_size_files: Vec<String> = Vec::new();
     let mut files_skipped_encoding = 0u32;
+    let mut files_withheld = 0u32;
     let mut skipped_boundary_files: Vec<(String, &'static str)> = Vec::new();
     let mut files_skipped_special = 0u32;
     let mut deadline_hit = false;
@@ -192,12 +257,22 @@ pub fn handle_filtered(
     // are still verified line-by-line with the same regex — so results are
     // identical. Missing/stale index → returns None and triggers a background
     // (re)build; this call uses the walk fallback.
-    let used_index = if let Some(idx) =
-        crate::core::search_index::get_fresh(dir, respect_gitignore, allow_secret_paths)
+    // Files the filters admit when the index narrowed candidates; the walk
+    // path scans its whole scope, so `None` there. Protected searches bypass
+    // legacy unbound indexes and admit original source before matching.
+    let mut narrowed_scope: Option<usize> = None;
+    let used_index = if !protected
+        && let Some(idx) =
+            crate::core::search_index::get_fresh(dir, respect_gitignore, allow_secret_paths)
     {
-        files = idx
-            .candidate_paths(pattern, &include_patterns, root)
-            .into_paths();
+        let candidates = idx.candidate_paths(pattern, &include_patterns, root);
+        if matches!(
+            candidates,
+            crate::core::search_index::CandidateSet::Narrowed(_)
+        ) {
+            narrowed_scope = Some(idx.scope_count(&include_patterns, &exclude_patterns, root));
+        }
+        files = candidates.into_paths();
         if !allow_secret_paths {
             skipped_boundary_files = crate::core::search_index::boundary_skipped_files(
                 dir,
@@ -247,8 +322,7 @@ pub fn handle_filtered(
             }
 
             if !include_patterns.is_empty() {
-                let rel = path.strip_prefix(root).unwrap_or(path);
-                let rel_str = rel.to_string_lossy();
+                let rel_str = filter_rel(path, root);
                 if !include_patterns.iter().any(|p| p.matches(&rel_str)) {
                     continue;
                 }
@@ -256,8 +330,7 @@ pub fn handle_filtered(
 
             if !allow_secret_paths {
                 if let Some(reason) = crate::core::io_boundary::is_secret_like(path) {
-                    let rel = path.strip_prefix(root).unwrap_or(path);
-                    skipped_boundary_files.push((rel.to_string_lossy().into_owned(), reason));
+                    skipped_boundary_files.push((filter_rel(path, root).into_owned(), reason));
                     continue;
                 }
             }
@@ -274,14 +347,21 @@ pub fn handle_filtered(
     // so the negative glob filter applies uniformly to either collection path.
     if !exclude_patterns.is_empty() {
         files.retain(|path| {
-            let rel = path.strip_prefix(root).unwrap_or(path);
-            let rel_str = rel.to_string_lossy();
+            let rel_str = filter_rel(path, root);
             !exclude_patterns.iter().any(|p| p.matches(&rel_str))
         });
     }
 
     // Deterministic search: stable file ordering makes max_results truncation reproducible.
     files.sort_unstable_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+
+    // #1994: the scope is every file the filters admit. Files the trigram
+    // index ruled out provably lack the literal, so they count as covered:
+    // "scanned" then means the same thing with or without a warm index, and
+    // `scanned 0` can only mean the filters left nothing to search.
+    let files_in_scope = narrowed_scope.unwrap_or(files.len());
+    let index_pruned =
+        u32::try_from(files_in_scope.saturating_sub(files.len())).unwrap_or(u32::MAX);
 
     let root_str = root.to_string_lossy();
     let deadline = search_deadline().map(|budget| Instant::now() + budget);
@@ -308,8 +388,14 @@ pub fn handle_filtered(
                 files_skipped_special += 1;
                 continue;
             }
-            Ok(meta) if meta.len() > MAX_FILE_SIZE => {
+            Ok(meta) if meta.len() > size_limit => {
                 files_skipped_size += 1;
+                if skipped_size_files.len() < MAX_NAMED_SKIPS {
+                    skipped_size_files.push(protocol::shorten_path_relative(
+                        &path.to_string_lossy(),
+                        &root_str,
+                    ));
+                }
                 continue;
             }
             Ok(meta) => crate::core::content_cache::FileState::from_metadata(&meta),
@@ -324,24 +410,57 @@ pub fn handle_filtered(
         // in-memory hit. On a miss (cold cache / evicted) read once and publish
         // it for the next caller. `(mtime, size)` validation guarantees we never
         // verify against stale bytes.
-        let content: std::sync::Arc<str> =
-            if let Some(cached) = state.and_then(|s| crate::core::content_cache::get(path, s)) {
-                crate::core::cache::record_search_content_read(true);
-                cached
+        let content: std::sync::Arc<str> = if protected {
+            let admitted = protected_root.as_ref().and_then(|root| {
+                crate::tools::ctx_read::read_file_for_tool_rooted_budgeted(
+                    path.to_str()?,
+                    root.to_str()?,
+                    "ctx_search",
+                    &mut protected_budget,
+                )
+                .ok()
+            });
+            if let Some(text) = admitted {
+                std::sync::Arc::from(text)
             } else {
-                if state.is_some() {
-                    crate::core::cache::record_search_content_read(false);
-                }
-                let Ok(text) = std::fs::read_to_string(path) else {
-                    files_skipped_encoding += 1;
-                    continue;
-                };
-                let arc: std::sync::Arc<str> = std::sync::Arc::from(text);
-                if let Some(s) = state {
-                    crate::core::content_cache::insert(path, s, std::sync::Arc::clone(&arc));
-                }
-                arc
+                // No source path or diagnostic payload is disclosed for
+                // an unreadable or policy-withheld original.
+                files_withheld += 1;
+                continue;
+            }
+        } else if let Some(cached) = state.and_then(|s| crate::core::content_cache::get(path, s)) {
+            crate::core::cache::record_search_content_read(true);
+            cached
+        } else {
+            if state.is_some() {
+                crate::core::cache::record_search_content_read(false);
+            }
+            let Ok(text) = crate::core::text_decode::read_text(path) else {
+                files_skipped_encoding += 1;
+                continue;
             };
+            // Search matches only ever come from admitted text: a masked value
+            // cannot be found, and a withheld or restricted source is skipped
+            // without disclosing it (G5).
+            let Some(text) = admission.admit(&text, path) else {
+                files_withheld += 1;
+                continue;
+            };
+            let arc: std::sync::Arc<str> = std::sync::Arc::from(text);
+            // An explicitly named file above the walk cap is read once and
+            // not published: it would evict the whole shared cache.
+            if let Some(s) = state
+                && arc.len() as u64 <= MAX_FILE_SIZE
+            {
+                crate::core::content_cache::insert(
+                    path,
+                    s,
+                    std::sync::Arc::clone(&arc),
+                    &admission,
+                );
+            }
+            arc
+        };
 
         files_searched += 1;
         // Enclosing-symbol spans for this file, computed lazily on the first hit
@@ -415,10 +534,25 @@ pub fn handle_filtered(
         });
     }
 
+    let files_covered = files_searched.saturating_add(index_pruned);
+
     if matches.is_empty() {
-        let mut msg = format!("0 matches for '{pattern}' in {files_searched} files");
+        // Match the hit response's scoped scan count, including candidates the
+        // index ruled out, while retaining policy-withheld visibility.
+        let mut msg = format!("0 matches for '{pattern}' (scanned {files_covered} files)");
+        if files_withheld > 0 {
+            msg.push_str(&format!(
+                " ({files_withheld} sources withheld under policy)"
+            ));
+        }
+        if files_in_scope == 0 {
+            msg.push_str(&empty_scope_note(dir, include, exclude));
+        }
         if files_skipped_size > 0 {
-            msg.push_str(&format!(" ({files_skipped_size} large files skipped)"));
+            msg.push_str(&format!(
+                " ({files_skipped_size} large files skipped: {})",
+                name_skipped(&skipped_size_files, files_skipped_size)
+            ));
         }
         if files_skipped_encoding > 0 {
             msg.push_str(&format!(
@@ -457,7 +591,7 @@ pub fn handle_filtered(
     // number of files *searched*. Report what matched; keep the scanned count as
     // a clearly-labelled secondary number so scope is still visible.
     let mut result = format!(
-        "{} matches in {} files (scanned {files_searched})",
+        "{} matches in {} files (scanned {files_covered})",
         matches.len(),
         matched_files.len()
     );
@@ -488,9 +622,17 @@ pub fn handle_filtered(
         );
     }
     result.push_str(&matches.join("\n"));
+    if files_withheld > 0 {
+        result.push_str(&format!(
+            "\n({files_withheld} sources withheld under policy)"
+        ));
+    }
 
     if files_skipped_size > 0 {
-        result.push_str(&format!("\n({files_skipped_size} files >512KB skipped)"));
+        result.push_str(&format!(
+            "\n({files_skipped_size} files >512KB skipped: {})",
+            name_skipped(&skipped_size_files, files_skipped_size)
+        ));
     }
     if files_skipped_encoding > 0 {
         result.push_str(&format!(
@@ -507,7 +649,7 @@ pub fn handle_filtered(
     }
     if deadline_hit {
         result.push_str(&format!(
-            "\n(search stopped after the {}s budget — {files_searched} files scanned; \
+            "\n(search stopped after the {}s budget — {files_covered} files scanned; \
              refine the pattern or scope with path= for full coverage)",
             search_deadline().map_or(0, |d| d.as_secs())
         ));
@@ -517,9 +659,8 @@ pub fn handle_filtered(
     // "10 matches in 1 files (scanned 1)" as an exhaustive answer when the
     // scan had in fact stopped after the first file of 32.
     if cap_hit {
-        let candidates = files.len();
         result.push_str(&format!(
-            "\n(stopped at the max_results={max_results} cap — {files_searched} of {candidates} \
+            "\n(stopped at the max_results={max_results} cap — {files_covered} of {files_in_scope} \
              files scanned; the counts above are a floor, not a total. Raise max_results, \
              narrow with include=/path=, or split the pattern.)"
         ));
@@ -559,6 +700,17 @@ pub fn handle_filtered(
     }
 
     SearchOutcome::from_observed(result, raw_tokens_accum)
+}
+
+/// `a.log, b.log, +3 more` — the size-skipped files by name (#1917), so a
+/// skipped target is never mistaken for a searched one.
+fn name_skipped(named: &[String], total: u32) -> String {
+    let mut out = named.join(", ");
+    let rest = (total as usize).saturating_sub(named.len());
+    if rest > 0 {
+        out.push_str(&format!(", +{rest} more"));
+    }
+    out
 }
 
 /// Render boundary-skip audit note (#1481): paths + reason codes, capped at 10.
@@ -704,12 +856,17 @@ const MAX_INCLUDE_GLOBS: usize = 64;
 /// with `**/` to match at any directory depth — matching `rg --glob` and
 /// `git grep` behaviour. Globs that already contain `/` are used as-is, so
 /// `src/**/*.rs` only matches under `src/`.
+///
+/// A comma outside braces separates globs (`*.go,*.yaml`), the list form
+/// callers reach for first (#1994). It used to compile to one glob no file
+/// could match, so the search reported a clean miss over an empty scope.
 fn compile_include(include: Option<&str>) -> Vec<Pattern> {
     let Some(raw) = include else {
         return Vec::new();
     };
-    expand_braces(raw)
+    split_top_level_commas(raw)
         .into_iter()
+        .flat_map(expand_braces)
         .take(MAX_INCLUDE_GLOBS)
         .filter(|g| !g.is_empty())
         .map(|g| {
@@ -721,6 +878,53 @@ fn compile_include(include: Option<&str>) -> Vec<Pattern> {
         })
         .filter_map(|g| Pattern::new(&g).ok())
         .collect()
+}
+
+/// Split a glob list at commas outside `{…}` groups, trimming each piece.
+fn split_top_level_commas(raw: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in raw.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                pieces.push(raw[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    pieces.push(raw[start..].trim());
+    pieces
+}
+
+/// The path include/exclude globs are matched against: relative to the search
+/// root, or the file name when the root is the file itself (#2059) — there
+/// `strip_prefix` yields the empty string, which no glob admits.
+fn filter_rel<'a>(path: &'a Path, root: &Path) -> std::borrow::Cow<'a, str> {
+    match path.strip_prefix(root) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy(),
+        _ => path
+            .file_name()
+            .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy()),
+    }
+}
+
+/// Why a search had nothing to scan (#1994), appended to a zero-hit result so
+/// it cannot be read as "the pattern is not in the codebase".
+fn empty_scope_note(dir: &str, include: Option<&str>, exclude: Option<&str>) -> String {
+    match (include, exclude) {
+        (Some(include), _) => format!(
+            " — include=`{include}` admits no file under {dir}, so nothing was searched. \
+             Check the glob; a list is `*.{{go,yaml}}` or `*.go,*.yaml`."
+        ),
+        (None, Some(exclude)) => format!(
+            " — exclude=`{exclude}` removes every file under {dir}, so nothing was searched."
+        ),
+        (None, None) => format!(" — {dir} holds no searchable text file."),
+    }
 }
 
 /// Expand one or more `{a,b,c}` brace groups into the cartesian set of concrete
@@ -761,9 +965,16 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 /// `symbol_map::is_keyword` simply treats them as "no keywords", so no allowlist
 /// has to be kept in sync here.
 fn extract_extensions(include: Option<&str>) -> Vec<String> {
-    let Some(pattern) = include else {
+    let Some(list) = include else {
         return Vec::new();
     };
+    split_top_level_commas(list)
+        .into_iter()
+        .flat_map(extensions_of_glob)
+        .collect()
+}
+
+fn extensions_of_glob(pattern: &str) -> Vec<String> {
     let filename = pattern.rsplit('/').next().unwrap_or(pattern);
     let Some(dot) = filename.rfind('.') else {
         return Vec::new();

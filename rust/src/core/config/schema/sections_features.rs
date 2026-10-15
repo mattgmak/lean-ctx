@@ -308,6 +308,14 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             "Only notify about updates, don't install automatically",
         ),
     );
+    updates.insert(
+        "pinned_version".into(),
+        key(
+            "string|null",
+            serde_json::json!(cfg.updates.pinned_version),
+            "Release version used by update commands and scheduled updates; unset follows latest",
+        ),
+    );
     sections.insert(
         "updates".into(),
         SectionSchema {
@@ -478,6 +486,93 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         SectionSchema {
             description: "Per-item sensitivity model with a uniform policy floor (#212)".into(),
             keys: sensitivity,
+        },
+    );
+
+    let gw = &cfg.context_gateway;
+    let mut context_gateway = BTreeMap::new();
+    context_gateway.insert(
+        "enabled".into(),
+        key_with_env(
+            "bool",
+            serde_json::json!(gw.enabled),
+            "Run context admission on every governed source before caching or compression",
+            "LEAN_CTX_CONTEXT_GATEWAY",
+        ),
+    );
+    let mode = serde_json::to_value(gw.mode)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    context_gateway.insert(
+        "mode".into(),
+        key_enum(
+            &["developer", "governed", "sovereign"],
+            &mode,
+            "Governed and sovereign treat unclassified content as internal, never public",
+        ),
+    );
+    for (name, action, what) in [
+        (
+            "secrets",
+            gw.secrets,
+            "credentials and keys (patterns from [secret_detection])",
+        ),
+        (
+            "pii",
+            gw.pii,
+            "checksum-validated PII: AHV, IBAN, payment cards",
+        ),
+        (
+            "injection",
+            gw.injection,
+            "prompt-injection heuristic (OWASP LLM01)",
+        ),
+        (
+            "classification",
+            gw.classification,
+            "explicit markings such as CONFIDENTIAL (redact = withhold)",
+        ),
+    ] {
+        context_gateway.insert(
+            name.into(),
+            key_enum(
+                &["off", "warn", "redact", "block"],
+                action.as_str(),
+                &format!("Action for {what}"),
+            ),
+        );
+    }
+    context_gateway.insert(
+        "max_inspected_bytes".into(),
+        key(
+            "usize",
+            serde_json::json!(gw.max_inspected_bytes),
+            "Bytes each detector inspects per object; beyond it coverage is partial (withheld in governed/sovereign mode)",
+        ),
+    );
+    context_gateway.insert(
+        "detector_timeout_ms".into(),
+        key(
+            "u64",
+            serde_json::json!(gw.detector_timeout_ms),
+            "Per-detector time budget; a detector that runs out reports timed_out, never clean",
+        ),
+    );
+    context_gateway.insert(
+        "hud".into(),
+        key_enum(
+            &["auto", "in_band", "status_line"],
+            gw.hud.as_str(),
+            "Where redaction counts appear: auto keeps them out of the model's context when the Claude Code status line shows lean-ctx",
+        ),
+    );
+    sections.insert(
+        "context_gateway".into(),
+        SectionSchema {
+            description:
+                "Context Gateway admission: built-in detectors, on by default, global-only".into(),
+            keys: context_gateway,
         },
     );
 
@@ -661,13 +756,21 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         key(
             "bool",
             serde_json::json!(cfg.telemetry.enabled),
-            "Enable anonymous telemetry heartbeat (version, OS, arch, random install ID — no code or PII)",
+            "Enable anonymous product telemetry (cumulative daily aggregates — no code, paths or PII)",
+        ),
+    );
+    telemetry.insert(
+        "preference".into(),
+        key_enum(
+            &["default_on", "explicitly_enabled", "explicitly_disabled"],
+            "default_on",
+            "Whether telemetry is using the v4 default or an explicit user choice",
         ),
     );
     sections.insert(
         "telemetry".into(),
         SectionSchema {
-            description: "Anonymous opt-in telemetry heartbeat".into(),
+            description: "Privacy-safe default-on telemetry with explicit opt-out".into(),
             keys: telemetry,
         },
     );
@@ -737,6 +840,57 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         SectionSchema {
             description: "Research-only hosted publication settings (inactive by default)".into(),
             keys: gain,
+        },
+    );
+
+    let vd = &cfg.value_display;
+    let mut value_display = BTreeMap::new();
+    value_display.insert(
+        "mode".into(),
+        key_enum_with_env(
+            &["off", "minimal", "milestones", "verbose"],
+            "minimal",
+            "How lean-ctx shows its measured value to you (never to the model): off, minimal (default: status line + threshold recaps), milestones (+ OS notifications), verbose (every recap window)",
+            "LEAN_CTX_VALUE_DISPLAY",
+        ),
+    );
+    value_display.insert(
+        "recap_every_turns".into(),
+        key(
+            "u32",
+            serde_json::json!(vd.recap_every_turns),
+            "A turn recap is considered every N agent turns (default 5)",
+        ),
+    );
+    value_display.insert(
+        "recap_min_tokens".into(),
+        key(
+            "u64",
+            serde_json::json!(vd.recap_min_tokens),
+            "Show a turn recap only when the window saved at least this many tokens or a security event happened (default 10000)",
+        ),
+    );
+    value_display.insert(
+        "notifications".into(),
+        key(
+            "bool",
+            serde_json::json!(vd.notifications),
+            "OS notifications for milestones in mode milestones or verbose, at most one per day (default true)",
+        ),
+    );
+    value_display.insert(
+        "git_trailer".into(),
+        key(
+            "bool",
+            serde_json::json!(vd.git_trailer),
+            "Opt-in `lean-ctx:` trailer in commit messages (default false)",
+        ),
+    );
+    sections.insert(
+        "value_display".into(),
+        SectionSchema {
+            description: "User-only value surface: status line, recaps, prompt segment, milestones. Every number is backed by `lean-ctx value`.".into(),
+            keys: value_display,
         },
     );
 }

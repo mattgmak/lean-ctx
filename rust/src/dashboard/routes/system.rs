@@ -45,7 +45,7 @@ pub(super) fn handle(
         // plan cache only — no network on this hot path, never gates anything.
         "/api/billing-badge" => {
             let eff = crate::cloud_client::resolve_effective_plan_cached();
-            let supporter = !matches!(eff.plan, crate::core::billing::Plan::Free);
+            let supporter = eff.supporter_recognition;
             let source = match eff.source {
                 crate::cloud_client::PlanSource::Live => "live",
                 crate::cloud_client::PlanSource::Cached => "cached",
@@ -79,6 +79,13 @@ pub(super) fn handle(
         "/api/owasp" => {
             let mappings = crate::core::owasp_alignment::alignment();
             let json = serde_json::to_string(&mappings).unwrap_or_else(|_| "[]".to_string());
+            Some(("200 OK", "application/json", json))
+        }
+        // Guards that fired: `lean-ctx value --all` as JSON — lifetime counts
+        // re-derived from the verified savings ledger and audit trail.
+        "/api/value" => {
+            let proof = crate::core::value::proof::build(None, true);
+            let json = serde_json::to_string(&proof).unwrap_or_else(|_| "{}".to_string());
             Some(("200 OK", "application/json", json))
         }
         "/api/slos" => {

@@ -3,12 +3,17 @@
 > Architectural contract defining the three lean-ctx pillars and their
 > dependency rules. CI-enforced via `contracts_frozen.rs`.
 
+The names below describe implementation modules, not competing product categories.
+LeanCTX is the **Context Gateway for AI Systems**; see the
+[canonical product definition](../POSITIONING_CANONICAL.md) for edition and release scope.
+
 ## Pillars
 
 ### Engine (always compiled)
 
-The developer-facing context compression layer. All features work locally,
-offline, with zero telemetry.
+LeanCTX Engine implements local context selection, supported controls, and evidence.
+Local operations can run without a model call. Enabled providers, model/proxy
+routes, updates, and opted-in telemetry have separate network paths.
 
 **Top-level modules:** `core`, `tools`, `server`, `engine`, `tool_defs`,
 `instructions`, `mcp_stdio`, `hooks`, `hook_handlers`, `rules_inject`,
@@ -72,9 +77,11 @@ repositories.
 
 ## Local-Free Invariant
 
-Every feature in every pillar works self-hosted for free. Commercial tiers
-(Cloud) add hosting and support, never capabilities. CI enforces this via
-the `local_free_invariant` test.
+The open-source Engine's local capability set is ungated by a commercial account
+or plan. Separately licensed SDK and Enterprise capabilities follow their own
+agreements; the local invariant does not grant their production or self-hosting
+rights. Commercial features remain additive to the open Engine. CI checks the
+Engine capability classification via `local_free_invariant`.
 
 ## Naming convention
 

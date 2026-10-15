@@ -1,8 +1,71 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::server::{CepComputedStats, CrpMode, LeanCtxServer, ToolCallRecord};
 use super::startup::auto_consolidate_knowledge;
 use super::{ctx_compress, ctx_share};
+
+/// The `mode` a `ctx_shell` status or cancel request reports: looking after a
+/// running background job, not a new command.
+pub(crate) const BACKGROUND_POLL_MODE: &str = "background";
+
+/// Whether a call counts in the session's tool-call and command stats (the
+/// value snapshot behind status lines and the cockpit). A background-job poll
+/// does not: a host that watches a job polls it every few seconds, and counted
+/// polls drowned the real commands and diluted the share of output kept out.
+#[must_use]
+pub(crate) fn counts_in_session(tool: &str, mode: Option<&str>) -> bool {
+    !(tool == "ctx_shell" && mode == Some(BACKGROUND_POLL_MODE))
+}
+
+/// Single-flight flag for the Pro usage scan in `record_call`.
+static PRO_SIGNAL_SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Clears `PRO_SIGNAL_SCAN_RUNNING` when the scan ends, even on panic or when
+/// the blocking task is dropped unrun.
+struct ProSignalScanGuard;
+
+impl Drop for ProSignalScanGuard {
+    fn drop(&mut self) {
+        PRO_SIGNAL_SCAN_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+/// The part of the live session `local_usage_signals` reads (its id and the
+/// agents in its evidence), cloned so the scan can run without the lock.
+fn pro_signal_probe(
+    session: &crate::core::session::SessionState,
+) -> crate::core::session::SessionState {
+    let mut probe = crate::core::session::SessionState::new();
+    probe.id.clone_from(&session.id);
+    probe.evidence = session
+        .evidence
+        .iter()
+        .filter(|record| record.agent_id.is_some())
+        .cloned()
+        .collect();
+    probe
+}
+
+/// Moves the security events recorded since the last call into the session's
+/// counters and captures the value snapshot the display channels read.
+fn fold_value_snapshot(
+    session: &mut crate::core::session::SessionState,
+) -> crate::core::value::snapshot::ValueSnapshot {
+    let security = crate::core::security_events::drain_pending();
+    session.stats.security.merge(&security);
+    crate::core::value::snapshot::ValueSnapshot::from_session(session)
+}
+
+/// Writes the snapshot off the async workers (throttled, atomic).
+fn publish_value_snapshot(snapshot: crate::core::value::snapshot::ValueSnapshot) {
+    if !crate::core::value::display_enabled() {
+        return;
+    }
+    drop(tokio::task::spawn_blocking(move || {
+        crate::core::value::snapshot::write_throttled(&snapshot);
+        crate::core::value::milestones::maybe_notify();
+    }));
+}
 
 /// Build payload-free OCLA metrics for one completed MCP tool call.
 ///
@@ -213,20 +276,6 @@ impl LeanCtxServer {
                 .as_ref();
             let _ = hook.observe(observation).await;
 
-            let outcome = crate::core::ocla::Outcome {
-                context: ctx.clone(),
-                accepted: Some(saved > 0),
-                quality_score_milli: if original > 0 {
-                    Some(((saved as u64 * 1000) / original as u64).min(1000) as u16)
-                } else {
-                    None
-                },
-                outcome_ref: None,
-            };
-            let _ = crate::core::ocla::OclaRegistry::global()
-                .outcome_tracker
-                .record_outcome(outcome);
-
             // OCLA MetricsExporter projection: one bounded, local batch per
             // tool call. This is observational only and cannot affect stats,
             // billing, or external export destinations.
@@ -237,39 +286,60 @@ impl LeanCtxServer {
                 .await;
         }
         let mut session = self.session.write().await;
-        session.record_tool_call(saved as u64, original as u64);
-        if tool == "ctx_shell" {
-            session.record_command();
+        if counts_in_session(tool, mode.as_deref()) {
+            session.record_tool_call(saved as u64, original as u64);
+            if tool == "ctx_shell" {
+                session.record_command();
+            }
         }
-        let pending_save = if session.should_save() {
-            session.prepare_save().ok()
-        } else {
-            None
-        };
+        let save_due = session.should_save();
+        let value_snapshot = fold_value_snapshot(&mut session);
         drop(calls);
         drop(session);
+        publish_value_snapshot(value_snapshot);
 
         let pro_count = self.pro_trigger_check_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if pro_count.is_multiple_of(10) {
-            let signals = {
+        if pro_count.is_multiple_of(10) && !PRO_SIGNAL_SCAN_RUNNING.swap(true, Ordering::AcqRel) {
+            // The usage scan deserializes every persisted session. Running it
+            // on a runtime worker while holding the session lock stalled every
+            // concurrent tool call behind it (a queued writer blocks new
+            // readers), so snapshot only what the scan reads and move it off
+            // the async path; at most one scan runs at a time.
+            let running = ProSignalScanGuard;
+            let probe = {
                 let session = self.session.read().await;
-                crate::core::pro_triggers::local_usage_signals(&session)
+                pro_signal_probe(&session)
             };
-            tokio::task::spawn_blocking(move || {
+            drop(tokio::task::spawn_blocking(move || {
+                let signals = {
+                    let _running = running;
+                    crate::core::pro_triggers::local_usage_signals(&probe)
+                };
                 for nudge in crate::core::pro_triggers::evaluate_triggers(&signals) {
                     tracing::info!(kind = ?nudge.kind, message = %nudge.message, "lean-ctx Pro trigger fired");
                 }
-            });
+            }));
         }
 
-        if let Some(prepared) = pending_save {
-            drop(tokio::task::spawn_blocking(move || {
-                let _ = prepared.write_to_disk();
-            }));
+        if save_due {
+            tokio::spawn(crate::core::session::SessionState::save_shared_logged(
+                self.session.clone(),
+            ));
         }
 
         self.write_mcp_live_stats().await;
         write_science_live_stats();
+    }
+
+    /// Folds security events recorded outside `record_call` (e.g. injection
+    /// flags found after the handler) into the session and republishes the
+    /// value snapshot, so the status line never lags a blocked or flagged call.
+    pub async fn publish_value_snapshot(&self) {
+        let snapshot = {
+            let mut session = self.session.write().await;
+            fold_value_snapshot(&mut session)
+        };
+        publish_value_snapshot(snapshot);
     }
 
     /// Increments the call counter and returns true if a checkpoint is due.
@@ -289,8 +359,7 @@ impl LeanCtxServer {
         let checkpoint = ctx_compress::handle(&cache, false, CrpMode::effective());
         drop(cache);
 
-        let mut session = self.session.write().await;
-        let pending_save = session.prepare_save().ok();
+        let session = self.session.read().await;
         let session_summary = session.format_compact();
         let has_insights = !session.findings.is_empty() || !session.decisions.is_empty();
         let project_root = session.project_root.clone();
@@ -298,11 +367,9 @@ impl LeanCtxServer {
         let summary_candidate = crate::core::session_summary::build_candidate(&session);
         drop(session);
 
-        if let Some(prepared) = pending_save {
-            tokio::task::spawn_blocking(move || {
-                let _ = prepared.write_to_disk();
-            });
-        }
+        tokio::spawn(crate::core::session::SessionState::save_shared_logged(
+            self.session.clone(),
+        ));
 
         if has_insights && let Some(ref root) = project_root {
             let root = root.clone();
@@ -499,25 +566,6 @@ impl LeanCtxServer {
             cache_hits: stats.cache_hits(),
             total_reads: stats.total_reads(),
             tool_call_count: calls.len() as u64,
-            adoption: Self::compute_adoption(calls),
-        }
-    }
-
-    /// Compute adoption metrics from tool call history.
-    /// ctx_* calls = lean-ctx MCP adoption; other tools = native passthrough.
-    fn compute_adoption(calls: &[ToolCallRecord]) -> super::server::AdoptionMetrics {
-        let ctx_tool_calls = calls.iter().filter(|c| c.tool.starts_with("ctx_")).count() as u64;
-        let total = calls.len() as u64;
-        let native_passthrough = total.saturating_sub(ctx_tool_calls);
-        let adoption_pct = if total > 0 {
-            ((ctx_tool_calls as f64 / total as f64) * 100.0).round() as u32
-        } else {
-            0
-        };
-        super::server::AdoptionMetrics {
-            ctx_tool_calls,
-            native_passthrough,
-            adoption_pct,
         }
     }
 
@@ -620,9 +668,6 @@ impl LeanCtxServer {
             "tokens_saved": cs.total_saved,
             "tokens_original": cs.total_original,
             "tool_calls": cs.tool_call_count,
-            "adoption_pct": cs.adoption.adoption_pct,
-            "ctx_tool_calls": cs.adoption.ctx_tool_calls,
-            "native_passthrough": cs.adoption.native_passthrough,
             "started_at": started_at,
             "updated_at": chrono::Local::now().to_rfc3339(),
         });
@@ -826,6 +871,49 @@ pub(crate) fn write_science_live_stats() {
 }
 
 #[cfg(test)]
+mod pro_signal_probe_tests {
+    use super::*;
+    use crate::core::session::{EvidenceKind, EvidenceRecord, SessionState};
+
+    fn evidence(agent: Option<&str>) -> EvidenceRecord {
+        EvidenceRecord {
+            kind: EvidenceKind::ToolCall,
+            key: "tool:ctx_read".into(),
+            value: Some("payload that the scan never reads".into()),
+            tool: Some("ctx_read".into()),
+            input_md5: None,
+            output_md5: None,
+            agent_id: agent.map(String::from),
+            client_name: None,
+            task_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn probe_keeps_id_and_agent_tagged_evidence_only() {
+        let mut session = SessionState::new();
+        session.evidence = vec![evidence(Some("a")), evidence(None), evidence(Some("b"))];
+        let probe = pro_signal_probe(&session);
+        assert_eq!(probe.id, session.id);
+        let agents: Vec<_> = probe
+            .evidence
+            .iter()
+            .filter_map(|r| r.agent_id.as_deref())
+            .collect();
+        assert_eq!(agents, ["a", "b"]);
+        assert_eq!(probe.evidence.len(), 2);
+    }
+
+    #[test]
+    fn scan_guard_releases_flag_when_dropped_unrun() {
+        PRO_SIGNAL_SCAN_RUNNING.store(true, Ordering::Release);
+        drop(ProSignalScanGuard);
+        assert!(!PRO_SIGNAL_SCAN_RUNNING.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
 mod activity_score_tests {
     use super::*;
 
@@ -952,5 +1040,15 @@ mod activity_score_tests {
             u64::MAX,
         );
         assert!(saturated.iter().all(|point| point.value_milli == i64::MAX));
+    }
+
+    /// A host watching a background job polls it every few seconds; those
+    /// polls once made a session read "896 commands" for a handful of real ones.
+    #[test]
+    fn background_job_polls_stay_out_of_the_session_stats() {
+        assert!(!counts_in_session("ctx_shell", Some(BACKGROUND_POLL_MODE)));
+        assert!(counts_in_session("ctx_shell", None));
+        assert!(counts_in_session("ctx_shell", Some("full")));
+        assert!(counts_in_session("ctx_read", Some(BACKGROUND_POLL_MODE)));
     }
 }

@@ -1,9 +1,9 @@
 # Team Invite Links v1 (GL #385)
 
-> **Status: historical research contract — unavailable.** This describes a
-> proposed hosted team, dashboard, and account flow. It is not a current LeanCTX
-> product surface. LeanCTX is **The Context SDK for AI Agents**; current scope
-> and status are governed by `docs/internal/README.md` (internal, not in this repository).
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 One-time links replace manual token copy-paste when onboarding teammates onto
 a hosted team server. The owner mints a link on the dashboard; the teammate

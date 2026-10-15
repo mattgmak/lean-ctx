@@ -484,6 +484,8 @@ fn handle_type_hierarchy(
         Ok((tree, backend.last_truncation()))
     });
     match result {
+        // No type at that position (or the server is still indexing).
+        Ok((tree, _)) if tree.name.is_empty() => "No type at this position.".to_string(),
         Ok((tree, meta)) => {
             let mut out = format_type_hierarchy(&tree);
             if matches!(meta, Some(m) if m.truncated) {

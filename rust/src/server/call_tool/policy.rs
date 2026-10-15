@@ -29,7 +29,7 @@ const ROOTS_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const ROOTS_LIST_MAX_ATTEMPTS: u32 = 3;
 
 impl LeanCtxServer {
-    pub(super) fn guard_role_and_policy(name: &str) -> Option<CallToolResult> {
+    pub(crate) fn guard_role_and_policy(name: &str) -> Option<CallToolResult> {
         let role_check = role_guard::check_tool_access(name);
         if let Some(denied) = role_guard::into_call_tool_result(&role_check) {
             tracing::warn!(
@@ -55,7 +55,7 @@ impl LeanCtxServer {
         None
     }
 
-    pub(super) fn guard_egress(
+    pub(crate) fn guard_egress(
         guard_name: &str,
         guard_args: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Option<CallToolResult> {
@@ -221,27 +221,38 @@ impl LeanCtxServer {
             );
         }
 
-        if old_root.as_deref() == Some(&new_root) {
-            let _ = session.save();
-            return;
-        }
-        tracing::info!(
-            "MCP roots: switching project root from {:?} to {new_root}",
-            old_root
-        );
-        if let Some(existing) =
-            crate::core::session::SessionState::load_latest_for_project_root(&new_root)
-        {
-            *session = existing;
-            session.extra_roots = validated_paths
-                .iter()
-                .filter(|p| p.as_str() != new_root)
-                .cloned()
-                .collect();
-        }
-        session.project_root = Some(new_root);
-        let _ = session.save();
+        // Everything below serializes under the guard and writes outside it.
+        // This runs before the handler watchdog on every call once the probe
+        // re-arms, and `call_tool_guarded` needs `session.read()` for each tool;
+        // tokio's RwLock is write-preferring, so blocking file I/O held here
+        // would park every later call behind it with nothing able to cancel it
+        // (#1783).
+        let prepared = if old_root.as_deref() == Some(&new_root) {
+            session.prepare_save().ok()
+        } else {
+            tracing::info!(
+                "MCP roots: switching project root from {:?} to {new_root}",
+                old_root
+            );
+            if let Some(existing) =
+                crate::core::session::SessionState::load_latest_for_project_root(&new_root)
+            {
+                *session = existing;
+                session.extra_roots = validated_paths
+                    .iter()
+                    .filter(|p| p.as_str() != new_root)
+                    .cloned()
+                    .collect();
+            }
+            session.project_root = Some(new_root);
+            session.prepare_save().ok()
+        };
         drop(session);
+        if let Some(prepared) = prepared {
+            drop(tokio::task::spawn_blocking(move || {
+                let _ = prepared.write_to_disk();
+            }));
+        }
         // Indices warm lazily on first use of a tool that needs them (#152) —
         // the dispatch path for this very call handles it via
         // `index_orchestrator::ensure_warm_for_tool`, so no eager scan here.

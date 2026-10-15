@@ -1,10 +1,9 @@
 # Contract: ctxpkg Registry v1 (GL #406)
 
-> **Status: historical research contract — unavailable.** This proposed hosted
-> registry, account, storefront, and control-plane flow is not a current LeanCTX
-> product or public endpoint. LeanCTX is **The Context SDK for AI Agents**; the
-> available `.ctxpkg` substrate is local and signed. Current scope and status are
-> governed by `docs/internal/README.md` (internal, not in this repository).
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 Status: historical research
 Consumers: `lean-ctx pack publish/install` (CLI), ctxpkg.com storefront,

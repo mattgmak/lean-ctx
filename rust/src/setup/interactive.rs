@@ -1,5 +1,5 @@
 use crate::core::editor_registry::{WriteAction, WriteOptions};
-use crate::core::portable_binary::resolve_portable_binary;
+use crate::core::portable_binary::resolve_agent_binary;
 use crate::hooks::{HookMode, recommend_hook_mode};
 
 use super::first_run::{first_run_setup_level, persist_setup_choice};
@@ -41,7 +41,7 @@ pub fn run_setup() {
         std::process::exit(1);
     };
 
-    let binary = resolve_portable_binary();
+    let binary = resolve_agent_binary();
 
     let home_str = home.to_string_lossy().to_string();
 
@@ -53,11 +53,11 @@ pub fn run_setup() {
     let allow_rule_steering =
         inject_rules && !crate::core::config::Config::load().declines_rule_steering();
 
-    terminal_ui::print_step_header(1, 13, "Shell Hook");
+    terminal_ui::print_step_header(1, 14, "Shell Hook");
     crate::cli::cmd_init(&["--global".to_string()]);
     crate::shell_hook::install_all(false);
 
-    terminal_ui::print_step_header(2, 13, "Daemon");
+    terminal_ui::print_step_header(2, 14, "Daemon");
     if crate::daemon::is_daemon_running() {
         terminal_ui::print_status_ok("Daemon running — restarting with current binary…");
         let _ = crate::daemon::stop_daemon();
@@ -69,7 +69,7 @@ pub fn run_setup() {
         terminal_ui::print_status_warn(&format!("Daemon start failed: {e}"));
     }
 
-    terminal_ui::print_step_header(3, 13, "AI Tool Detection");
+    terminal_ui::print_step_header(3, 14, "AI Tool Detection");
 
     let targets = crate::core::editor_registry::build_targets(&home);
     // #281: in MCP-disabled environments (`auto_update_mcp = false`) editors are
@@ -83,6 +83,7 @@ pub fn run_setup() {
     let mut not_installed: Vec<&str> = Vec::new();
     let mut mcp_skipped: Vec<&str> = Vec::new();
     let mut errors: Vec<&str> = Vec::new();
+    let mut configured_integration_ids = Vec::new();
 
     for target in &targets {
         let short_path = shorten_path(&target.config_path.to_string_lossy(), &home_str);
@@ -121,6 +122,7 @@ pub fn run_setup() {
                     target.name
                 ));
                 already_configured.push(target.name);
+                configured_integration_ids.push(target.agent_key.clone());
             }
             Ok(_) => {
                 terminal_ui::print_status_new(&format!(
@@ -128,6 +130,7 @@ pub fn run_setup() {
                     target.name
                 ));
                 newly_configured.push(target.name);
+                configured_integration_ids.push(target.agent_key.clone());
             }
             Err(e) => {
                 terminal_ui::print_status_warn(&format!("{}: {e}", target.name));
@@ -153,7 +156,7 @@ pub fn run_setup() {
 
     configure_plan_mode_settings(&newly_configured, &already_configured);
 
-    terminal_ui::print_step_header(4, 13, "Agent Rules");
+    terminal_ui::print_step_header(4, 14, "Agent Rules");
     let rules_result = if inject_rules {
         let r = crate::rules_inject::inject_all_rules(&home);
         for name in &r.injected {
@@ -202,7 +205,7 @@ pub fn run_setup() {
         }
     }
 
-    terminal_ui::print_step_header(5, 13, "API Proxy (optional)");
+    terminal_ui::print_step_header(5, 14, "API Proxy (optional)");
     {
         let cfg = crate::core::config::Config::load();
         let proxy_port = crate::proxy_setup::default_port();
@@ -231,7 +234,7 @@ pub fn run_setup() {
                     "  \x1b[2mWithout it: MCP tools, shell hooks, gain tracking, and memory\x1b[0m"
                 );
                 println!(
-                    "  \x1b[2mall work normally. The proxy adds ~5-15% extra savings on top.\x1b[0m"
+                    "  \x1b[2mall work normally. The proxy compresses API traffic on top.\x1b[0m"
                 );
                 println!();
                 print!("  Enable the API proxy? [y/N] ");
@@ -258,7 +261,7 @@ pub fn run_setup() {
         }
     }
 
-    terminal_ui::print_step_header(6, 13, "IDE Config Access (optional)");
+    terminal_ui::print_step_header(6, 14, "IDE Config Access (optional)");
     {
         let cfg = crate::core::config::Config::load();
         match cfg.allow_ide_config_dirs {
@@ -308,7 +311,7 @@ pub fn run_setup() {
         }
     }
 
-    terminal_ui::print_step_header(7, 13, "Skill Files");
+    terminal_ui::print_step_header(7, 14, "Skill Files");
     if inject_skills {
         let skill_result = install_skill_files(&home);
         for (name, installed) in &skill_result {
@@ -331,7 +334,7 @@ pub fn run_setup() {
         );
     }
 
-    terminal_ui::print_step_header(8, 13, "Environment Check");
+    terminal_ui::print_step_header(8, 14, "Environment Check");
     let lean_dir = crate::core::data_dir::lean_ctx_data_dir()
         .unwrap_or_else(|_| home.join(".config/lean-ctx"));
     if lean_dir.exists() {
@@ -370,45 +373,21 @@ pub fn run_setup() {
     // marker can never re-collapse config/data/state/cache later (GL #623).
     crate::core::layout_pin::heal();
 
-    terminal_ui::print_step_header(9, 13, "Help Improve lean-ctx");
-    println!("  Share anonymous telemetry to make lean-ctx better:");
-    println!("  [2m  • Version, OS, architecture, random install ID[0m");
-    println!("  [2m  • Compression patterns: file-type, size bucket, mode, ratio[0m");
-    println!("  [1mNo code, no file names, no personal data — ever.[0m");
-    println!("  [2mInspect anytime: lean-ctx telemetry show[0m");
-    println!();
-    print!("  Enable anonymous telemetry? [1m[y/N][0m ");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-
-    let mut input = String::new();
-    let contribute = if std::io::stdin().read_line(&mut input).is_ok() {
-        let answer = input.trim().to_lowercase();
-        answer == "y" || answer == "yes"
-    } else {
-        false
-    };
-
-    if contribute {
-        let config_path = crate::core::config::Config::path()
-            .unwrap_or_else(|| home.join(".config/lean-ctx").join("config.toml"));
-        if let Some(dir) = config_path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    terminal_ui::print_step_header(9, 14, "Help Improve lean-ctx");
+    // No question: telemetry stays on by default and setup only says how to
+    // change it. An earlier explicit `telemetry off` is left untouched.
+    if crate::core::telemetry_consent::telemetry_would_send() {
+        for line in crate::core::telemetry_consent::hint_lines() {
+            println!("  \x1b[2m{line}\x1b[0m");
         }
-        let mut config_content = std::fs::read_to_string(&config_path).unwrap_or_default();
-        if !config_content.contains("[telemetry]") {
-            if !config_content.ends_with('\n') {
-                config_content.push('\n');
-            }
-            config_content.push_str("\n[telemetry]\nenabled = true\n");
-        }
-        let _ = crate::config_io::write_atomic_with_backup(&config_path, &config_content);
-        terminal_ui::print_status_ok("Enabled — thank you!");
     } else {
-        terminal_ui::print_status_skip("Skipped — enable later with: lean-ctx telemetry on");
+        terminal_ui::print_status_skip(
+            "Telemetry is off — nothing is sent. Turn on: lean-ctx telemetry on",
+        );
     }
+    crate::core::telemetry_consent::mark_notice_seen();
 
-    terminal_ui::print_step_header(10, 13, "Auto-Updates");
+    terminal_ui::print_step_header(10, 14, "Auto-Updates");
     println!("  Keep lean-ctx up to date automatically.");
     println!("  \x1b[1mChecks GitHub every 6h, installs only when a new release exists.\x1b[0m");
     println!(
@@ -416,6 +395,7 @@ pub fn run_setup() {
     );
     println!();
     print!("  Enable automatic updates? \x1b[1m[y/N]\x1b[0m ");
+    use std::io::Write;
     std::io::stdout().flush().ok();
 
     let mut auto_input = String::new();
@@ -444,13 +424,13 @@ pub fn run_setup() {
         terminal_ui::print_status_skip("Skipped — enable later: lean-ctx update --schedule");
     }
 
-    terminal_ui::print_step_header(11, 13, "Tool Profile");
+    terminal_ui::print_step_header(11, 14, "Tool Profile");
     configure_tool_profile();
 
-    terminal_ui::print_step_header(12, 13, "Advanced Tuning (optional)");
+    terminal_ui::print_step_header(12, 14, "Advanced Tuning (optional)");
     configure_premium_features(&home);
 
-    terminal_ui::print_step_header(13, 13, "Code Intelligence");
+    terminal_ui::print_step_header(13, 14, "Code Intelligence");
     let cwd = std::env::current_dir().ok();
     let cwd_is_home = cwd
         .as_ref()
@@ -537,6 +517,9 @@ pub fn run_setup() {
         println!("  \x1b[2mDisable with: lean-ctx setup --no-auto-approve\x1b[0m");
     }
 
+    terminal_ui::print_step_header(14, 14, "Intelligence Runtime (optional)");
+    super::intelligence::configure_runtime();
+
     println!();
     println!(
         "  \x1b[1;32m✓ Setup complete!\x1b[0m  \x1b[1m{}\x1b[0m configured, \x1b[2m{} already set, {} skipped\x1b[0m",
@@ -605,6 +588,14 @@ pub fn run_setup() {
     println!();
     terminal_ui::print_logo_animated();
     terminal_ui::print_command_box();
+
+    if errors.is_empty() {
+        if let Err(error) =
+            crate::core::telemetry_aggregate::record_setup_completion(configured_integration_ids)
+        {
+            tracing::debug!("telemetry setup aggregate unavailable: {error}");
+        }
+    }
 
     crate::cli::show_first_run_wow();
 }

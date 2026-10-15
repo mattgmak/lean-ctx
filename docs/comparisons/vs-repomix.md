@@ -1,9 +1,9 @@
 # LeanCTX and Repomix
 
-> **Status: historical comparison note — not canonical product copy.** Current
-> LeanCTX scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository). This note does not make
-> feature-count, percentage-reduction, compatibility, or outcome claims.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 Repomix creates a shareable snapshot of a repository. LeanCTX is a local context
 Runtime for existing coding agents: it can expose selected project material via

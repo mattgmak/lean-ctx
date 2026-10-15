@@ -1,7 +1,7 @@
 {
   "name": "pi-lean-ctx",
-  "version": "3.10.2",
-  "description": "Pi Coding Agent extension — routes bash/read/grep/find/ls through lean-ctx for strong token savings. The embedded MCP bridge (on by default) adds a persistent session cache so unchanged re-reads cost ~13 tokens.",
+  "version": "3.11.4",
+  "description": "Pi Coding Agent integration for LeanCTX Engine, the Context Gateway for AI Systems. Routes supported tools through context selection, controls, and a persistent MCP session.",
   "keywords": [
     "pi-package",
     "lean-ctx",
@@ -43,9 +43,9 @@
     "README.md"
   ],
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "^0.99.1",
     "@earendil-works/pi-tui": "^0.79.3",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "esbuild": "^0.28.1",
     "typebox": "^1.2.9",
     "typescript": "^6.0.3",
@@ -53,7 +53,7 @@
   },
   "overrides": {
     "@hono/node-server": "^2.0.5",
-    "brace-expansion": "^5.0.9",
+    "brace-expansion": "^5.0.12",
     "vite": "^6.4.2",
     "esbuild": "^0.28.1",
     "undici": "^8.10.0",

@@ -37,12 +37,13 @@ pub(crate) fn install_opencode_hook_with_mode(mode: HookMode) {
         "environment": super::super::mcp_server_env_json()
     });
 
-    // #313: `shadow_mode` (default off) controls whether native tools (read,
-    // grep, glob, bash) are denied at the permission level in opencode.json,
-    // forcing the agent to use ctx_* equivalents via the MCP server.
-    // In Replace mode, shadow permissions are always applied regardless of config.
+    // #313/#1864: Replace mode sets native read/grep/glob/bash to "ask" in
+    // opencode.json (not "deny": a denied tool leaves the request, which
+    // OpenCode Zen's free tier rejects). "ask" prompts on every native call and
+    // refuses it headless, so only Replace applies it; every other mode removes
+    // the entries lean-ctx wrote earlier.
+    let shadow = mode == HookMode::Replace;
     let cfg = Config::load();
-    let shadow = cfg.shadow_mode || mode == HookMode::Replace;
 
     let should_reg_mcp = super::super::should_register_mcp();
     let mcp_needed =
@@ -108,7 +109,7 @@ pub(crate) fn install_opencode_hook_with_mode(mode: HookMode) {
             if !mcp_server_quiet_mode() {
                 if perm_changed && shadow {
                     eprintln!(
-                        "  \x1b[32m✓\x1b[0m Shadow mode: native tools denied at {display_path}"
+                        "  \x1b[32m✓\x1b[0m Shadow mode: native tools set to ask at {display_path}"
                     );
                 } else if perm_changed {
                     eprintln!(
@@ -125,7 +126,7 @@ pub(crate) fn install_opencode_hook_with_mode(mode: HookMode) {
     }
 
     // #442: inject the "prefer ctx_*" rules block so the agent knows to use
-    // lean-ctx tools. In shadow mode, native tools are denied — the agent
+    // lean-ctx tools. In shadow mode, native tools require approval — the agent
     // must use ctx_* tools, so rules are even more important.
     if super::super::should_register_mcp() && cfg.setup.auto_inject_rules != Some(false) {
         let _ = crate::rules_inject::inject_rules_for_agent(&home, "OpenCode");
@@ -258,10 +259,23 @@ fn strip_opencode_agents_block(home: &std::path::Path) {
     }
 }
 
-/// Native tools that shadow mode denies via opencode.json `permission` object.
+/// Native tools that shadow mode steers away from via the opencode.json
+/// `permission` object.
 const SHADOW_DENIED_TOOLS: &[&str] = &["read", "grep", "glob", "bash"];
 
-/// Apply permission denies in-place on a JSON object.
+/// `ask`, not `deny`: opencode drops a denied tool from the request, and
+/// OpenCode Zen's free tier rejects any request whose tool list lacks `bash` or
+/// `read` (#1864). An asked tool stays declared and still needs the user's
+/// approval, so the agent keeps reaching for the ctx_* tools.
+const SHADOW_ACTION: &str = "ask";
+
+/// Values shadow mode has written: the current one, and `deny` from releases
+/// before #1864.
+fn is_shadow_value(v: Option<&serde_json::Value>) -> bool {
+    matches!(v.and_then(|v| v.as_str()), Some("ask" | "deny"))
+}
+
+/// Apply the shadow permissions in-place on a JSON object.
 /// Returns true if any changes were made.
 fn apply_shadow_permissions_inplace(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
     let perms = obj
@@ -273,8 +287,8 @@ fn apply_shadow_permissions_inplace(obj: &mut serde_json::Map<String, serde_json
 
     let mut changed = false;
     for &tool in SHADOW_DENIED_TOOLS {
-        if perms_obj.get(tool).and_then(|v| v.as_str()) != Some("deny") {
-            perms_obj.insert(tool.to_string(), serde_json::json!("deny"));
+        if perms_obj.get(tool).and_then(|v| v.as_str()) != Some(SHADOW_ACTION) {
+            perms_obj.insert(tool.to_string(), serde_json::json!(SHADOW_ACTION));
             changed = true;
         }
     }
@@ -298,7 +312,7 @@ fn apply_shadow_permissions(config_path: &std::path::Path, display_path: &str) {
     {
         let _ = std::fs::write(config_path, formatted);
         if !mcp_server_quiet_mode() {
-            eprintln!("  \x1b[32m✓\x1b[0m Shadow mode: native tools denied at {display_path}");
+            eprintln!("  \x1b[32m✓\x1b[0m Shadow mode: native tools set to ask at {display_path}");
         }
     }
 }
@@ -312,7 +326,7 @@ fn remove_shadow_permissions_inplace(obj: &mut serde_json::Map<String, serde_jso
 
     let mut changed = false;
     for &tool in SHADOW_DENIED_TOOLS {
-        if perms.get(tool).and_then(|v| v.as_str()) == Some("deny") {
+        if is_shadow_value(perms.get(tool)) {
             perms.remove(tool);
             changed = true;
         }
@@ -325,8 +339,33 @@ fn remove_shadow_permissions_inplace(obj: &mut serde_json::Map<String, serde_jso
     changed
 }
 
+/// Release the `ask`/`deny` gates lean-ctx put on OpenCode's native tools when
+/// Replace was the default. Runs on MCP server start, because an update through
+/// a package manager never reaches `setup`; file-only, and a config that does
+/// not parse is left alone. Returns whether the file changed.
+pub(crate) fn release_opencode_native_tool_gates(home: &std::path::Path) -> bool {
+    if crate::hooks::replace_mode_chosen() {
+        return false;
+    }
+    let path = crate::core::opencode_config::resolve(home).path;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(mut json) = crate::core::jsonc::parse_jsonc(&content) else {
+        return false;
+    };
+    let Some(obj) = json.as_object_mut() else {
+        return false;
+    };
+    if !remove_shadow_permissions_inplace(obj) {
+        return false;
+    }
+    serde_json::to_string_pretty(&json)
+        .is_ok_and(|out| crate::config_io::write_atomic_with_backup(&path, &out).is_ok())
+}
+
 /// Remove shadow-mode permission denies from opencode.json. Only removes
-/// entries WE set — tools with value "deny" that are in our deny list.
+/// entries WE set — tools with a shadow value ("ask", or legacy "deny") in our list.
 /// Leaves other permission entries and other values for these tools untouched.
 #[cfg(test)]
 fn remove_shadow_permissions(config_path: &std::path::Path, display_path: &str) {
@@ -472,13 +511,13 @@ mod shadow_permission_tests {
     // --- apply_shadow_permissions ---
 
     #[test]
-    fn apply_adds_deny_for_all_tools() {
+    fn apply_adds_ask_for_all_tools() {
         let (_dir, cfg) = temp_cfg_with_tag("apply_adds", r#"{"mcp":{"other":{"type":"local"}}}"#);
         apply_shadow_permissions(&cfg, "test");
         let json = read_json(&cfg);
         let perms = json["permission"].as_object().unwrap();
         for tool in &["read", "grep", "glob", "bash"] {
-            assert_eq!(perms[*tool], "deny", "{tool} should be deny");
+            assert_eq!(perms[*tool], "ask", "{tool} should be ask");
         }
         assert_eq!(
             json["mcp"]["other"]["type"], "local",
@@ -502,7 +541,7 @@ mod shadow_permission_tests {
         );
         apply_shadow_permissions(&cfg, "test");
         let json = read_json(&cfg);
-        assert_eq!(json["permission"]["read"], "deny", "user allow overwritten");
+        assert_eq!(json["permission"]["read"], "ask", "user allow overwritten");
         assert_eq!(
             json["permission"]["edit"], "allow",
             "non-shadow tool preserved"
@@ -526,7 +565,7 @@ mod shadow_permission_tests {
         let json = read_json(&cfg);
         let perms = json["permission"].as_object().unwrap();
         for tool in &["read", "grep", "glob", "bash"] {
-            assert_eq!(perms[*tool], "deny", "{tool} should be deny in new file");
+            assert_eq!(perms[*tool], "ask", "{tool} should be ask in new file");
         }
     }
 
@@ -538,8 +577,8 @@ mod shadow_permission_tests {
         let perms = json["permission"].as_object().unwrap();
         for tool in &["read", "grep", "glob", "bash"] {
             assert_eq!(
-                perms[*tool], "deny",
-                "{tool} should be deny after corrupt apply"
+                perms[*tool], "ask",
+                "{tool} should be ask after corrupt apply"
             );
         }
     }
@@ -636,6 +675,38 @@ mod shadow_permission_tests {
         assert_eq!(before, after, "corrupt file left unchanged");
     }
 
+    // --- #1864: legacy "deny" written by older releases ---
+
+    #[test]
+    fn apply_migrates_legacy_deny_to_ask() {
+        let (_dir, cfg) = temp_cfg_with_tag(
+            "legacy_migrate",
+            r#"{"permission":{"read":"deny","grep":"deny","glob":"deny","bash":"deny","edit":"deny"}}"#,
+        );
+        apply_shadow_permissions(&cfg, "test");
+        let json = read_json(&cfg);
+        let perms = json["permission"].as_object().unwrap();
+        for tool in &["read", "grep", "glob", "bash"] {
+            assert_eq!(perms[*tool], "ask", "{tool} must no longer be denied");
+        }
+        assert_eq!(perms["edit"], "deny", "non-shadow tool untouched");
+    }
+
+    #[test]
+    fn remove_clears_current_ask_entries() {
+        let (_dir, cfg) = temp_cfg_with_tag(
+            "rm_ask",
+            r#"{"permission":{"read":"ask","grep":"ask","glob":"ask","bash":"ask","edit":"allow"}}"#,
+        );
+        remove_shadow_permissions(&cfg, "test");
+        let json = read_json(&cfg);
+        let perms = json["permission"].as_object().unwrap();
+        for tool in &["read", "grep", "glob", "bash"] {
+            assert!(perms.get(*tool).is_none(), "{tool} should be removed");
+        }
+        assert_eq!(perms["edit"], "allow");
+    }
+
     // --- State transitions ---
 
     #[test]
@@ -652,14 +723,14 @@ mod shadow_permission_tests {
     }
 
     #[test]
-    fn remove_then_apply_adds_denies() {
+    fn remove_then_apply_adds_asks() {
         let (_dir, cfg) = temp_cfg_with_tag("rm_then_apply", r"{}");
         remove_shadow_permissions(&cfg, "test");
         apply_shadow_permissions(&cfg, "test");
         let json = read_json(&cfg);
         let perms = json["permission"].as_object().unwrap();
         for tool in &["read", "grep", "glob", "bash"] {
-            assert_eq!(perms[*tool], "deny", "{tool} should be deny");
+            assert_eq!(perms[*tool], "ask", "{tool} should be ask");
         }
     }
 
@@ -766,5 +837,42 @@ mod config_preservation_tests {
         let resolved = crate::core::opencode_config::resolve_in_dir(&cfg_dir);
         assert_eq!(resolved.path, cfg_dir.join("opencode.jsonc"));
         assert!(!cfg_dir.join("opencode.json").exists());
+    }
+
+    /// "ask" prompts on every native call and refuses it headless: an install
+    /// from when Replace was the default must get its tools back on the next
+    /// MCP start, while the user's own permission entries stay.
+    #[test]
+    fn native_tool_gates_are_released_unless_replace_was_chosen() {
+        let _env = crate::core::data_dir::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = dir.path().join(".config/opencode");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let path = crate::core::opencode_config::resolve(dir.path()).path;
+        let gated = r#"{"permission":{"read":"ask","grep":"ask","glob":"ask","bash":"ask","edit":"allow"}}"#;
+
+        crate::test_env::set_var("LEAN_CTX_HOOK_MODE", "replace");
+        std::fs::write(&path, gated).unwrap();
+        let released_under_replace = release_opencode_native_tool_gates(dir.path());
+        crate::test_env::remove_var("LEAN_CTX_HOOK_MODE");
+        assert!(
+            !released_under_replace,
+            "an explicit Replace keeps the gates"
+        );
+
+        assert!(release_opencode_native_tool_gates(dir.path()));
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for tool in SHADOW_DENIED_TOOLS {
+            assert!(
+                json["permission"].get(*tool).is_none(),
+                "{tool} still gated"
+            );
+        }
+        assert_eq!(json["permission"]["edit"], "allow", "user entries survive");
+        assert!(
+            !release_opencode_native_tool_gates(dir.path()),
+            "idempotent"
+        );
     }
 }

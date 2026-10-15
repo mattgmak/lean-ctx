@@ -1,6 +1,9 @@
 # lean-ctx FAQ
 
-> **Latest version: 3.10.2** — complete MCP tool set · 10 read modes · 95+ shell patterns
+**LeanCTX — Context Gateway for AI Systems. Control what your AI can see.**
+See the [current product definition](docs/POSITIONING_CANONICAL.md).
+
+> **Latest version: 3.11.4** — complete MCP tool set · 16 read modes · 85+ shell patterns
 > Docs: https://leanctx.com/docs/getting-started
 
 ---
@@ -40,8 +43,8 @@ After updating, restart your shell (`source ~/.zshrc`) and your IDE.
 
 **Q: What does lean-ctx actually do?**
 lean-ctx sits between your AI tool and the system. It has two layers:
-1. **Shell Hook** — transparently compresses CLI output (git, ls, npm, cargo, etc.) using 95+ patterns before it reaches the LLM
-2. **MCP Server** — tools for cached file reads, 10 read modes, deltas, dedup, memory, multi-agent coordination, and more
+1. **Shell Hook** — transparently compresses CLI output (git, ls, npm, cargo, etc.) using 85+ patterns before it reaches the LLM
+2. **MCP Server** — tools for cached file reads, 16 read modes, deltas, dedup, memory, multi-agent coordination, and more
 
 Actual savings depend on the workload and enabled modes. Use `lean-ctx savings`
 for local observations and Shadow Mode for a comparable baseline.
@@ -50,9 +53,9 @@ for local observations and Shadow Mode for a comparable baseline.
 - **Shell Hook**: Compresses output of regular shell commands (git status, ls, npm test, etc.). Works automatically once installed. No code changes needed.
 - **MCP Server**: Provides specialized `ctx_*` tools (ctx_read, ctx_shell, ctx_search, etc.) that your AI tool calls instead of native file/shell tools. Offers caching, read modes, and intelligence features.
 
-Both work together for maximum savings.
+Both can reduce repeated context on supported integration paths; measure the effect on your own workload.
 
-**Q: What are the 10 read modes?**
+**Q: What are the 16 read modes?**
 | Mode | Use when... |
 |------|-------------|
 | `auto` | You don't know — lean-ctx picks the best mode |
@@ -64,10 +67,16 @@ Both work together for maximum savings.
 | `entropy` | Focus on high-information fragments |
 | `task` | Filtered by current task context |
 | `reference` | Minimal citation-style excerpts |
-| `lines:N-M` | Specific line range |
+| `lines:N-M` | Specific line range (`lines:5,10-20`, `lines:-N` tail) |
+| `anchored` | Full content with per-line anchors for `ctx_patch` edits |
+| `full-compact` | Full content without header, trailing whitespace stripped |
+| `raw` | Exact bytes, no framing |
+| `cognitive` | 7±2 semantic chunks of a long file |
+| `mdl` | Minimal structural description |
+| `density:X` | Highest-entropy lines until ~X of the tokens remain |
 
 **Q: Does lean-ctx send my code anywhere?**
-No. lean-ctx runs 100% locally. Zero telemetry. Your code never leaves your machine. The only exception is if you explicitly opt into `lean-ctx cloud` for cross-device sync.
+Core context processing runs locally. Configured providers, model requests, update checks, telemetry, and optional services have separate network paths. Your AI client may send prepared context to its model provider. Review the actual configuration and [security documentation](SECURITY.md) for outbound connections, telemetry fields, and opt-outs.
 
 ---
 
@@ -127,10 +136,10 @@ If you're using `pi-lean-ctx` (Pi editor), make sure you're on the latest versio
 3. Check that your project root is correct: `lean-ctx doctor`
 
 **Q: "path escapes project root" error!**
-This happens when the MCP server's project root is stuck from a previous session. Fixed in v3.2.5+:
-- Update: `lean-ctx update`
-- Restart your IDE/AI tool after switching projects
-- Run `lean-ctx doctor` to verify the root
+Since v3.11.3 everything below your home directory is readable and writable out of the box (`path_jail_scope = "home"`), except protected locations like `~/.ssh`, `~/.aws`, `~/.config` and `~/Library`. If you still see it:
+- The error names the fix — usually `lean-ctx allow-path <dir>` for a directory outside `~`, a non-project folder, a sibling project you want to edit, or a protected one like `~/.config/...` (takes effect immediately)
+- Session bound to the wrong project? Run `lean-ctx doctor` — "Project binding" shows a `LEAN_CTX_PROJECT_ROOT` pinned in a global agent config (older setups wrote it); `lean-ctx doctor --fix` removes it, then restart the agent once
+- On an older version: `lean-ctx update`
 
 **Q: How do I use Unified mode vs Full Tools?**
 - **Full (default)**: Every registered tool available as a separate `ctx_*` tool

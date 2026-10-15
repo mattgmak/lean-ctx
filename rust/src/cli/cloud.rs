@@ -1,21 +1,5 @@
 use crate::{cloud_client, core};
 
-fn hosted_research_enabled() -> bool {
-    std::env::var("LEAN_CTX_EXPERIMENTAL_HOSTED").as_deref() == Ok("1")
-}
-
-fn require_hosted_research() -> bool {
-    if hosted_research_enabled() {
-        return true;
-    }
-
-    eprintln!(
-        "Hosted account operations are Research and unavailable in the public LeanCTX Runtime. \\
-         Local context tooling continues to work without an account. Set LEAN_CTX_EXPERIMENTAL_HOSTED=1 only for a local development evaluation."
-    );
-    false
-}
-
 fn mask_email(email: &str) -> String {
     match email.split_once('@') {
         Some((local, domain)) if local.len() > 2 => {
@@ -102,9 +86,6 @@ fn save_and_report(r: &cloud_client::RegisterResult, email: &str) {
 }
 
 pub fn cmd_login(args: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     let (email, pw) = require_email_and_password(args, "lean-ctx login <email> [--password <pw>]");
 
     println!("Logging in to LeanCTX Cloud...");
@@ -133,9 +114,6 @@ pub fn cmd_login(args: &[String]) {
 }
 
 pub fn cmd_forgot_password(args: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     let (email, _) = parse_auth_args(args);
 
     if email.is_empty() {
@@ -158,9 +136,6 @@ pub fn cmd_forgot_password(args: &[String]) {
 }
 
 pub fn cmd_register(args: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     let (email, pw) =
         require_email_and_password(args, "lean-ctx register <email> [--password <pw>]");
 
@@ -184,9 +159,6 @@ pub fn cmd_register(args: &[String]) {
 }
 
 pub fn cmd_sync(rest: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     if rest.first().map(String::as_str) == Some("index") {
         cmd_sync_index(&rest[1..]);
         return;
@@ -196,22 +168,10 @@ pub fn cmd_sync(rest: &[String]) {
         std::process::exit(1);
     }
 
-    // Stats roll-up is account-level and stays free for everyone.
-    println!("Syncing stats...");
+    // Every sync surface, stats included, is the Pro "Personal Cloud". On a Free
+    // account the server returns 402; detect it once and show a friendly upgrade
+    // hint instead of one failure per surface.
     let store = core::stats::load();
-    let entries = build_sync_entries(&store);
-    if entries.is_empty() {
-        println!("No stats to sync yet.");
-    } else {
-        match cloud_client::sync_stats(&entries) {
-            Ok(_) => println!("  Stats: synced"),
-            Err(e) => tracing::error!("Stats sync failed: {e}"),
-        }
-    }
-
-    // Everything below is the Pro "Personal Cloud" (cross-device sync of your own
-    // context). On a Free account the server returns 402; detect it once and show
-    // a friendly upgrade hint instead of one failure per surface.
     if sync_personal_cloud(&store) == CloudSyncOutcome::Gated {
         print_pro_upgrade_hint();
         return;
@@ -231,35 +191,43 @@ fn cmd_sync_index(args: &[String]) {
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     match sub {
-        "push" => match cloud_client::push_index_bundle(&root) {
-            Ok((project_hash, bytes)) => {
-                println!(
-                    "\x1b[32m✓\x1b[0m Index pushed ({:.1} MB encrypted, project {})",
-                    bytes as f64 / 1_048_576.0,
-                    &project_hash[..12.min(project_hash.len())]
-                );
-                println!("  Pull on any device: lean-ctx sync index pull");
+        "push" => {
+            let result = cloud_client::push_index_bundle(&root);
+            record_sync_telemetry(&result);
+            match result {
+                Ok((project_hash, bytes)) => {
+                    println!(
+                        "\x1b[32m✓\x1b[0m Index pushed ({:.1} MB encrypted, project {})",
+                        bytes as f64 / 1_048_576.0,
+                        &project_hash[..12.min(project_hash.len())]
+                    );
+                    println!("  Pull on any device: lean-ctx sync index pull");
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m✗\x1b[0m {e}");
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("\x1b[31m✗\x1b[0m {e}");
-                std::process::exit(1);
+        }
+        "pull" => {
+            let result = cloud_client::pull_index_bundle(&root);
+            record_sync_telemetry(&result);
+            match result {
+                Ok(manifest) => {
+                    println!(
+                        "\x1b[32m✓\x1b[0m Index restored ({} files, built {} by v{})",
+                        manifest.files.len(),
+                        manifest.created_at,
+                        manifest.engine_version
+                    );
+                    println!("  Semantic search is ready — no local re-index needed.");
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m✗\x1b[0m {e}");
+                    std::process::exit(1);
+                }
             }
-        },
-        "pull" => match cloud_client::pull_index_bundle(&root) {
-            Ok(manifest) => {
-                println!(
-                    "\x1b[32m✓\x1b[0m Index restored ({} files, built {} by v{})",
-                    manifest.files.len(),
-                    manifest.created_at,
-                    manifest.engine_version
-                );
-                println!("  Semantic search is ready — no local re-index needed.");
-            }
-            Err(e) => {
-                eprintln!("\x1b[31m✗\x1b[0m {e}");
-                std::process::exit(1);
-            }
-        },
+        }
         "status" => match cloud_client::index_bundle_status() {
             Ok(v) => {
                 let used_mb = v["used_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0;
@@ -340,12 +308,28 @@ enum CloudSyncOutcome {
 /// rather than one error per surface. A self-hosted backend with the gate open
 /// (billing unset / `LEANCTX_CLOUD_SYNC_OPEN`) never returns 402, so all sync.
 fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
+    println!("Syncing stats...");
+    let entries = build_sync_entries(store);
+    if entries.is_empty() {
+        println!("  No stats to sync yet.");
+    } else {
+        let result = cloud_client::sync_stats(&entries);
+        record_sync_telemetry(&result);
+        match result {
+            Ok(_) => println!("  Stats: synced"),
+            Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
+            Err(e) => tracing::error!("Stats sync failed: {e}"),
+        }
+    }
+
     println!("Syncing commands...");
     let command_entries = collect_command_entries(store);
     if command_entries.is_empty() {
         println!("  No command data to sync.");
     } else {
-        match cloud_client::push_commands(&command_entries) {
+        let result = cloud_client::push_commands(&command_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Commands: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Commands sync failed: {e}"),
@@ -357,7 +341,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if cep_entries.is_empty() {
         println!("  No CEP sessions to sync.");
     } else {
-        match cloud_client::push_cep(&cep_entries) {
+        let result = cloud_client::push_cep(&cep_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  CEP: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("CEP sync failed: {e}"),
@@ -369,7 +355,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if knowledge_entries.is_empty() {
         println!("  No knowledge to sync.");
     } else {
-        match cloud_client::push_knowledge(&knowledge_entries) {
+        let result = cloud_client::push_knowledge(&knowledge_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Knowledge: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Knowledge sync failed: {e}"),
@@ -381,7 +369,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if gotcha_entries.is_empty() {
         println!("  No gotchas to sync.");
     } else {
-        match cloud_client::push_gotchas(&gotcha_entries) {
+        let result = cloud_client::push_gotchas(&gotcha_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Gotchas: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Gotchas sync failed: {e}"),
@@ -393,7 +383,9 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     if feedback_entries.is_empty() {
         println!("  No feedback thresholds to sync.");
     } else {
-        match cloud_client::push_feedback(&feedback_entries) {
+        let result = cloud_client::push_feedback(&feedback_entries);
+        record_sync_telemetry(&result);
+        match result {
             Ok(_) => println!("  Feedback: synced"),
             Err(e) if pro_gate_hit(&e) => return CloudSyncOutcome::Gated,
             Err(e) => tracing::error!("Feedback sync failed: {e}"),
@@ -403,11 +395,27 @@ fn sync_personal_cloud(store: &core::stats::StatsStore) -> CloudSyncOutcome {
     CloudSyncOutcome::Done
 }
 
-/// Friendly, non-error hint shown when the server gates cloud sync behind Pro.
-/// Delegates to the central, entitlement-aware hint helper (#346) so the message
-/// reflects the user's actual plan and the cheapest unlocking tier.
+/// Friendly, non-error hint shown when the server gates cloud sync (HTTP 402):
+/// the account is valid but its plan carries no `cloud_sync` entitlement.
+/// Paid plans are application-only, so point at the account page and support
+/// instead of a checkout, and say that nothing local was touched.
 fn print_pro_upgrade_hint() {
-    super::upgrade_hint::hint_for("cloud_sync");
+    println!();
+    println!("Synchronization is not included in this account's plan.");
+    println!("Your local context is unchanged and keeps working.");
+    println!("Plan details: https://leanctx.com/account/billing/ · help: hello@leanctx.com");
+}
+
+fn record_sync_telemetry<T>(result: &Result<T, String>) {
+    if let Err(error) = core::telemetry_aggregate::record_sync_result(result.is_ok()) {
+        tracing::debug!("telemetry sync aggregate unavailable: {error}");
+    }
+}
+
+fn record_sync_outcome(success: bool) {
+    if let Err(error) = core::telemetry_aggregate::record_sync_result(success) {
+        tracing::debug!("telemetry sync aggregate unavailable: {error}");
+    }
 }
 
 fn build_sync_entries(store: &core::stats::StatsStore) -> Vec<serde_json::Value> {
@@ -435,9 +443,6 @@ fn collect_feedback_entries() -> Vec<serde_json::Value> {
 }
 
 pub fn cmd_contribute() {
-    if !require_hosted_research() {
-        return;
-    }
     let mut entries = Vec::new();
 
     // GH #439: mode_stats.json lives in the data dir — read it through the typed
@@ -530,25 +535,24 @@ pub fn cmd_contribute() {
 }
 
 pub fn cmd_cloud(args: &[String]) {
-    if !require_hosted_research() {
-        return;
-    }
     let action = args.first().map_or("help", std::string::String::as_str);
 
     match action {
         "pull-models" => {
             println!("Updating adaptive models...");
-            match cloud_client::pull_cloud_models() {
+            let result = cloud_client::pull_cloud_models().and_then(|data| {
+                cloud_client::save_cloud_models(&data)
+                    .map(|()| data)
+                    .map_err(|error| error.to_string())
+            });
+            record_sync_telemetry(&result);
+            match result {
                 Ok(data) => {
                     let count = data
                         .get("models")
                         .and_then(|v| v.as_array())
                         .map_or(0, std::vec::Vec::len);
 
-                    if let Err(e) = cloud_client::save_cloud_models(&data) {
-                        tracing::warn!("Could not save models: {e}");
-                        return;
-                    }
                     println!("{count} adaptive models updated.");
                     if let Some(est) = data
                         .get("improvement_estimate")
@@ -583,8 +587,6 @@ pub fn cmd_cloud(args: &[String]) {
     }
 }
 
-/// `lean-ctx cloud status` — your Personal Cloud, from the terminal. Shows the
-/// same privacy-preserving footprint as leanctx.com/account/cloud: per-bucket
 /// `lean-ctx cloud autosync <on|off|status>` — toggle the daily background
 /// Personal-Cloud push (GL #384). The flag lives in `[cloud] auto_sync`.
 fn cmd_cloud_autosync(arg: Option<&str>) {
@@ -682,6 +684,8 @@ fn cmd_cloud_autoindex(arg: Option<&str>) {
     }
 }
 
+/// `lean-ctx cloud status` — your Personal Cloud, from the terminal. Shows the
+/// same privacy-preserving footprint as leanctx.com/account/cloud: per-bucket
 /// counts + last sync, buddy, and the all-time usage totals. Free accounts see
 /// the connection state plus what upgrading unlocks.
 fn cmd_cloud_status() {
@@ -691,7 +695,7 @@ fn cmd_cloud_status() {
         return;
     }
     let email = cloud_client::account_email().unwrap_or_default();
-    println!("Connected to the development-only hosted evaluation as {email}.");
+    println!("Connected to LeanCTX Cloud as {email}.");
 
     let d = match cloud_client::fetch_account_cloud() {
         Ok(d) => d,
@@ -706,7 +710,7 @@ fn cmd_cloud_status() {
 
     if d.get("cloud_sync").and_then(serde_json::Value::as_bool) != Some(true) {
         println!("Personal Cloud sync: locked on this plan.");
-        super::upgrade_hint::hint_for("cloud_sync");
+        print_pro_upgrade_hint();
         return;
     }
 
@@ -789,16 +793,19 @@ fn cmd_cloud_pull() {
     let entries = match cloud_client::pull_knowledge() {
         Ok(e) => e,
         Err(e) if pro_gate_hit(&e) => {
+            record_sync_outcome(false);
             print_pro_upgrade_hint();
             std::process::exit(1);
         }
         Err(e) => {
+            record_sync_outcome(false);
             tracing::error!("Pull failed: {e}");
             std::process::exit(1);
         }
     };
 
     if entries.is_empty() {
+        record_sync_outcome(true);
         println!(
             "No cloud knowledge to restore yet. Run `lean-ctx sync` on another machine first."
         );
@@ -808,6 +815,7 @@ fn cmd_cloud_pull() {
     let facts = match parse_pulled_knowledge(&entries) {
         Ok(f) => f,
         Err(e) => {
+            record_sync_outcome(false);
             tracing::error!("Could not parse pulled knowledge: {e}");
             std::process::exit(1);
         }
@@ -816,6 +824,7 @@ fn cmd_cloud_pull() {
     let policy = match crate::tools::knowledge_shared::load_policy_or_error() {
         Ok(p) => p,
         Err(e) => {
+            record_sync_outcome(false);
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -833,6 +842,7 @@ fn cmd_cloud_pull() {
         )
     }) {
         Ok((_, result)) => {
+            record_sync_outcome(true);
             println!(
                 "  Knowledge: {} restored, {} already present (into {project_root})",
                 result.added, result.skipped
@@ -840,6 +850,7 @@ fn cmd_cloud_pull() {
             println!("Pull complete.");
         }
         Err(e) => {
+            record_sync_outcome(false);
             tracing::error!("Knowledge restore failed: {e}");
             std::process::exit(1);
         }
@@ -897,6 +908,9 @@ fn cloud_upgrade(args: &[String]) {
     println!("Starting {plan} checkout ({interval})...");
     match cloud_client::start_checkout(&plan, &interval) {
         Ok(url) => {
+            if let Err(error) = crate::core::telemetry_aggregate::record_checkout_started() {
+                tracing::debug!("telemetry checkout aggregate unavailable: {error}");
+            }
             println!();
             println!("Open this link to complete your subscription:");
             println!("  {url}");
@@ -1000,9 +1014,11 @@ pub fn cmd_buddy(_args: &[String]) {
     println!("Buddy has been removed.");
 }
 
-pub fn cmd_upgrade() {
+/// Deprecated alias for `update`. Arguments are forwarded, so `upgrade --check`
+/// only checks instead of silently installing the latest release (#1906).
+pub fn cmd_upgrade(args: &[String]) {
     println!("'upgrade' has been renamed to 'update'. Running 'lean-ctx update' instead.\n");
-    core::updater::run(&[]);
+    core::updater::run(args);
 }
 
 #[cfg(test)]

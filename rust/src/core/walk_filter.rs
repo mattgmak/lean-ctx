@@ -25,6 +25,12 @@ const VENDOR_DIR_NAMES: &[&str] = &["node_modules", "__pycache__", "bower_compon
 /// `pyvenv.cfg`, so a source folder that happens to be called `venv` survives.
 const VENV_DIR_NAMES: &[&str] = &[".venv", "venv"];
 
+/// Version-control metadata. Content walks run with `hidden(false)` (#1792),
+/// which also lifts the `ignore` crate's implicit skip of these: a project-wide
+/// search returned `.git/rr-cache/…` conflict images as "uses in code" and
+/// scanned thousands of object and filter-repo files.
+const VCS_METADATA_NAMES: &[&str] = &[".git", ".hg", ".svn", ".jj"];
+
 /// Basenames of directories that hold stale agent worktree copies (#1480).
 /// Kept in sync with the agent-worktree subset of
 /// [`crate::core::auto_findings::NOISE_PATH_SEGMENTS`].
@@ -38,8 +44,7 @@ const AGENT_COPY_DIR_NAMES: &[&str] = &[".worktrees", ".codex-worktrees", ".clau
 pub(crate) fn explicit_walk_root(root: &std::path::Path) -> std::path::PathBuf {
     #[cfg(windows)]
     {
-        return crate::core::pathutil::canonicalize_raw(root)
-            .unwrap_or_else(|_| root.to_path_buf());
+        crate::core::pathutil::canonicalize_raw(root).unwrap_or_else(|_| root.to_path_buf())
     }
     #[cfg(not(windows))]
     {
@@ -60,6 +65,17 @@ pub(crate) fn is_vendor_dir(entry: &ignore::DirEntry) -> bool {
         return true;
     }
     VENV_DIR_NAMES.contains(&name) && entry.path().join("pyvenv.cfg").is_file()
+}
+
+/// Returns `true` when `entry` is version-control metadata (`.git` directory,
+/// or the `.git` file of a worktree/submodule) below the walk root. An
+/// explicitly requested root stays walkable (`depth == 0`).
+pub(crate) fn is_vcs_metadata(entry: &ignore::DirEntry) -> bool {
+    entry.depth() > 0
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| VCS_METADATA_NAMES.contains(&name))
 }
 
 /// Returns `true` when `entry` is a stale agent worktree directory that
@@ -84,11 +100,87 @@ pub(crate) fn is_agent_worktree_dir(entry: &ignore::DirEntry) -> bool {
         })
 }
 
+/// Whether a *content* walk should skip dot-prefixed entries.
+///
+/// Always `false` (#1792). What belongs to a project is decided by git and
+/// `.gitignore`; a leading dot is a display convention, not a relevance
+/// signal. The distinction matters more than it used to: `.github/`,
+/// `.agents/`, `.config/` and friends hold source-owned automation and agent
+/// instructions that a repository genuinely owns and tracks.
+///
+/// Before this, walkers disagreed — `ctx_glob` and `ctx_search` found tracked
+/// dotfiles while `lean-ctx find` and the BM25/graph corpus builders did not,
+/// with no option to change it. The corpus case was the damaging one: an
+/// incomplete index is indistinguishable from an empty result, so `ctx_compose`
+/// reported "no match" for code that was right there and tracked.
+///
+/// This constant is deliberately not a config key. A corpus that silently
+/// omits tracked files is a correctness bug, not a preference.
+///
+/// It governs *content* walks only. A walker whose job is to render a listing
+/// for a person may still hide dotfiles by default — `ctx_tree` does, behind
+/// `--all` — because there the leading dot is exactly the display convention
+/// it was meant to be.
+///
+/// Note that [`keep_entry`] still prunes `.claude` / `.cursor` and the other
+/// agent-copy directories regardless of this setting: those hold scratch and
+/// worktree copies, and excluding them is a separate, deliberate rule.
+pub(crate) const SKIP_HIDDEN_IN_CONTENT_WALK: bool = false;
+
+/// Returns `true` when `entry` is a *linked git worktree checked out inside
+/// its own repository*, whatever the directory is called: its `.git` is a file
+/// pointing into `<repo>/.git/worktrees/<name>` and `entry` lies below
+/// `<repo>`. Such a checkout is a second copy of the walked repository, so
+/// walking it duplicates every file and exhausts corpus budgets. A worktree
+/// of another repository (a folder of projects) and submodules
+/// (`.git` → `…/modules/…`) are real content and stay.
+pub(crate) fn is_linked_git_worktree(entry: &ignore::DirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+        return false;
+    }
+    let dot_git = entry.path().join(".git");
+    if !dot_git.is_file() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    let Some(gitdir) = raw.trim().strip_prefix("gitdir:").map(str::trim) else {
+        return false;
+    };
+    let gitdir = std::path::Path::new(gitdir);
+    let gitdir = if gitdir.is_absolute() {
+        gitdir.to_path_buf()
+    } else {
+        entry.path().join(gitdir)
+    };
+    // `<repo>/.git/worktrees/<name>` → `<repo>`.
+    let mut ancestors = gitdir.ancestors();
+    let (Some(_name), Some(worktrees), Some(dot_git_dir), Some(repo)) = (
+        ancestors.next(),
+        ancestors.next(),
+        ancestors.next(),
+        ancestors.next(),
+    ) else {
+        return false;
+    };
+    if worktrees.file_name().is_none_or(|n| n != "worktrees")
+        || dot_git_dir.file_name().is_none_or(|n| n != ".git")
+    {
+        return false;
+    }
+    let canonical = |p: &std::path::Path| crate::core::pathutil::safe_canonicalize_or_self(p);
+    canonical(entry.path()).starts_with(canonical(repo))
+}
+
 /// Predicate for `ignore::WalkBuilder::filter_entry`: prunes vendor
-/// directories, stale agent worktree copies, and cloud placeholders.
+/// directories, stale agent worktree copies (named or linked), and cloud
+/// placeholders.
 pub(crate) fn keep_entry(entry: &ignore::DirEntry) -> bool {
-    !is_vendor_dir(entry)
+    !is_vcs_metadata(entry)
+        && !is_vendor_dir(entry)
         && !is_agent_worktree_dir(entry)
+        && !is_linked_git_worktree(entry)
         && crate::core::cloud_files::keep_entry(entry)
 }
 
@@ -231,9 +323,194 @@ mod tests {
         assert!(!seen.iter().any(|p| p.contains(".codex-worktrees")));
     }
 
+    /// #1792: the reporter's fixture — a tracked dotfile and a tracked file
+    /// under a hidden directory must both be reachable by a content walk.
+    /// `.gitignore` decides membership; the leading dot must not.
+    #[test]
+    fn content_walk_reaches_tracked_hidden_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".hidden")).expect("mkdir");
+        std::fs::write(root.join(".editorconfig"), "root\n").expect("write");
+        std::fs::write(root.join(".hidden/tool"), "nested\n").expect("write");
+        std::fs::write(root.join("visible.txt"), "visible\n").expect("write");
+
+        let seen: Vec<String> = ignore::WalkBuilder::new(root)
+            .hidden(SKIP_HIDDEN_IN_CONTENT_WALK)
+            .filter_entry(keep_entry)
+            .build()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        for name in [".editorconfig", "tool", "visible.txt"] {
+            assert!(
+                seen.iter().any(|s| s == name),
+                "{name} must be discoverable"
+            );
+        }
+    }
+
+    /// The policy does not override `.gitignore` — an ignored dotfile stays out.
+    /// Otherwise "include hidden" would quietly become "include everything".
+    #[test]
+    fn content_walk_still_honours_gitignore_for_hidden_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), ".secret\n").expect("write");
+        std::fs::write(root.join(".secret"), "nope\n").expect("write");
+        std::fs::write(root.join(".editorconfig"), "root\n").expect("write");
+
+        let seen: Vec<String> = ignore::WalkBuilder::new(root)
+            .hidden(SKIP_HIDDEN_IN_CONTENT_WALK)
+            .git_ignore(true)
+            .require_git(false)
+            .filter_entry(keep_entry)
+            .build()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        assert!(seen.iter().any(|s| s == ".editorconfig"));
+        assert!(
+            !seen.iter().any(|s| s == ".secret"),
+            "an ignored dotfile must stay excluded"
+        );
+    }
+
+    /// Including hidden paths must not resurrect the agent-copy directories
+    /// #1480 prunes — those are a separate rule and stay pruned.
+    #[test]
+    fn content_walk_does_not_resurrect_agent_copy_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codex-worktrees/wt")).expect("mkdir");
+        std::fs::write(root.join(".codex-worktrees/wt/copy.rs"), "x").expect("write");
+        std::fs::write(root.join(".editorconfig"), "root\n").expect("write");
+
+        let seen: Vec<String> = ignore::WalkBuilder::new(root)
+            .hidden(SKIP_HIDDEN_IN_CONTENT_WALK)
+            .filter_entry(keep_entry)
+            .build()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path().to_string_lossy().to_string())
+            .collect();
+
+        assert!(seen.iter().any(|p| p.ends_with(".editorconfig")));
+        assert!(!seen.iter().any(|p| p.contains(".codex-worktrees")));
+    }
+
+    /// A linked worktree checked out inside its own repository under any name
+    /// is a second copy of that repository; a submodule, and a worktree of
+    /// another repository (a folder of projects), are not.
+    #[test]
+    fn linked_git_worktrees_are_skipped_submodules_are_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git/worktrees/wt-feature")).expect("mkdir");
+        std::fs::create_dir_all(root.join("wt-feature/src")).expect("mkdir");
+        std::fs::write(
+            root.join("wt-feature/.git"),
+            format!(
+                "gitdir: {}\n",
+                root.join(".git/worktrees/wt-feature").display()
+            ),
+        )
+        .expect("write");
+        std::fs::write(root.join("wt-feature/src/copy.rs"), "x").expect("write");
+        std::fs::create_dir_all(root.join("other-project")).expect("mkdir");
+        std::fs::write(
+            root.join("other-project/.git"),
+            "gitdir: /elsewhere/other/.git/worktrees/other-project\n",
+        )
+        .expect("write");
+        std::fs::write(root.join("other-project/own.rs"), "z").expect("write");
+        std::fs::create_dir_all(root.join("vendor/lib")).expect("mkdir");
+        std::fs::write(
+            root.join("vendor/lib/.git"),
+            "gitdir: ../../.git/modules/vendor/lib\n",
+        )
+        .expect("write");
+        std::fs::write(root.join("vendor/lib/real.rs"), "y").expect("write");
+
+        let seen: Vec<String> = ignore::WalkBuilder::new(root)
+            .hidden(false)
+            .filter_entry(keep_entry)
+            .build()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path().to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            seen.iter().any(|p| p.ends_with("real.rs")),
+            "submodule kept"
+        );
+        assert!(
+            seen.iter().any(|p| p.ends_with("own.rs")),
+            "another repository's worktree is its own project"
+        );
+        assert!(
+            !seen.iter().any(|p| p.ends_with("copy.rs")),
+            "a worktree nested in its own repository is pruned"
+        );
+        let wt_root = ignore::WalkBuilder::new(root.join("wt-feature"))
+            .build()
+            .filter_map(std::result::Result::ok)
+            .find(|e| e.depth() == 0)
+            .expect("root entry");
+        assert!(
+            keep_entry(&wt_root),
+            "an explicitly requested worktree stays walkable"
+        );
+    }
+
+    /// Regression: with hidden entries walked (#1792), `.git` internals were
+    /// searched and indexed like project content.
+    #[test]
+    fn vcs_metadata_is_never_walked_but_tracked_dotfiles_are() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git/rr-cache/abc")).expect("mkdir");
+        std::fs::write(
+            root.join(".git/rr-cache/abc/preimage"),
+            "fn secret_preimage() {}",
+        )
+        .expect("write");
+        std::fs::create_dir_all(root.join(".github/workflows")).expect("mkdir");
+        std::fs::write(root.join(".github/workflows/ci.yml"), "on: push").expect("write");
+        std::fs::write(root.join("main.rs"), "fn main() {}").expect("write");
+
+        let seen: Vec<String> = ignore::WalkBuilder::new(root)
+            .hidden(SKIP_HIDDEN_IN_CONTENT_WALK)
+            .filter_entry(keep_entry)
+            .build()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path().to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            seen.iter().any(|p| p.ends_with("ci.yml")),
+            "tracked dotfile kept"
+        );
+        assert!(seen.iter().any(|p| p.ends_with("main.rs")));
+        assert!(
+            !seen.iter().any(|p| p.contains("rr-cache")),
+            "VCS metadata pruned: {seen:?}"
+        );
+        let git_root = ignore::WalkBuilder::new(root.join(".git"))
+            .hidden(false)
+            .build()
+            .filter_map(std::result::Result::ok)
+            .find(|e| e.depth() == 0)
+            .expect("root entry");
+        assert!(
+            keep_entry(&git_root),
+            "an explicitly requested .git stays walkable"
+        );
+    }
+
     #[test]
     fn explicit_root_named_claude_worktrees_is_not_pruned() {
-        // depth == 0 must never be filtered, so an explicit
         // `ctx_search path=.claude/worktrees/wt` still works.
         let tmp = tempfile::tempdir().expect("tempdir");
         let wt = tmp.path().join(".claude/worktrees/wt");

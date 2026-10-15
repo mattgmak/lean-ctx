@@ -39,6 +39,8 @@ pub(super) fn handle_with_options_inner(
     } else {
         mode
     };
+    // #1910: a fallback inside an `auto` read returns the bare file, bannerless.
+    let _auto_guard = (mode == "auto").then(super::render::AutoRequestGuard::new);
 
     if fresh {
         if mode == "diff" {
@@ -151,12 +153,15 @@ pub(super) fn handle_with_options_inner(
         }
 
         let compressed_hit = if is_cacheable_mode(&resolved_mode) {
-            let cache_key = compressed_cache_key(
-                &resolved_mode,
-                crp_mode,
-                task,
-                tuning.aggressiveness,
-                tuning.protect,
+            let cache_key = super::request_scoped_key(
+                compressed_cache_key(
+                    &resolved_mode,
+                    crp_mode,
+                    task,
+                    tuning.aggressiveness,
+                    tuning.protect,
+                ),
+                mode == "auto",
             );
             // #1287: a same-conversation re-read of the SAME variant of an
             // unchanged file collapses to the ~15-token variant stub instead
@@ -165,12 +170,22 @@ pub(super) fn handle_with_options_inner(
             // conversation gate mirrors the full-content stub — stubs must
             // never leak across chats (#1042). Fresh reads bypass the cache
             // entirely, so `fresh=true` remains the escape hatch.
+            //
+            // #1909: a variant stored without a conversation id is handed to
+            // the same gate as the full-content stub (`delivered = None`), so
+            // a process with no conversation context still collapses its own
+            // re-reads — the gate withholds whenever a caller is known or
+            // cannot be identified.
+            let delivered = match cache.compressed_delivered_conversation(path, &cache_key) {
+                crate::core::cache::VariantDelivery::Conversation(id) => Some(Some(id)),
+                crate::core::cache::VariantDelivery::UnknownConversation => Some(None),
+                crate::core::cache::VariantDelivery::Absent => None,
+            };
             if super::dispatch::stub_policy_allows()
-                && let crate::core::cache::VariantDelivery::Conversation(delivered) =
-                    cache.compressed_delivered_conversation(path, &cache_key)
+                && let Some(delivered) = delivered
                 && crate::core::conversation::conversation_allows_stub(
                     crate::core::conversation::current_conversation_id_fresh().as_deref(),
-                    Some(&delivered),
+                    delivered.as_deref(),
                 )
             {
                 crate::core::telemetry::global_metrics().record_cache(true);
@@ -236,12 +251,15 @@ pub(super) fn handle_with_options_inner(
                 out
             };
             if is_cacheable_mode(&resolved_mode) {
-                let cache_key = compressed_cache_key(
-                    &resolved_mode,
-                    crp_mode,
-                    task,
-                    tuning.aggressiveness,
-                    tuning.protect,
+                let cache_key = super::request_scoped_key(
+                    compressed_cache_key(
+                        &resolved_mode,
+                        crp_mode,
+                        task,
+                        tuning.aggressiveness,
+                        tuning.protect,
+                    ),
+                    mode == "auto",
                 );
                 cache.set_compressed(path, &cache_key, out.clone());
             }
@@ -392,12 +410,15 @@ pub(super) fn handle_with_options_inner(
         output
     };
     if is_cacheable_mode(&resolved_mode) {
-        let cache_key = compressed_cache_key(
-            &resolved_mode,
-            crp_mode,
-            task,
-            tuning.aggressiveness,
-            tuning.protect,
+        let cache_key = super::request_scoped_key(
+            compressed_cache_key(
+                &resolved_mode,
+                crp_mode,
+                task,
+                tuning.aggressiveness,
+                tuning.protect,
+            ),
+            mode == "auto",
         );
         cache.set_compressed(path, &cache_key, output.clone());
     }
@@ -546,7 +567,7 @@ pub(super) fn handle_full_with_auto_delta(
     let prof = crate::core::profiles::active_profile();
     let force_full = no_deg
         || (prof.read.default_mode_effective() == "full"
-            && prof.compression.crp_mode_effective() == "off");
+            && prof.compression.crp_mode.as_deref() == Some("off"));
 
     let old_content = cache
         .get(path)
@@ -614,6 +635,20 @@ pub(super) fn handle_full_with_auto_delta(
 /// `process_mode_tuned` (which would report it as an unknown mode and fall back
 /// to dumping the entire file, #1584).
 pub(crate) fn handle_diff(cache: &mut SessionCache, path: &str, file_ref: &str) -> (String, usize) {
+    let (output, sent, baseline) = prepare_diff(cache, path, file_ref);
+    if let Some(content) = baseline {
+        let result = cache.store(path, &content);
+        crate::core::telemetry::global_metrics().record_cache(result.was_hit);
+    }
+    (output, sent)
+}
+
+/// Prepare a delta without advancing its baseline until the caller delivers it.
+pub(crate) fn prepare_diff(
+    cache: &SessionCache,
+    path: &str,
+    file_ref: &str,
+) -> (String, usize, Option<String>) {
     let _mode_guard = crate::core::savings_footer::ModeGuard::new("diff");
     let short = protocol::shorten_path(path);
     let old_content = cache
@@ -625,7 +660,7 @@ pub(crate) fn handle_diff(cache: &mut SessionCache, path: &str, file_ref: &str) 
         Err(e) => {
             let msg = format!("ERROR: {e}");
             let tokens = count_tokens(&msg);
-            return (msg, tokens);
+            return (msg, tokens, None);
         }
     };
 
@@ -636,17 +671,12 @@ pub(crate) fn handle_diff(cache: &mut SessionCache, path: &str, file_ref: &str) 
     } else {
         // No previous version cached — store content for future diffs but
         // return a short guidance message instead of dumping the full file.
-        let store_result = cache.store(path, &new_content);
-        crate::core::telemetry::global_metrics().record_cache(store_result.was_hit);
         let msg = format!(
             "{file_ref}={short} [no cached version for diff — use mode=full first, then diff on re-read]"
         );
         let sent = count_tokens(&msg);
-        return (msg, sent);
+        return (msg, sent, Some(new_content));
     };
-
-    let store_result = cache.store(path, &new_content);
-    crate::core::telemetry::global_metrics().record_cache(store_result.was_hit);
 
     let sent = count_tokens(&diff_output);
     let savings = protocol::format_savings(original_tokens, sent);
@@ -655,7 +685,11 @@ pub(crate) fn handle_diff(cache: &mut SessionCache, path: &str, file_ref: &str) 
     } else {
         short
     };
-    (format!("{head} [diff]\n{diff_output}\n{savings}"), sent)
+    (
+        format!("{head} [diff]\n{diff_output}\n{savings}"),
+        sent,
+        Some(new_content),
+    )
 }
 
 #[cfg(test)]

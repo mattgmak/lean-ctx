@@ -6,7 +6,7 @@ You have the lean-ctx MCP server available. You MUST use it for ALL file reads, 
 
 | NEVER use | ALWAYS use instead |
 |-----------|-------------------|
-| `Read` / `View` / `cat` / `head` / `tail` | `ctx_read(path, mode)` — cached, 10 read modes, re-reads ~13 tokens |
+| `Read` / `View` / `cat` / `head` / `tail` | `ctx_read(path, mode)` — cached read modes and compact references for eligible re-reads |
 | `Bash` (any shell command) | `ctx_shell(command)` — pattern compression for git/npm/cargo/docker |
 | `Grep` / `Search` / `rg` | `ctx_search(pattern, path)` — compact, token-efficient results |
 | `ListFiles` / `ListDirectory` / `ls` / `find` | `ctx_tree(path, depth)` — compact directory maps |
@@ -26,5 +26,3 @@ Edits: `ctx_read(path, mode="anchored")` → `ctx_patch(path, op, line, hash, ne
 never echo old text (`op=create` for new files). Native Write/Edit, where the host provides them, stay fine.
 
 CRITICAL: Every time you reach for Read, Bash, Grep, or ListFiles — stop and use the lean-ctx MCP equivalent instead. This is not optional.
-
-Preferred workflow: use `ctx_workflow` for state + evidence + tool gating.

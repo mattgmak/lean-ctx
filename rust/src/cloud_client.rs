@@ -1,5 +1,11 @@
 use std::path::PathBuf;
 
+#[allow(dead_code, unreachable_pub)]
+mod entitlement_cache;
+pub use entitlement_cache::EffectivePlan as VerifiedEffectivePlan;
+
+pub const ENTITLEMENT_DENIAL_PREFIX: &str = "Signed entitlement does not allow ";
+
 fn config_dir() -> PathBuf {
     // GH #439: data_dir() already honors LEAN_CTX_DATA_DIR + legacy/XDG, so the
     // cloud cache follows the migration instead of pinning ~/.lean-ctx.
@@ -12,8 +18,19 @@ fn credentials_path() -> PathBuf {
     config_dir().join("credentials.json")
 }
 
+/// Base URL of the lean-ctx cloud API. Unit tests and cargo-launched binaries
+/// get the discard port instead of any non-loopback endpoint, so test fixtures
+/// (telemetry probes, feedback, stats, wrapped cards) can never reach
+/// production; their requests fail fast with "connection refused".
 pub fn api_url() -> String {
-    std::env::var("LEAN_CTX_API_URL").unwrap_or_else(|_| "https://api.leanctx.com".to_string())
+    const LOOPBACK_SINK: &str = "http://127.0.0.1:9";
+    let configured =
+        std::env::var("LEAN_CTX_API_URL").unwrap_or_else(|_| "https://api.leanctx.com".to_string());
+    if cloud_endpoint_allowed(&configured, launched_by_cargo()) {
+        configured
+    } else {
+        LOOPBACK_SINK.to_string()
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -148,10 +165,10 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// This machine's display label for the device overview (GL #387): the
-/// hostname, attached as `X-Device-Label` to every sync push. Display
-/// metadata only — the server treats it as an opaque, sanitized string and
-/// silently skips tracking when it is empty.
+/// This machine's legacy account-key label, sent with login/registration and
+/// attached as `X-Device-Label` to sync pushes. It lets the account service
+/// replace this machine's key without replacing the account's other keys.
+/// This display label is not the authenticated device identity of a v2 lease.
 fn device_label() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
@@ -262,7 +279,9 @@ pub struct RegisterResult {
 
 pub fn register(email: &str, password: Option<&str>) -> Result<RegisterResult, String> {
     let url = format!("{}/api/auth/register", api_url());
-    let mut body = serde_json::json!({ "email": email });
+    // The label names the key this call issues, so the account page can tell
+    // one machine from another. Keys are per-device and additive.
+    let mut body = serde_json::json!({ "email": email, "device_label": device_label() });
     if let Some(pw) = password {
         body["password"] = serde_json::Value::String(pw.to_string());
     }
@@ -319,7 +338,11 @@ pub fn forgot_password(email: &str) -> Result<String, String> {
 
 pub fn login(email: &str, password: &str) -> Result<RegisterResult, String> {
     let url = format!("{}/api/auth/login", api_url());
-    let body = serde_json::json!({ "email": email, "password": password });
+    let body = serde_json::json!({
+        "email": email,
+        "password": password,
+        "device_label": device_label(),
+    });
 
     let resp = ureq::post(&url)
         .header("Content-Type", "application/json")
@@ -452,6 +475,126 @@ pub fn submit_product_feedback(payload: &serde_json::Value) -> Result<String, St
         serde_json::from_str(&body).map_err(|e| format!("Invalid JSON: {e}"))?;
 
     Ok(json["message"].as_str().unwrap_or("Thanks").to_string())
+}
+
+/// Cargo exports `CARGO_PKG_NAME` to `cargo test` / `cargo run` processes and
+/// every child they spawn, so integration tests driving the binary carry it too.
+fn launched_by_cargo() -> bool {
+    std::env::var("CARGO_PKG_NAME").is_ok_and(|name| name == env!("CARGO_PKG_NAME"))
+}
+
+/// Unit tests and cargo-launched binaries may only talk to a loopback
+/// endpoint; otherwise test fixtures would pollute production data.
+fn cloud_endpoint_allowed(base_url: &str, launched_by_cargo: bool) -> bool {
+    if !cfg!(test) && !launched_by_cargo {
+        return true;
+    }
+    let Some(authority) = base_url
+        .strip_prefix("http://")
+        .or_else(|| base_url.strip_prefix("https://"))
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+    else {
+        return false;
+    };
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Send one validated telemetry-v2 daily batch. No authentication required.
+pub fn telemetry_v2_batch(
+    batch: &crate::core::telemetry_v2::TelemetryBatchV2,
+) -> Result<String, String> {
+    telemetry_v2_batch_with_timeout(batch, std::time::Duration::from_secs(10))
+}
+
+pub(crate) fn telemetry_v2_batch_with_timeout(
+    batch: &crate::core::telemetry_v2::TelemetryBatchV2,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    // A sender may have waited for another lease since its initial precheck.
+    let config = crate::core::config::Config::try_load_global()
+        .map_err(|_| "Telemetry configuration unavailable".to_string())?;
+    let do_not_track = crate::core::host_env::var("DO_NOT_TRACK");
+    let telemetry_override = crate::core::host_env::var("LEAN_CTX_TELEMETRY");
+    if !config
+        .telemetry
+        .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref())
+    {
+        return Err("Telemetry sending is disabled".to_string());
+    }
+    if crate::core::telemetry_consent::running_in_ci() {
+        return Err("Telemetry is not sent from CI".to_string());
+    }
+    batch
+        .validate()
+        .map_err(|error| format!("Telemetry validation failed: {error:?}"))?;
+    let url = format!("{}/api/telemetry/v2/batch", api_url());
+    let response = ureq::post(&url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .header("Content-Type", "application/json")
+        .send(&serde_json::to_vec(batch).map_err(|error| format!("JSON error: {error}"))?)
+        .map_err(|error| format!("Telemetry v2 batch failed: {error}"))?;
+    let body = response
+        .into_body()
+        .read_to_string()
+        .map_err(|error| format!("Failed to read response: {error}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|error| format!("Invalid JSON: {error}"))?;
+    crate::core::telemetry_notices::remember(crate::core::telemetry_notices::from_response(&json));
+    Ok(json["message"].as_str().unwrap_or("OK").to_string())
+}
+
+/// Delete every server-side aggregate associated with one installation ID.
+pub fn delete_remote_telemetry(
+    installation_id: &str,
+    deletion_token: &str,
+) -> Result<bool, String> {
+    let installation_id = uuid::Uuid::parse_str(installation_id)
+        .map_err(|_| "Invalid installation ID".to_string())?;
+    let url = format!(
+        "{}/api/telemetry/v2/installations/{installation_id}",
+        api_url()
+    );
+    if deletion_token.len() != 64
+        || !deletion_token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("Invalid telemetry deletion credential".to_string());
+    }
+    let response = ureq::delete(&url)
+        .header(
+            "Authorization",
+            &format!("TelemetryDelete v1.{deletion_token}"),
+        )
+        .call()
+        .map_err(|error| format!("Remote telemetry deletion failed: {error}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .into_body()
+        .read_to_string()
+        .map_err(|error| format!("Failed to read deletion response: {error}"))?;
+    deletion_confirmed(status, &body)
+}
+
+fn deletion_confirmed(status: u16, body: &str) -> Result<bool, String> {
+    if status == 204 {
+        return Ok(false);
+    }
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("Invalid deletion response: {error}"))?;
+    Ok(value.get("deleted").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
 /// Result of a successful Wrapped publish (`POST /api/wrapped`). The `edit_token` is returned
@@ -706,12 +849,18 @@ pub fn fetch_leaderboard() -> Result<serde_json::Value, String> {
 
 pub fn is_cloud_user() -> bool {
     let path = config_dir().join("plan.txt");
-    std::fs::read_to_string(path).is_ok_and(|p| matches!(p.trim(), "cloud" | "pro"))
+    std::fs::read_to_string(path).is_ok_and(|value| plan_value_has_cloud_access(&value))
+}
+
+fn plan_value_has_cloud_access(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("cloud")
+        || crate::core::billing::Plan::parse_known(value)
+            .is_some_and(|plan| plan.rank() >= crate::core::billing::Plan::Pro.rank())
 }
 
 /// Days a cached plan keeps granting its hosted entitlements while the billing
 /// backend is unreachable. Generous on purpose: a network blip or a weekend
-/// offline must never silently demote a paying user to Free.
+/// offline must never silently demote a paying user to Community.
 pub const PLAN_GRACE_DAYS: i64 = 14;
 
 fn plan_cache_path() -> PathBuf {
@@ -765,18 +914,17 @@ pub enum PlanSource {
     Live,
     /// Served from the local cache and still within the grace window.
     Cached,
-    /// Cached confirmation is past the grace window → demoted to Free.
+    /// Cached confirmation is past the grace window → demoted to Community.
     Expired,
-    /// No cached plan at all (never logged in / never synced) → Free.
+    /// No cached plan at all (never logged in / never synced) → Community.
     None,
 }
 
-/// A resolved plan plus its provenance. The plan here is only ever used for
-/// *display* and for gating **hosted** surfaces — it never gates a local
-/// capability (Local-Free Invariant; the local engine has no entitlement checks).
+/// A resolved plan plus provenance and donation/support recognition.
 #[derive(Debug, Clone)]
 pub struct EffectivePlan {
     pub plan: crate::core::billing::Plan,
+    pub supporter_recognition: bool,
     pub source: PlanSource,
     pub verified_at: Option<i64>,
     pub grace_days: i64,
@@ -803,7 +951,8 @@ pub fn resolve_effective_plan_cached() -> EffectivePlan {
     let grace_days = PLAN_GRACE_DAYS;
     let Some(cache) = cached_plan() else {
         return EffectivePlan {
-            plan: crate::core::billing::Plan::Free,
+            plan: crate::core::billing::Plan::Community,
+            supporter_recognition: false,
             source: PlanSource::None,
             verified_at: None,
             grace_days,
@@ -811,22 +960,59 @@ pub fn resolve_effective_plan_cached() -> EffectivePlan {
     };
     let (fresh, _age) = plan_within_grace(cache.verified_at, now_unix(), grace_days);
     if fresh {
+        let selection = crate::core::billing::Plan::parse_selection(&cache.plan);
         EffectivePlan {
-            plan: crate::core::billing::Plan::parse(&cache.plan),
+            plan: selection.plan,
+            supporter_recognition: selection.supporter_recognition,
             source: PlanSource::Cached,
             verified_at: Some(cache.verified_at),
             grace_days,
         }
     } else {
-        // Fail closed for *hosted* entitlements once grace lapses. Local features
-        // remain unaffected — they are never gated.
+        // Fail closed for paid entitlements once grace lapses. Explicit
+        // Community/Trust Core capabilities remain unaffected.
         EffectivePlan {
-            plan: crate::core::billing::Plan::Free,
+            plan: crate::core::billing::Plan::Community,
+            supporter_recognition: false,
             source: PlanSource::Expired,
             verified_at: Some(cache.verified_at),
             grace_days,
         }
     }
+}
+
+/// Authoritative, local-only paid-capability decision from a verified signed
+/// entitlement. Unsigned plan caches are display state and never reach here.
+#[must_use]
+pub fn signed_entitlement_allows(capability: &str) -> bool {
+    entitlement_cache::resolve_cached().allows(capability)
+}
+
+/// Resolve signed rights for reports without trusting unsigned display plans.
+#[must_use]
+pub fn resolve_verified_plan_cached() -> VerifiedEffectivePlan {
+    entitlement_cache::resolve_cached()
+}
+
+/// Refresh signed authority, retaining only cryptographically valid grace.
+#[must_use]
+pub fn refresh_verified_plan() -> VerifiedEffectivePlan {
+    entitlement_cache::refresh()
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_signed_entitlement_paths(
+    trust: PathBuf,
+    credentials: PathBuf,
+    cache: PathBuf,
+    anchors: Vec<(String, [u8; 32])>,
+) -> impl Drop {
+    entitlement_cache::install_test_paths(trust, credentials, cache, anchors)
+}
+
+#[cfg(test)]
+pub(crate) fn accept_test_signed_entitlement(account: &str, bytes: &[u8]) {
+    entitlement_cache::accept_test_cache(account, bytes);
 }
 
 /// Best-effort *live* resolve: try the backend (refreshing the cache on success),
@@ -838,8 +1024,10 @@ pub fn refresh_effective_plan() -> EffectivePlan {
         && let Ok(plan_str) = fetch_plan()
     {
         let _ = save_plan(&plan_str);
+        let selection = crate::core::billing::Plan::parse_selection(&plan_str);
         return EffectivePlan {
-            plan: crate::core::billing::Plan::parse(&plan_str),
+            plan: selection.plan,
+            supporter_recognition: selection.supporter_recognition,
             source: PlanSource::Live,
             verified_at: Some(now_unix()),
             grace_days: PLAN_GRACE_DAYS,
@@ -865,7 +1053,7 @@ pub fn fetch_plan() -> Result<String, String> {
     let json: serde_json::Value =
         serde_json::from_str(&resp_body).map_err(|e| format!("Invalid response: {e}"))?;
 
-    Ok(json["plan"].as_str().unwrap_or("free").to_string())
+    Ok(json["plan"].as_str().unwrap_or("community").to_string())
 }
 
 /// Start a Stripe Checkout session for the logged-in account and return the
@@ -891,10 +1079,28 @@ pub fn start_checkout(plan: &str, interval: &str) -> Result<String, String> {
     let json: serde_json::Value =
         serde_json::from_str(&resp_body).map_err(|e| format!("Invalid response: {e}"))?;
 
-    json["url"]
+    parse_checkout_url(&json)
+}
+
+fn parse_checkout_url(json: &serde_json::Value) -> Result<String, String> {
+    let raw = json["url"]
         .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "Billing did not return a checkout URL.".to_string())
+        .ok_or_else(|| "Billing did not return a checkout URL.".to_string())?;
+    // The URL is printed to the terminal and handed to the browser opener:
+    // control characters (CR/LF, ESC sequences) must never pass through.
+    if raw.chars().any(char::is_control) {
+        return Err("Billing returned an invalid checkout URL.".to_string());
+    }
+    let parsed = reqwest::Url::parse(raw)
+        .map_err(|_| "Billing returned an invalid checkout URL.".to_string())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("Billing returned an invalid checkout URL.".to_string());
+    }
+    Ok(parsed.to_string())
 }
 
 pub fn push_commands(entries: &[serde_json::Value]) -> Result<String, String> {
@@ -1227,156 +1433,5 @@ pub fn index_bundle_status() -> Result<serde_json::Value, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::billing::Plan;
-    // Only the `#[cfg(unix)]` credential-permission tests still take the env lock
-    // directly; the plan-resolver tests use `isolated_data_dir()` (which locks
-    // internally). Gating the import keeps the Windows cross-compile warning-free.
-    #[cfg(unix)]
-    use crate::core::data_dir::test_env_lock;
-
-    #[test]
-    fn existing_card_publish_response_carries_recovery_challenge() {
-        let card: PublishedCard = serde_json::from_value(serde_json::json!({
-            "id": "card-1",
-            "url": "https://leanctx.com/w/card-1",
-            "edit_token_challenge": "nonce-1",
-            "challenge_expires_in_secs": 300
-        }))
-        .unwrap();
-        assert!(card.edit_token.is_none());
-        assert_eq!(card.edit_token_challenge.as_deref(), Some("nonce-1"));
-        assert_eq!(card.challenge_expires_in_secs, Some(300));
-        assert!(!card.account_claimed);
-    }
-
-    #[test]
-    fn grace_window_boundaries_are_inclusive_and_skew_safe() {
-        let now = 1_000_000_000;
-        let day = 86_400;
-        assert_eq!(plan_within_grace(now, now, 14), (true, 0));
-        // Exactly at the edge stays valid (inclusive).
-        assert_eq!(plan_within_grace(now - 14 * day, now, 14), (true, 14));
-        // One day past → expired.
-        assert_eq!(plan_within_grace(now - 15 * day, now, 14), (false, 15));
-        // Clock skew (future timestamp) is clamped to age 0, never negative.
-        assert_eq!(plan_within_grace(now + day, now, 14), (true, 0));
-    }
-
-    #[test]
-    fn plan_cache_roundtrips_through_json() {
-        let c = PlanCache {
-            plan: "pro".into(),
-            verified_at: 42,
-        };
-        let back: PlanCache = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
-        assert_eq!(back.plan, "pro");
-        assert_eq!(back.verified_at, 42);
-    }
-
-    #[test]
-    fn cached_resolve_grants_within_grace_then_expires_to_free() {
-        // Isolate all dirs (config + cache) so the resolver reads only the cache
-        // this test writes, not a developer's real plan cache.
-        let _iso = crate::core::data_dir::isolated_data_dir();
-
-        // A fresh save is served from cache, within grace, at full plan.
-        save_plan("pro").unwrap();
-        let eff = resolve_effective_plan_cached();
-        assert_eq!(eff.plan, Plan::Pro);
-        assert_eq!(eff.source, PlanSource::Cached);
-
-        // Backdate beyond grace → hosted entitlements fail closed to Free.
-        let stale = PlanCache {
-            plan: "pro".into(),
-            verified_at: now_unix() - (PLAN_GRACE_DAYS + 1) * 86_400,
-        };
-        std::fs::write(plan_cache_path(), serde_json::to_string(&stale).unwrap()).unwrap();
-        let eff = resolve_effective_plan_cached();
-        assert_eq!(eff.plan, Plan::Free);
-        assert_eq!(eff.source, PlanSource::Expired);
-    }
-
-    #[test]
-    fn no_cache_resolves_to_free_none() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        let eff = resolve_effective_plan_cached();
-        assert_eq!(eff.plan, Plan::Free);
-        assert_eq!(eff.source, PlanSource::None);
-    }
-
-    // P0-2 (#414): credentials must be owner-only on disk.
-    #[cfg(unix)]
-    #[test]
-    fn credentials_are_written_owner_only_and_atomic() {
-        use std::os::unix::fs::PermissionsExt;
-        let _env = test_env_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        crate::test_env::set_var("LEAN_CTX_DATA_DIR", tmp.path());
-
-        save_credentials("sk-test-key", "user-1", "a@b.c").unwrap();
-
-        let path = credentials_path();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "credentials.json must be 0o600");
-
-        let dir_mode = std::fs::metadata(config_dir())
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(
-            dir_mode & 0o077,
-            0,
-            "cloud dir must not be group/world accessible"
-        );
-
-        // No tmp file leftovers from the atomic write.
-        let leftovers: Vec<_> = std::fs::read_dir(config_dir())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
-            .collect();
-        assert!(leftovers.is_empty(), "atomic write must not leak tmp files");
-
-        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
-    }
-
-    // P0-2 (#414): pre-existing world-readable credentials are tightened on load.
-    #[cfg(unix)]
-    #[test]
-    fn loose_credential_permissions_are_tightened_on_load() {
-        use std::os::unix::fs::PermissionsExt;
-        let _env = test_env_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        crate::test_env::set_var("LEAN_CTX_DATA_DIR", tmp.path());
-
-        std::fs::create_dir_all(config_dir()).unwrap();
-        let path = credentials_path();
-        std::fs::write(&path, "{}").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let _ = load_credentials();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "legacy file must be tightened to 0o600"
-        );
-
-        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
-    }
-
-    #[test]
-    fn legacy_plan_txt_is_migrated_but_treated_as_stale() {
-        let _iso = crate::core::data_dir::isolated_data_dir();
-        // Only the legacy flat file exists (no timestamp) → past grace until refresh.
-        std::fs::create_dir_all(config_dir()).unwrap();
-        std::fs::write(config_dir().join("plan.txt"), "team").unwrap();
-        let cache = cached_plan().unwrap();
-        assert_eq!(cache.plan, "team");
-        assert_eq!(cache.verified_at, 0);
-        assert_eq!(resolve_effective_plan_cached().source, PlanSource::Expired);
-    }
-}
+#[path = "cloud_client/inline_tests.rs"]
+mod tests;

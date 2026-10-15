@@ -11,6 +11,7 @@ use std::path::Path;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::core::context_admission::stores::StoreAdmission;
 use crate::core::import_resolver;
 use crate::core::signatures;
 mod edges;
@@ -21,7 +22,9 @@ pub(crate) mod file_id;
 #[cfg(test)]
 mod tests;
 
-const INDEX_VERSION: u32 = 6;
+/// 7: file summaries are admitted (E3); indexes from 6 may hold raw source
+/// lines and are rebuilt rather than reused.
+const INDEX_VERSION: u32 = 7;
 
 // Path-key utilities moved to `core::index_paths` (#682); re-exported so existing
 // `graph_index::…` call sites keep compiling during the migration.
@@ -64,6 +67,19 @@ fn has_marker_in_ancestry(p: &Path, stop: &Path) -> bool {
         cur = dir.parent();
     }
     false
+}
+
+/// True if `p` or an ancestor carries a project marker. Below `$HOME` the walk
+/// stops before `$HOME` itself (a dotfiles repo there must not vouch for every
+/// home directory); elsewhere it stops before the filesystem root.
+fn is_inside_project(p: &Path) -> bool {
+    let home = dirs::home_dir()
+        .map(|home| std::path::PathBuf::from(normalize_project_root(&home.to_string_lossy())));
+    let stop = home
+        .filter(|home| p.starts_with(home))
+        .or_else(|| p.ancestors().last().map(Path::to_path_buf))
+        .unwrap_or_default();
+    has_marker_in_ancestry(p, &stop)
 }
 
 fn is_safe_scan_root(path: &str) -> bool {
@@ -183,7 +199,12 @@ fn is_safe_scan_root(path: &str) -> bool {
         "go.work",
     ];
 
-    if !breadth_markers.iter().any(|m| p.join(m).exists()) && !dir_has_dotnet_project(p) {
+    // A wide source tree inside a project (`repo/rust/src/core`, markers only
+    // in an ancestor) is not a broad directory (#1984, as GL#438 above).
+    if !breadth_markers.iter().any(|m| p.join(m).exists())
+        && !dir_has_dotnet_project(p)
+        && !is_inside_project(p)
+    {
         // Multi-repo workspace parent: >=2 children with project markers is always safe
         if crate::core::pathutil::has_multi_repo_children(p) {
             return true;
@@ -634,7 +655,8 @@ fn source_content_changed_since_index(index: &ProjectIndex, root_abs: &str) -> b
     // data would otherwise force needless graph rescans forever).
     let index_filter = crate::core::index_filter::IndexFileFilter::effective();
     let walker = ignore::WalkBuilder::new(root_abs)
-        .hidden(true)
+        // #1792: corpus membership follows git, not a leading dot.
+        .hidden(crate::core::walk_filter::SKIP_HIDDEN_IN_CONTENT_WALK)
         .git_ignore(index_filter.respect_gitignore)
         .git_global(index_filter.respect_gitignore)
         .git_exclude(index_filter.respect_gitignore)
@@ -681,7 +703,7 @@ fn source_content_changed_since_index(index: &ProjectIndex, root_abs: &str) -> b
             // Too many candidates to verify cheaply — assume stale.
             return true;
         }
-        match std::fs::read_to_string(path) {
+        match crate::core::text_decode::read_text(path) {
             // Bytes unchanged despite a newer mtime → not a real change.
             Ok(content) if compute_hash(&content) == file_entry.hash => {}
             // Edited content, or no longer readable as it was at scan time.
@@ -768,7 +790,8 @@ fn scan_inner(project_root: &str) -> (ProjectIndex, HashMap<String, String>) {
     let index_filter = crate::core::index_filter::IndexFileFilter::resolve(&cfg);
 
     let walker = ignore::WalkBuilder::new(&project_root)
-        .hidden(true)
+        // #1792: kept identical to the BM25 walk, as the comment above promises.
+        .hidden(crate::core::walk_filter::SKIP_HIDDEN_IN_CONTENT_WALK)
         .git_ignore(index_filter.respect_gitignore)
         .git_global(index_filter.respect_gitignore)
         .git_exclude(index_filter.respect_gitignore)
@@ -920,6 +943,8 @@ fn scan_inner(project_root: &str) -> (ProjectIndex, HashMap<String, String>) {
         &target_rels,
     );
     let parallel = admission.parallel_ok && !crate::core::memory_guard::is_under_pressure();
+    // One gateway policy snapshot for the whole scan (E3: stored excerpts are admitted).
+    let store_admission = StoreAdmission::current();
     let mut files_done = 0;
     while files_done < targets.len() {
         if crate::core::memory_guard::abort_requested() {
@@ -945,6 +970,7 @@ fn scan_inner(project_root: &str) -> (ProjectIndex, HashMap<String, String>) {
             &previous_symbols,
             existing.as_ref(),
             parallel,
+            &store_admission,
         );
         for r in results {
             if r.reused {
@@ -1023,11 +1049,12 @@ fn process_scan_file(
     ext: &str,
     previous_symbols: &PreviousSymbols<'_>,
     existing: Option<&ProjectIndex>,
+    admission: &StoreAdmission,
 ) -> Option<ScanFileResult> {
     if crate::core::memory_guard::abort_requested() {
         return None;
     }
-    let content = std::fs::read_to_string(file_path).ok()?;
+    let content = crate::core::text_decode::read_text(file_path).ok()?;
     let hash = compute_hash(&content);
 
     // Unchanged file with a prior entry: reuse verbatim (no re-parse). Clone
@@ -1058,7 +1085,11 @@ fn process_scan_file(
     let sigs = signatures::extract_signatures(&content, ext);
     let line_count = content.lines().count();
     let token_count = crate::core::tokens::count_tokens(&content);
-    let summary = extract_summary(&content);
+    // The summary is source text that enters a derived store (E3): it is
+    // admitted like every other stored excerpt, and a restricted file has none.
+    let summary = admission
+        .admit(&extract_summary(&content), std::path::Path::new(file_path))
+        .unwrap_or_default();
 
     let exports: Vec<String> = sigs
         .iter()
@@ -1116,25 +1147,26 @@ fn process_scan_targets(
     previous_symbols: &PreviousSymbols<'_>,
     existing: Option<&ProjectIndex>,
     parallel: bool,
+    admission: &StoreAdmission,
 ) -> Vec<ScanFileResult> {
     if parallel {
         targets
             .par_iter()
             .filter_map(|(file_path, rel, ext)| {
-                process_scan_file(file_path, rel, ext, previous_symbols, existing)
+                process_scan_file(file_path, rel, ext, previous_symbols, existing, admission)
             })
             .collect()
     } else {
         targets
             .iter()
             .filter_map(|(file_path, rel, ext)| {
-                process_scan_file(file_path, rel, ext, previous_symbols, existing)
+                process_scan_file(file_path, rel, ext, previous_symbols, existing, admission)
             })
             .collect()
     }
 }
 
-fn find_symbol_range(content: &str, sig: &signatures::Signature) -> (usize, usize) {
+pub(crate) fn find_symbol_range(content: &str, sig: &signatures::Signature) -> (usize, usize) {
     let lines: Vec<&str> = content.lines().collect();
     let mut start = 0;
 

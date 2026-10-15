@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! BuiltinConnectorScheduler — queues provider connector jobs.
 //!
 //! Wraps `core/providers/provider_trait.rs` behind the OCLA trait.
@@ -44,6 +45,10 @@ impl Default for BuiltinConnectorScheduler {
 }
 
 impl OclaService for BuiltinConnectorScheduler {
+    fn manifest(&self) -> crate::core::ocla::OclaResult<lean_ctx_protocol::CapabilityManifestV1> {
+        crate::core::ocla::capability_fabric::builtin_manifest(&self.capability())
+    }
+
     fn capability(&self) -> OclaCapability {
         OclaCapability::available(OclaCapabilityKind::ConnectorScheduler)
     }
@@ -52,7 +57,7 @@ impl OclaService for BuiltinConnectorScheduler {
 impl ConnectorScheduler for BuiltinConnectorScheduler {
     fn schedule_connector(&self, job: ConnectorJob) -> OclaResult<ScheduledJob> {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let scheduled = crate::proxy::providers::schedule_connector(&job, seq)?;
+        let scheduled = crate::proxy::connector_schedule::schedule_connector(&job, seq)?;
 
         let mut queue = self
             .queue

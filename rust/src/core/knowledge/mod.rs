@@ -7,15 +7,18 @@ pub mod local_store;
 pub mod maintenance;
 pub mod okf;
 mod persist;
+pub(crate) mod protection;
 mod query;
 mod ranking;
 pub mod retrieval;
 pub mod snapshot;
+pub(crate) mod source_view;
 pub mod store;
 pub mod supersession;
 mod types;
 
 pub use import_export::{ImportMerge, ImportResult, SimpleFactEntry, parse_import_data};
+pub(crate) use persist::is_machine_derived;
 pub use query::KnowledgeQuery;
 pub(crate) use ranking::sort_fact_for_output;
 pub use ranking::{SimilarFact, find_cross_key_similar};
@@ -210,6 +213,36 @@ mod tests {
     }
 
     #[test]
+    fn recall_for_task_matches_content_words_only() {
+        let policy = default_policy();
+        let mut k = ProjectKnowledge::new("/tmp/test-task-recall");
+        k.remember(
+            "finding",
+            "deploy",
+            "Review the deploy order",
+            "s1",
+            0.8,
+            &policy,
+        );
+        k.remember("api", "rate-limit", "100/min", "s1", 0.8, &policy);
+
+        // #1832: "review" is framing; the explicit query still matches it.
+        assert!(
+            k.recall_for_task("Review the rate limit.")
+                .iter()
+                .all(|f| f.key != "deploy")
+        );
+        assert_eq!(k.recall("review").len(), 1);
+
+        // Punctuation and underscores split like the index splits facts.
+        let hits = k.recall_for_task("Check rate_limit handling.");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "rate-limit");
+
+        assert!(k.recall_for_task("Please review and fix this.").is_empty());
+    }
+
+    #[test]
     fn remember_infers_archetype_from_category() {
         let policy = default_policy();
         let mut k = ProjectKnowledge::new("/tmp/test-archetype");
@@ -300,12 +333,14 @@ mod tests {
 
     #[test]
     fn facts_evict_down_to_cap_not_double() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let root = tempfile::tempdir().unwrap();
         // Regression: remember() must keep the fact count at or below max_facts.
         // Previously the lifecycle only fired above 2 * max_facts, so a store
         // could silently grow to twice its configured budget before reclaiming.
         let mut policy = default_policy();
         policy.knowledge.max_facts = 5;
-        let mut k = ProjectKnowledge::new("/tmp/test-evict");
+        let mut k = ProjectKnowledge::new(root.path().to_str().unwrap());
         for i in 0..40 {
             k.remember(
                 "finding",
@@ -326,6 +361,8 @@ mod tests {
 
     #[test]
     fn import_facts_evict_down_to_cap_not_double() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let root = tempfile::tempdir().unwrap();
         // Regression: import_facts() must settle the store at <= max_facts, just
         // like remember(). The import path previously only ran the lifecycle above
         // 2 * max_facts, so a bulk import could inflate a store to twice its
@@ -333,6 +370,13 @@ mod tests {
         // already capped at max_facts.
         let mut policy = default_policy();
         policy.knowledge.max_facts = 5;
+
+        // Eviction archives into the data dir. Own it, so a parallel test that
+        // swaps LEAN_CTX_DATA_DIR cannot make the archive (and so the eviction)
+        // fail, and nothing lands in the real data dir.
+        let _lock = crate::core::data_dir::test_env_lock();
+        let data = tempfile::tempdir().expect("data dir");
+        crate::test_env::set_var("LEAN_CTX_DATA_DIR", data.path().to_str().unwrap());
 
         // Produce a batch larger than 2x the cap via a generously-capped source.
         let mut source_policy = default_policy();
@@ -355,7 +399,7 @@ mod tests {
             incoming.len()
         );
 
-        let mut k = ProjectKnowledge::new("/tmp/test-import-target");
+        let mut k = ProjectKnowledge::new(root.path().to_str().unwrap());
         k.import_facts(incoming, ImportMerge::Append, "s2", &policy);
         assert!(
             k.facts.len() <= policy.knowledge.max_facts,
@@ -363,6 +407,7 @@ mod tests {
             policy.knowledge.max_facts,
             k.facts.len()
         );
+        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
     }
 
     #[test]
@@ -610,6 +655,7 @@ mod tests {
         k.remember("arch", "db", "PostgreSQL", "s1", 0.95, &policy);
 
         let incoming = vec![KnowledgeFact {
+            origin: crate::core::knowledge::FactOrigin::Local,
             category: "arch".into(),
             key: "db".into(),
             value: "MySQL".into(),
@@ -647,6 +693,7 @@ mod tests {
         k.remember("arch", "db", "PostgreSQL", "s1", 0.95, &policy);
 
         let incoming = vec![KnowledgeFact {
+            origin: crate::core::knowledge::FactOrigin::Local,
             category: "arch".into(),
             key: "db".into(),
             value: "MySQL".into(),
@@ -685,6 +732,7 @@ mod tests {
         k.remember("arch", "db", "PostgreSQL", "s1", 0.95, &policy);
 
         let incoming = vec![KnowledgeFact {
+            origin: crate::core::knowledge::FactOrigin::Local,
             category: "security".into(),
             key: "auth".into(),
             value: "JWT".into(),

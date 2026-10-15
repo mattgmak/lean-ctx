@@ -147,7 +147,7 @@ pub fn reset_state() {
 
 #[cfg(test)]
 pub mod tests {
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     use super::{
         ProxyRequestData, current_etpao, etpao_summary, identity_summary, process_proxy_request,
@@ -157,13 +157,14 @@ pub mod tests {
     use crate::core::context_kernel::coverage_class::CoverageClass;
     use crate::core::context_kernel::types::ReceiptOutcome;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// The bridge metrics are process-wide and the kernel e2e suites
+    /// (bridge_e2e, envelope_*, production_e2e, smoke_test) drive them too;
+    /// a module-private lock let their requests land in these totals
+    /// (`total_tokens` 172 instead of 120 on Linux CI). Share their lock.
     fn isolated_test() -> MutexGuard<'static, ()> {
-        let guard = match TEST_LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let guard = crate::core::context_kernel::kernel_config::KERNEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_state();
         guard
     }

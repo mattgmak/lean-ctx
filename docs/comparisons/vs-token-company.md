@@ -1,9 +1,9 @@
 # LeanCTX and The Token Company
 
-> **Status: historical comparison note — not canonical product copy.** Current
-> LeanCTX scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository). This note does not claim
-> universal compression, privacy, determinism, prompt-cache, or savings results.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 The products can be evaluated for different context-processing paths. LeanCTX's
 current product boundary is a local Runtime for existing coding agents; it can

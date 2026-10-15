@@ -7,11 +7,12 @@ mod build;
 mod chunking;
 pub use chunking::*;
 mod coordinator;
+pub(crate) mod coverage;
 pub use coordinator::{SearchIndexBuildProgress, get_or_start_build};
 #[cfg(test)]
 mod tests;
 
-const MAX_BM25_FILES: usize = 5000;
+pub(crate) const MAX_BM25_FILES: usize = 5000;
 const CHUNK_COUNT_WARNING: usize = 50_000;
 const ZSTD_LEVEL: i32 = 9;
 
@@ -140,6 +141,12 @@ pub struct BM25Index {
     /// directory instead of a full ingest walk.
     #[serde(default)]
     pub dirs: HashMap<String, u64>,
+    /// Digest of the Context Gateway policy the chunk contents were admitted
+    /// under. An index built under another policy (or before admission
+    /// existed — its postcard layout lacks this field and no longer loads) is
+    /// rebuilt in full, never reused (G5, E3).
+    #[serde(default)]
+    pub admission_policy: Option<String>,
     /// True once `shrink_resident_content_to_snippet` has trimmed each chunk's
     /// `content` down to the snippet lines. Resident-only RAM-saving state: never
     /// persisted (`skip`) so the on-disk index keeps full content, and a reload
@@ -217,6 +224,7 @@ impl BM25Index {
             doc_freqs: HashMap::new(),
             files: HashMap::new(),
             dirs: HashMap::new(),
+            admission_policy: None,
             content_truncated: false,
         }
     }
@@ -263,9 +271,9 @@ impl BM25Index {
 
     /// Shrinks each resident chunk's `content` to its first `keep_lines` lines,
     /// reclaiming the RAM held by the full source bodies once the embedding pass
-    /// has already consumed them. The search path only ever reads
-    /// `content.lines().take(5)` for snippets, so the trimmed copy is functionally
-    /// complete for BM25/dense/hybrid result rendering.
+    /// has already consumed them. Query previews can only select lines still
+    /// resident, so this trades preview coverage for memory in cached indexes.
+    /// Fresh admitted retrieval views retain their separately budgeted content.
     ///
     /// Further shrinks resident content (chunks are already truncated to 10 lines
     /// during `add_chunk`; this method can tighten that further). Sets
@@ -318,6 +326,79 @@ impl BM25Index {
         Self::build_from_directory_inner(root, &HashMap::new())
     }
 
+    /// Ephemeral retrieval view: admit each complete original source before
+    /// tokenization. Never consult metadata-only caches or persist this view.
+    ///
+    /// `subdir` / `in_scope` narrow the walk itself (see
+    /// [`list_scoped_code_files`]), so the file budget counts only sources the
+    /// caller asked about.
+    pub(crate) fn build_from_admitted_sources(
+        root: &Path,
+        subdir: Option<&str>,
+        in_scope: &dyn Fn(&str) -> bool,
+        mut admit: impl FnMut(&str) -> Result<Option<String>, String>,
+    ) -> Result<Self, String> {
+        if !is_safe_bm25_root(root) {
+            return Err("source root is not safe to scan".into());
+        }
+        let mut index = Self::new();
+        let mut chunk_bytes = 64 * 1024 * 1024;
+        let mut chunk_count = 100_000;
+        let sources = list_scoped_code_files(root, &CorpusRules::load(), true, subdir, in_scope)?;
+        for path in sources {
+            if crate::core::memory_guard::abort_requested()
+                || crate::core::memory_guard::is_under_pressure()
+            {
+                return Err("source search withheld under memory pressure".into());
+            }
+            let Some(content) = admit(&path)? else {
+                continue;
+            };
+            if looks_minified(&content) {
+                continue;
+            }
+            let allowance = chunk_bytes.min(content.len().saturating_mul(5).max(64 * 1024));
+            if !crate::core::index_admission::admit(
+                crate::core::index_admission::BuildKind::Bm25,
+                allowance as u64,
+            )
+            .parallel_ok
+            {
+                return Err("source search exceeds available memory headroom".into());
+            }
+            let mut file_chunk_bytes = allowance;
+            let count_allowance = chunk_count.min(4096);
+            let mut file_chunk_count = count_allowance;
+            let mut chunks = extract_admitted_chunks(
+                &path,
+                &content,
+                &mut file_chunk_bytes,
+                &mut file_chunk_count,
+            )?;
+            chunk_bytes -= allowance - file_chunk_bytes;
+            chunk_count -= count_allowance - file_chunk_count;
+            chunks.sort_by(|a, b| {
+                (a.start_line, a.end_line, &a.symbol_name).cmp(&(
+                    b.start_line,
+                    b.end_line,
+                    &b.symbol_name,
+                ))
+            });
+            for chunk in chunks {
+                if crate::core::memory_guard::abort_requested()
+                    || crate::core::memory_guard::is_under_pressure()
+                {
+                    return Err("source search withheld under memory pressure".into());
+                }
+                // This ephemeral view already charges the full admitted chunk
+                // against its byte budget; retain it for query-centred previews.
+                index.add_chunk_with_content_limit(chunk, None);
+            }
+        }
+        index.finalize();
+        Ok(index)
+    }
+
     /// Like `build_from_directory` but reuses file content from a prior scan
     /// (e.g. the graph index walk) to avoid redundant disk reads.
     pub fn build_with_content_hint(root: &Path, content_hint: &HashMap<String, String>) -> Self {
@@ -336,6 +417,8 @@ impl BM25Index {
         // snapshot, so the next staleness check sees it instead of silently
         // pinning the partial tree (#1724).
         let dirs = dir_states(root, &files);
+        // One policy for the whole build, recorded with the index (G5).
+        let admission = crate::core::context_admission::stores::StoreAdmission::current();
 
         // #933: parallel fast path for the common case. The per-file parse +
         // tokenize work is pure and thread-safe, so we fan it across a rayon pool
@@ -356,12 +439,14 @@ impl BM25Index {
             )
             .parallel_ok
         {
-            let mut index = Self::build_parallel(root, content_hint, &files);
+            let mut index = Self::build_parallel(root, content_hint, &files, &admission);
             index.dirs = dirs;
+            index.admission_policy = Some(admission.digest().to_owned());
             return index;
         }
-        let mut index = Self::build_sequential(root, content_hint, &files);
+        let mut index = Self::build_sequential(root, content_hint, &files, &admission);
         index.dirs = dirs;
+        index.admission_policy = Some(admission.digest().to_owned());
         index
     }
 
@@ -389,6 +474,11 @@ impl BM25Index {
     }
 
     pub fn rebuild_incremental(root: &Path, prev: &BM25Index) -> Self {
+        // Reused chunks must have been admitted under the current policy.
+        let admission = crate::core::context_admission::stores::StoreAdmission::current();
+        if prev.admission_policy.as_deref() != Some(admission.digest()) {
+            return Self::build_from_directory(root);
+        }
         let old_by_file = Self::group_prev_chunks_by_file(prev);
         let files = list_code_files(root);
         let dirs = dir_states(root, &files);
@@ -412,12 +502,16 @@ impl BM25Index {
             )
             .parallel_ok
         {
-            let mut index = Self::rebuild_incremental_parallel(root, prev, &old_by_file, &files);
+            let mut index =
+                Self::rebuild_incremental_parallel(root, prev, &old_by_file, &files, &admission);
             index.dirs = dirs;
+            index.admission_policy = Some(admission.digest().to_owned());
             return index;
         }
-        let mut index = Self::rebuild_incremental_sequential(root, prev, &old_by_file, &files);
+        let mut index =
+            Self::rebuild_incremental_sequential(root, prev, &old_by_file, &files, &admission);
         index.dirs = dirs;
+        index.admission_policy = Some(admission.digest().to_owned());
         index
     }
 
@@ -429,6 +523,7 @@ impl BM25Index {
         prev: &BM25Index,
         old_by_file: &HashMap<String, Vec<CodeChunk>>,
         files: &[String],
+        admission: &crate::core::context_admission::stores::StoreAdmission,
     ) -> Self {
         let mut index = Self::new();
         const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
@@ -474,7 +569,7 @@ impl BM25Index {
                     Err(_) => continue,
                 }
             } else {
-                match std::fs::read_to_string(&abs) {
+                match crate::core::text_decode::read_text(&abs) {
                     Ok(c) => c,
                     Err(_) => continue,
                 }
@@ -482,6 +577,10 @@ impl BM25Index {
             if content.is_empty() {
                 continue;
             }
+            // Derived store: only admitted text, never restricted (E3).
+            let Some(content) = admission.admit(&content, &abs) else {
+                continue;
+            };
             // #1739: see `build::prepare_file` — same predicate, same position.
             if looks_minified(&content) {
                 tracing::debug!("[bm25: skipping minified payload {rel}]");
@@ -504,7 +603,11 @@ impl BM25Index {
         index
     }
 
-    fn add_chunk(&mut self, mut chunk: CodeChunk) {
+    fn add_chunk(&mut self, chunk: CodeChunk) {
+        self.add_chunk_with_content_limit(chunk, Some(10));
+    }
+
+    fn add_chunk_with_content_limit(&mut self, mut chunk: CodeChunk, keep_lines: Option<usize>) {
         let idx = self.chunks.len();
 
         let enriched = enrich_for_bm25(&chunk);
@@ -520,12 +623,11 @@ impl BM25Index {
 
         // #790: truncate content to snippet AFTER tokenization — full text was
         // used for BM25 scoring above; stored content is only for result display.
-        const SNIPPET_LINES: usize = 10;
-        if chunk.content.lines().nth(SNIPPET_LINES).is_some() {
+        if let Some(keep_lines) = keep_lines.filter(|&n| chunk.content.lines().nth(n).is_some()) {
             chunk.content = chunk
                 .content
                 .lines()
-                .take(SNIPPET_LINES)
+                .take(keep_lines)
                 .collect::<Vec<_>>()
                 .join("\n");
             chunk.content.shrink_to_fit();
@@ -593,7 +695,7 @@ impl BM25Index {
             .filter(|&&idx| scores[idx] > 0.0)
             .map(|&idx| {
                 let chunk = &self.chunks[idx];
-                let snippet = chunk.content.lines().take(5).collect::<Vec<_>>().join("\n");
+                let snippet = query_snippet(&chunk.content, &query_tokens);
                 SearchResult {
                     chunk_idx: idx,
                     score: scores[idx],
@@ -680,7 +782,16 @@ impl BM25Index {
         Ok(SaveOutcome::Persisted { compressed_bytes })
     }
 
+    /// The persisted index, only when it was admitted under the current
+    /// admission policy: chunks admitted under another policy (or a legacy
+    /// index built from raw sources) are never served or reused (G5, E3).
     pub fn load(root: &Path) -> Option<Self> {
+        let admission = crate::core::context_admission::stores::StoreAdmission::current();
+        Self::load_persisted(root)
+            .filter(|idx| idx.admission_policy.as_deref() == Some(admission.digest()))
+    }
+
+    fn load_persisted(root: &Path) -> Option<Self> {
         let dir = index_dir(root);
         let max_bytes = max_bm25_cache_bytes();
 
@@ -811,6 +922,31 @@ impl BM25Index {
             return bin;
         }
         dir.join("bm25_index.json")
+    }
+
+    /// Chunk count of the persisted index without loading it (#1914): postcard
+    /// writes `chunks` — the first field — as a varint length prefix, so only
+    /// the first few decompressed bytes are read. `None` for the legacy JSON
+    /// format or an unreadable file; `Some(0)` for an index that holds nothing.
+    pub fn persisted_chunk_count(root: &Path) -> Option<u64> {
+        use std::io::Read;
+        let path = Self::index_file_path(root);
+        let file = std::fs::File::open(&path).ok()?;
+        let mut head: Box<dyn Read> = match path.extension().and_then(|e| e.to_str()) {
+            Some("zst") => Box::new(zstd::Decoder::new(file).ok()?),
+            Some("bin") => Box::new(file),
+            _ => return None,
+        };
+        let mut count = 0u64;
+        for shift in (0..64).step_by(7) {
+            let mut byte = [0u8; 1];
+            head.read_exact(&mut byte).ok()?;
+            count |= u64::from(byte[0] & 0x7f) << shift;
+            if byte[0] & 0x80 == 0 {
+                return Some(count);
+            }
+        }
+        None
     }
 
     /// Ingest external `ContentChunk`s into the BM25 index.
@@ -1073,36 +1209,132 @@ fn index_dir(root: &Path) -> PathBuf {
     crate::core::index_namespace::vectors_dir(root)
 }
 
-fn list_code_files(root: &Path) -> Vec<String> {
-    let cfg = crate::core::config::Config::load();
-    // #735: the declared corpus filter ([index] config + CLI overlay) decides
-    // membership before anything is chunked; the semantic index chunks this
-    // corpus, so it inherits the same universe.
-    let filter = crate::core::index_filter::IndexFileFilter::resolve(&cfg);
+/// Walk depth of the corpus walk. Deeper files are never indexed.
+const CORPUS_MAX_DEPTH: usize = 20;
 
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(filter.respect_gitignore)
-        .git_global(filter.respect_gitignore)
-        .git_exclude(filter.respect_gitignore)
-        .require_git(false)
-        .max_depth(Some(20))
+/// The rules that decide corpus membership, loaded once. Shared by
+/// [`list_code_files`] and the `index why` diagnostic ([`coverage`]), so the
+/// explanation can never drift from what the indexer actually does.
+pub(crate) struct CorpusRules {
+    filter: crate::core::index_filter::IndexFileFilter,
+    /// `DEFAULT_BM25_IGNORES` followed by `extra_ignore_patterns`, with the
+    /// source text kept so a diagnostic can name the pattern that matched.
+    ignore_patterns: Vec<(String, glob::Pattern)>,
+    max_files: usize,
+}
+
+impl CorpusRules {
+    pub(crate) fn load() -> Self {
+        Self::from_config(&crate::core::config::Config::load())
+    }
+
+    fn from_config(cfg: &crate::core::config::Config) -> Self {
+        // #735: the declared corpus filter ([index] config + CLI overlay) decides
+        // membership before anything is chunked; the semantic index chunks this
+        // corpus, so it inherits the same universe.
+        let filter = crate::core::index_filter::IndexFileFilter::resolve(cfg);
+        let ignore_patterns = DEFAULT_BM25_IGNORES
+            .iter()
+            .map(|p| (*p).to_string())
+            .chain(cfg.extra_ignore_patterns.iter().cloned())
+            .filter_map(|p| glob::Pattern::new(&p).ok().map(|g| (p, g)))
+            .collect();
+        // Mirrors graph_index_max_files: 0 = unlimited, default 5000 (MAX_BM25_FILES).
+        let max_files = if cfg.bm25_max_files == 0 {
+            usize::MAX
+        } else {
+            cfg.bm25_max_files as usize
+        };
+        Self {
+            filter,
+            ignore_patterns,
+            max_files,
+        }
+    }
+
+    /// The corpus walker: gitignore per the filter, bounded depth. Callers add
+    /// their own `filter_entry`.
+    fn walker(&self, root: &Path) -> ignore::WalkBuilder {
+        let mut builder = ignore::WalkBuilder::new(root);
+        builder
+            // #1792: the BM25 corpus is authoritative for `ctx_compose`/`ctx_overview`,
+            // so omitting tracked dotfiles made "no match" indistinguishable from
+            // "not indexed".
+            .hidden(crate::core::walk_filter::SKIP_HIDDEN_IN_CONTENT_WALK)
+            .git_ignore(self.filter.respect_gitignore)
+            .git_global(self.filter.respect_gitignore)
+            .git_exclude(self.filter.respect_gitignore)
+            .require_git(false)
+            .max_depth(Some(CORPUS_MAX_DEPTH));
+        builder
+    }
+
+    /// First default/extra ignore pattern matching `rel`.
+    fn ignore_pattern_for(&self, rel: &str) -> Option<&str> {
+        self.ignore_patterns
+            .iter()
+            .find(|(_, p)| p.matches(rel))
+            .map(|(src, _)| src.as_str())
+    }
+
+    /// Whether the declared `[index]` filter drops `rel`. Globs match on
+    /// forward slashes so they behave identically on Windows; the index key
+    /// keeps the platform separator (existing indexes stay valid).
+    fn filter_excludes(&self, rel: &str) -> bool {
+        self.filter.is_excluded(&rel.replace('\\', "/"))
+    }
+}
+
+fn list_code_files(root: &Path) -> Vec<String> {
+    list_code_files_with(root, &CorpusRules::load())
+}
+
+fn list_code_files_with(root: &Path, rules: &CorpusRules) -> Vec<String> {
+    list_code_files_bounded(root, rules, false).unwrap_or_default()
+}
+
+/// The corpus walk. `bounded` (source-admission views) fails closed on a
+/// walk or file budget instead of silently truncating.
+fn list_code_files_bounded(
+    root: &Path,
+    rules: &CorpusRules,
+    bounded: bool,
+) -> Result<Vec<String>, String> {
+    list_scoped_code_files(root, rules, bounded, None, &|_| true)
+}
+
+/// [`list_code_files_bounded`] restricted to the caller's scope: the walk
+/// starts at `subdir` (project-relative) and only paths `in_scope` accepts
+/// count against the walk and file budgets. A search scoped to a 20-file
+/// directory used to walk the whole project and fail its 5000-file budget
+/// before the scope was ever applied. Returned paths stay project-relative.
+fn list_scoped_code_files(
+    root: &Path,
+    rules: &CorpusRules,
+    bounded: bool,
+    subdir: Option<&str>,
+    in_scope: &dyn Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
+    let walk_root = subdir
+        .map(|s| root.join(s))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| root.to_path_buf());
+    let walker = rules
+        .walker(&walk_root)
         .filter_entry(crate::core::walk_filter::keep_entry)
         .build();
 
-    let mut ignore_patterns: Vec<glob::Pattern> = DEFAULT_BM25_IGNORES
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-    ignore_patterns.extend(
-        cfg.extra_ignore_patterns
-            .iter()
-            .filter_map(|p| glob::Pattern::new(p).ok()),
-    );
-
     let mut files: Vec<String> = Vec::new();
     let mut filtered_out = 0usize;
-    for entry in walker.flatten() {
+    for (visited, entry) in walker.enumerate() {
+        if bounded && visited >= 100_000 {
+            return Err("source discovery budget exceeded; narrow the search scope".into());
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) if bounded => return Err("source discovery could not be completed".into()),
+            Err(_) => continue,
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -1118,19 +1350,28 @@ fn list_code_files(root: &Path) -> Vec<String> {
         if rel.is_empty() {
             continue;
         }
-        if ignore_patterns.iter().any(|p| p.matches(&rel)) {
+        if rules.ignore_pattern_for(&rel).is_some() {
             continue;
         }
-        // Match on forward slashes so globs behave identically on Windows;
-        // the index key keeps the platform separator (existing indexes stay
-        // valid).
-        if filter.is_excluded(&rel.replace('\\', "/")) {
+        if rules.filter_excludes(&rel) {
             filtered_out += 1;
             continue;
         }
-        if files.len() >= MAX_BM25_FILES {
+        if !in_scope(&rel) {
+            continue;
+        }
+        if files.len() >= rules.max_files {
+            if bounded {
+                return Err(format!(
+                    "source file budget exceeded ({} files); narrow the search with path=, \
+                     languages= or a glob, or raise bm25_max_files (0 = unlimited)",
+                    rules.max_files
+                ));
+            }
             tracing::warn!(
-                "[bm25] file cap reached ({MAX_BM25_FILES}), skipping remaining files in {}",
+                "[bm25] file cap reached ({}), skipping remaining files in {}. \
+                 Set bm25_max_files in config (0 = unlimited) to index more.",
+                rules.max_files,
                 root.display()
             );
             break;
@@ -1141,13 +1382,13 @@ fn list_code_files(root: &Path) -> Vec<String> {
     if filtered_out > 0 {
         tracing::info!(
             "[bm25] index filter excluded {filtered_out} files ({})",
-            filter.summary().unwrap_or_default()
+            rules.filter.summary().unwrap_or_default()
         );
     }
 
     files.sort();
     files.dedup();
-    files
+    Ok(files)
 }
 
 pub fn is_code_file(path: &Path) -> bool {

@@ -48,24 +48,8 @@ fn is_cache_stale(cache: &VersionCache) -> bool {
 }
 
 fn fetch_latest_version() -> Result<String, String> {
-    let agent = crate::core::http_client::ureq_agent(
-        ureq::config::Config::builder()
-            .tls_config(crate::core::http_client::platform_tls_config())
-            .timeout_global(Some(std::time::Duration::from_secs(5)))
-            .build(),
-    );
-
-    let body = agent
-        .get(GITHUB_API_RELEASES)
-        .header("User-Agent", &format!("lean-ctx/{CURRENT_VERSION}"))
-        .header("Accept", "application/vnd.github.v3+json")
-        .call()
-        .map_err(|e| e.to_string())?
-        .into_body()
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
-
-    let release: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    // Same client as `lean-ctx update`: token-aware and rate-limit aware (#2037).
+    let release = crate::core::updater::github_api_json(GITHUB_API_RELEASES)?;
     let tag = release["tag_name"]
         .as_str()
         .ok_or_else(|| "missing tag_name in GitHub releases response".to_string())?;
@@ -77,9 +61,13 @@ fn fetch_latest_version() -> Result<String, String> {
     Ok(version)
 }
 
-fn is_newer(latest: &str, current: &str) -> bool {
-    let parse =
-        |v: &str| -> Vec<u32> { v.split('.').filter_map(|p| p.parse::<u32>().ok()).collect() };
+pub(crate) fn is_newer(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> {
+        v.trim_start_matches('v')
+            .split('.')
+            .filter_map(|p| p.parse::<u32>().ok())
+            .collect()
+    };
     parse(latest) > parse(current)
 }
 

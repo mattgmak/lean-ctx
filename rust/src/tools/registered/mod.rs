@@ -69,6 +69,7 @@ pub mod ctx_rules;
 pub mod ctx_search;
 pub mod ctx_semantic_search;
 pub mod ctx_session;
+pub mod ctx_shape;
 pub mod ctx_share;
 pub mod ctx_shell;
 mod ctx_shell_background;
@@ -83,6 +84,7 @@ pub mod ctx_transcript_compact;
 pub mod ctx_tree;
 pub mod ctx_url_read;
 pub mod ctx_verify;
+pub mod ctx_work_graph;
 pub mod ctx_workflow;
 pub mod shell_alias;
 

@@ -50,13 +50,74 @@ pub(crate) fn shell_allowlist_outcome() -> Outcome {
         };
     }
 
+    let invalid = crate::core::shell_allowlist::invalid_allowlist_entries_pub();
+    let invalid_note = if invalid.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  {YELLOW}{} invalid entr{} dropped (`*` must be a trailing token){RST}",
+            invalid.len(),
+            if invalid.len() == 1 { "y" } else { "ies" }
+        )
+    };
+
     Outcome {
         ok: true,
         line: format!(
-            "{BOLD}Shell allowlist{RST}  {GREEN}{} command(s) enforced{RST}  {DIM}(add one: lean-ctx allow <cmd>){RST}",
+            "{BOLD}Shell allowlist{RST}  {GREEN}{} command(s) enforced{RST}  {DIM}(add one: lean-ctx allow <cmd>){RST}{invalid_note}",
             effective.len()
         ),
     }
+}
+
+/// GH #1419 follow-up: upgrade advisory — multi-word entries with no
+/// trailing `*` whose meaning changed under subcommand scoping (exact match
+/// only, previously "whole binary"). Read-only; `--fix` deliberately does
+/// NOT add the `*` automatically, since that would widen access — the user
+/// must choose. `None` when there's nothing to report.
+pub(crate) fn shell_allowlist_upgrade_advisory_outcome() -> Option<Outcome> {
+    let narrowed = crate::core::shell_allowlist::narrowed_allowlist_entries_pub();
+    if narrowed.is_empty() {
+        return None;
+    }
+    Some(Outcome {
+        ok: true,
+        line: format!(
+            "{BOLD}Shell allowlist upgrade{RST}  {YELLOW}{} entr{} now match only the exact command{RST}  {DIM}({} — add a trailing `*` if prefix matching was intended){RST}",
+            narrowed.len(),
+            if narrowed.len() == 1 { "y" } else { "ies" },
+            narrowed.join(", ")
+        ),
+    })
+}
+
+/// GH #1419 follow-up: shadowing advisory — a broader entry (e.g. the
+/// default `"git"`) makes a narrower one (`"git status"`) useless. Entries
+/// are a permissive union, so this only warns; it never refuses. `None`
+/// when there's nothing to report.
+pub(crate) fn shell_allowlist_shadowing_outcome() -> Option<Outcome> {
+    let effective = crate::core::shell_allowlist::effective_allowlist_pub();
+    let shadowed = crate::core::shell_allowlist::shadowed_allowlist_entries_pub(&effective);
+    if shadowed.is_empty() {
+        return None;
+    }
+    let detail = shadowed
+        .iter()
+        .map(|(a, b)| format!("'{a}' has no effect (covered by '{b}')"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(Outcome {
+        ok: true,
+        line: format!(
+            "{BOLD}Shell allowlist shadowing{RST}  {YELLOW}{} entr{} shadowed{RST}  {DIM}({detail}){RST}",
+            shadowed.len(),
+            if shadowed.len() == 1 {
+                "y is"
+            } else {
+                "ies are"
+            }
+        ),
+    })
 }
 /// Reports the effective PathJail state (GH #392): which knob (if any)
 /// disabled it, and whether configured `allow_paths`/`extra_roots` entries
@@ -235,6 +296,35 @@ pub(crate) fn secret_detection_outcome() -> Outcome {
         ),
     }
 }
+
+/// Reports Context Gateway admission: which built-in detectors run on every
+/// agent read before caching or compression, and how each one acts.
+pub(crate) fn context_gateway_outcome() -> Outcome {
+    let cfg = crate::core::config::Config::load_arc();
+    let gw = &cfg.context_gateway;
+    if !gw.enabled_effective() {
+        return Outcome {
+            ok: true,
+            line: format!(
+                "{BOLD}Context gateway{RST}  {YELLOW}off{RST}  {DIM}(reads reach caches and the model without admission; re-enable: [context_gateway] enabled = true){RST}"
+            ),
+        };
+    }
+    let secrets = if cfg.secret_detection.enabled {
+        gw.secrets.as_str()
+    } else {
+        "off"
+    };
+    Outcome {
+        ok: true,
+        line: format!(
+            "{BOLD}Context gateway{RST}  {GREEN}on{RST}  {DIM}(secrets={secrets} pii={} injection={} classification={} — admitted before cache/compression){RST}",
+            gw.pii.as_str(),
+            gw.injection.as_str(),
+            gw.classification.as_str(),
+        ),
+    }
+}
 /// Reports IDE permission inheritance: when on, lean-ctx mirrors the host IDE's
 /// bash/read/edit/grep permission rules onto its own tools, so `ctx_shell` honors
 /// a `rm *: ask`/`deny` rule instead of forming a parallel, ungoverned path.
@@ -275,10 +365,10 @@ pub(crate) fn managed_addon_binaries_outcome() -> Option<Outcome> {
     None
 }
 
-/// Managed ONNX Runtime state (GH #732). Only rendered on embedding-enabled
-/// builds; `None` when the runtime is simply not provisioned (embeddings are
-/// opt-in — a missing optional runtime is not a finding, the provision hint
-/// lives in the embeddings CLI and the resolver error).
+/// Managed ONNX Runtime state (GH #732). The managed runtime was removed, so
+/// this is always `None`: embeddings are opt-in and a missing optional runtime
+/// is not a finding — `lean-ctx embeddings status` and the resolver error
+/// explain how to point `ORT_DYLIB_PATH` at an installed runtime.
 pub(crate) fn managed_ort_outcome() -> Option<Outcome> {
     None
 }

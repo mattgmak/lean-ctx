@@ -1,16 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rmcp::ErrorData;
 use rmcp::model::Tool;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use crate::core::cache::ReuseOutcome;
 use crate::server::tool_trait::{
     McpTool, ToolContext, ToolOutput, get_bool, get_f64, get_int, get_str, get_str_array,
     require_resolved_path,
 };
-use crate::tool_defs::tool_def;
 
 /// Per-file lock that serializes concurrent reads of the same path.
 ///
@@ -28,108 +29,50 @@ fn per_file_lock(path: &str) -> Arc<Mutex<()>> {
 
 pub struct CtxReadTool;
 
-impl McpTool for CtxReadTool {
-    fn name(&self) -> &'static str {
-        "ctx_read"
-    }
+#[path = "ctx_read_delivery.rs"]
+mod delivery;
+use delivery::{
+    CacheSourceIdentity, PendingCacheDelivery, PendingCrossAgentDelivery, PendingReadDelivery,
+};
 
-    fn tool_def(&self) -> Tool {
-        tool_def(
-            "ctx_read",
-            "Read source files. mode recommended — choose by intent (see `mode` below); defaults to auto when omitted.\n\
-             To UNDERSTAND code run ctx_compose FIRST; ctx_read after it identified files.\n\
-             anchored → edit by reference via ctx_patch (no exact-recall).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Absolute path" },
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Batch read" },
-                    "mode": {
-                        "type": "string",
-                        "description": "Recommended (defaults to auto). full=verbatim(edit-ready) anchored=full+N:hh|anchors(edit via ctx_patch) raw=exact-bytes signatures=API map=structure auto=smart diff=cache-delta lines:N-M=window -N=tail 5,10-20=multi reference=quotes task=focus"
-                    },
-                    "raw": { "type": "boolean", "description": "Verbatim (= mode=raw + fresh)" },
-                    "start_line": { "type": "integer", "description": "1-based" },
-                    "offset": { "type": "integer", "description": "start_line alias" },
-                    "limit": { "type": "integer", "description": "Max lines" },
-                    "fresh": { "type": "boolean", "description": "Bypass cache" },
-                    "aggressiveness": { "type": "number", "description": "0.0–1.0 density (entropy/task)" },
-                    "protect": { "type": "array", "items": { "type": "string" }, "description": "Symbols kept verbatim" },
-                    "engine_interface": engine::interface_schema()
-                },
-                "required": []
-            }),
-        )
-    }
+pub(super) struct PreparedRead {
+    pub(super) output: ToolOutput,
+    delivery: Option<PendingReadDelivery>,
+}
 
-    fn handle(
-        &self,
-        args: &Map<String, Value>,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ErrorData> {
-        let engine_interface_v1 = engine::interface_v1_requested(args)?;
-        engine::validate_v1_request_shape(args, engine_interface_v1)?;
-        // #509: ctx_read absorbs multi-file batch reads (supersedes ctx_multi_read).
-        // A non-empty `paths` array routes to the one shared batch implementation.
-        if args
-            .get("paths")
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty())
-        {
-            let result = super::ctx_multi_read::batch_read(args, ctx);
-            if let Ok(output) = &result {
-                record_attribution_result(ctx, "ctx_read batch".to_string(), output);
-            }
-            return result;
+impl PreparedRead {
+    pub(super) fn commit(self, ctx: &ToolContext, record_agent_budget: bool) -> ToolOutput {
+        if let Some(delivery) = self.delivery {
+            delivery.commit(ctx, &self.output, record_agent_budget);
         }
-
-        let path = if let Some(repo) = get_str(args, "repo") {
-            let root = crate::core::multi_repo::resolve_repo_root(&repo).ok_or_else(|| {
-                let known = crate::core::multi_repo::known_aliases().join(", ");
-                let known = if known.is_empty() {
-                    "none registered — use ctx_multi_repo add_root".to_string()
-                } else {
-                    known
-                };
-                ErrorData::invalid_params(
-                    format!("unknown repo alias: {repo} (known: {known})"),
-                    None,
-                )
-            })?;
-            let rel = get_str(args, "path").unwrap_or_else(|| ".".to_string());
-            crate::core::path_resolve::resolve_tool_path(Some(&root), None, &rel)
-                .map_err(|e| ErrorData::invalid_params(e, None))?
-        } else {
-            require_resolved_path(ctx, args, "path")?
-        };
-
-        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.handle_inner(args, ctx, &path, engine_interface_v1)
-        })) {
-            Ok(result) => result,
-            Err(_) => Err(ErrorData::internal_error(
-                format!(
-                    "ctx_read panicked while processing '{path}'. This is a bug — please report it."
-                ),
-                None,
-            )),
-        };
-        if let Ok(output) = &result {
-            record_attribution_result(ctx, format!("ctx_read {path}"), output);
-        }
-        result
+        self.output
     }
 }
 
+#[path = "ctx_read_dispatch.rs"]
+mod dispatch;
+
 impl CtxReadTool {
     #[allow(clippy::unused_self)]
-    fn handle_inner(
+    pub(super) fn handle_inner(
         &self,
         args: &Map<String, Value>,
         ctx: &ToolContext,
         path: &str,
         engine_interface_v1: bool,
     ) -> Result<ToolOutput, ErrorData> {
+        self.handle_inner_prepared(args, ctx, path, engine_interface_v1)
+            .map(|prepared| prepared.commit(ctx, true))
+    }
+
+    #[allow(clippy::unused_self)]
+    pub(super) fn handle_inner_prepared(
+        &self,
+        args: &Map<String, Value>,
+        ctx: &ToolContext,
+        path: &str,
+        engine_interface_v1: bool,
+    ) -> Result<PreparedRead, ErrorData> {
         let session_lock = ctx
             .session
             .as_ref()
@@ -182,7 +125,7 @@ impl CtxReadTool {
         // force a fresh disk read below so a re-read never collapses to an
         // `[unchanged]`/auto-delta stub. An explicit raw flag wins over `mode`.
         let arg_raw = get_bool(args, "raw").unwrap_or(false);
-        let explicit_mode_arg = resolve_raw_alias(arg_raw, get_str(args, "mode"));
+        let explicit_mode_arg = resolve_explicit_mode(arg_raw, get_str(args, "mode"));
         let explicit_mode = explicit_mode_arg.is_some();
         // #1209: a malformed line-range payload (e.g. `lines:44:48` with a colon
         // instead of a dash) must fail loudly, not silently return an empty
@@ -222,6 +165,11 @@ impl CtxReadTool {
             "full",
         );
         let mut fresh = get_bool(args, "fresh").unwrap_or(false);
+        // Reacquire original bytes under current rules; an older compressed
+        // view can have omitted the classification marker that now blocks it.
+        if crate::core::policy::runtime::is_active() {
+            fresh = true;
+        }
         // #513: a raw/verbatim request always reads from disk — the whole point
         // is exact current bytes, never a cached stub or delta.
         if arg_raw || engine_interface_v1 {
@@ -259,20 +207,41 @@ impl CtxReadTool {
             get_int(args, "limit"),
         );
 
+        // A concrete per-call request outranks saved views and adaptive heuristics.
+        // `auto` explicitly delegates the choice; mandatory admission still runs.
+        let pinned_mode = explicit_mode && mode != "auto";
+        if pinned_mode
+            && (matches!(mode.as_str(), "raw" | "full" | "full-compact")
+                || mode.starts_with("lines:")
+                || mode.starts_with("anchored"))
+        {
+            // Exact/full requests must not collapse to a cache stub or a delta,
+            // including when the older delta_explicit preference is enabled.
+            fresh = true;
+        }
+
         let pressure_action = ctx.pressure_snapshot.as_ref().map(|p| &p.recommendation);
         let resolved_agent_id = ctx.agent_id.as_ref().and_then(|a| match a.try_read() {
             Ok(guard) => guard.clone(),
             Err(_) => None,
         });
-        let gate_result = crate::server::context_gate::pre_dispatch_read_for_agent(
-            path,
-            &mode,
-            task_ref,
-            Some(&ctx.project_root),
-            pressure_action,
-            resolved_agent_id.as_deref(),
-            fresh,
-        );
+        let gate_result = if pinned_mode {
+            crate::server::context_gate::pre_dispatch_pinned_read_for_agent(
+                path,
+                &mode,
+                resolved_agent_id.as_deref(),
+            )
+        } else {
+            crate::server::context_gate::pre_dispatch_read_for_agent(
+                path,
+                &mode,
+                task_ref,
+                Some(&ctx.project_root),
+                pressure_action,
+                resolved_agent_id.as_deref(),
+                fresh,
+            )
+        };
         let mut engine_policy_admission = engine::admission_or_reject(
             engine_interface_v1,
             &gate_result,
@@ -307,7 +276,11 @@ impl CtxReadTool {
         let (mut mode, degrade_warning) =
             if instruction_mode_note.is_some() || instruction_mode != mode {
                 (instruction_mode, None)
-            } else if mode == "raw" || mode.starts_with("anchored") || mode.starts_with("lines:") {
+            } else if pinned_mode
+                || mode == "raw"
+                || mode.starts_with("anchored")
+                || mode.starts_with("lines:")
+            {
                 // #513: raw bypasses context-pressure degradation (which would
                 // otherwise downgrade to signatures under Block), exactly like
                 // instruction files — explicit lossless modes mean lossless.
@@ -362,8 +335,36 @@ impl CtxReadTool {
             path,
             &mut engine_policy_admission,
         )?;
+        // A directory has no text to read; failing with the OS error ("Is a
+        // directory") left the agent guessing. Answer with its entries, as
+        // ctx_tree would, so the next call can name a file.
+        if !engine_interface_v1 && std::path::Path::new(path).is_dir() {
+            let (tree, _) = crate::tools::ctx_tree::handle(path, 1, false, true);
+            if tree.starts_with("ERROR:") {
+                return Err(ErrorData::invalid_params(tree, None));
+            }
+            return Ok(PreparedRead {
+                output: ToolOutput::simple(format!(
+                    "{path} is a directory — pass one of its files to ctx_read:\n{tree}"
+                )),
+                delivery: None,
+            });
+        }
         if crate::core::binary_detect::is_llm_viewable_image(path) {
-            return read_image_file(path);
+            // Text detectors cannot inspect pixels: the gateway says so, and
+            // withholds the image where every detector is mandatory.
+            let bytes = std::fs::metadata(path).map_or(0, |meta| meta.len());
+            let note = crate::core::context_admission::admit_media(path, bytes)
+                .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+            return read_image_file(path).map(|mut output| {
+                if let (Some(note), Some(blocks)) = (note, output.content_blocks.as_mut()) {
+                    blocks.push(rmcp::model::ContentBlock::text(note));
+                }
+                PreparedRead {
+                    output,
+                    delivery: None,
+                }
+            });
         }
         if !engine_interface_v1 && crate::core::binary_detect::is_binary_file(path) {
             let msg = crate::core::binary_detect::binary_file_message(path);
@@ -401,12 +402,13 @@ impl CtxReadTool {
         let read_timeout = std::time::Duration::from_secs(30);
         let cancelled = Arc::new(AtomicBool::new(false));
         let engine_snapshot = engine::SourceSnapshot::default();
+        let pending_cache = Arc::new(Mutex::new(PendingCacheDelivery::default()));
         // Hash once for cross-agent delivery (avoids re-reading on record).
         let delivery_metadata = (!engine_interface_v1
             && crate::core::config::Config::load().ocla.delivery_enabled())
         .then(|| crate::tools::ctx_read::file_blake3_prefix(path))
         .flatten();
-        let (output, resolved_mode, original, is_cache_hit, file_ref, cache_stats, reuse_outcome) = {
+        let (output, resolved_mode, original, is_cache_hit, file_ref, _cache_stats, reuse_outcome) = {
             let crp_mode = ctx.crp_mode;
             let fast_result = 'fast: {
                 let file_lock = per_file_lock(path);
@@ -465,29 +467,33 @@ impl CtxReadTool {
                 let project_root_owned = ctx.project_root.clone();
                 let cancel_flag = cancelled.clone();
                 let snapshot_worker = engine_snapshot.clone();
+                let pending_cache_worker = pending_cache.clone();
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                std::thread::spawn(move || {
+                crate::core::task_spine::TaskSpine::spawn_thread(move || {
                     let file_lock = per_file_lock(&path_owned);
 
+                    // The per-file lock only deduplicates concurrent reads of
+                    // one file. When an earlier read holds it past the
+                    // deadline (an abandoned read of a huge file, a slow
+                    // mount), this read proceeds without it: duplicate work
+                    // beats failing the call — the cache store below has its
+                    // own lock, and "retry in a moment" met the same holder.
                     let _file_guard = {
                         let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(25);
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
                         loop {
                             if cancel_flag.load(Ordering::Relaxed) {
                                 return;
                             }
                             if let Ok(guard) = file_lock.try_lock() {
-                                break guard;
+                                break Some(guard);
                             }
                             if std::time::Instant::now() >= deadline {
-                                tracing::error!(
-                                    "ctx_read: per-file lock timeout after 25s for {path_owned}"
+                                tracing::warn!(
+                                    "ctx_read: per-file lock still held after 10s for \
+                                     {path_owned}, reading without it"
                                 );
-                                let _ = tx.send((
-                                    format!("per-file lock contention for {path_owned} — retry in a moment"),
-                                    "error".to_string(), 0, false, None, (0, 0), ReuseOutcome::Cold,
-                                ));
-                                return;
+                                break None;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(50));
                         }
@@ -532,12 +538,17 @@ impl CtxReadTool {
                     // agent's own delivery always wins. On a miss, a verified
                     // cross-agent delivery can avoid the disk read below.
                     if !crate::tools::ctx_read::effective_fresh_for_delivery(fresh)
-                        && let Some((hash, mtime)) = delivery_metadata
+                        && let Some(fp) = delivery_metadata
                         && let Some(read_output) = crate::tools::ctx_read::try_cross_agent_stub(
                             &path_owned,
                             &mode,
-                            hash,
-                            mtime,
+                            fp.hash,
+                            fp.mtime,
+                            crp_mode,
+                            crate::tools::ctx_read::ReadTuning::resolve(
+                                aggressiveness,
+                                &protect_owned,
+                            ),
                         )
                     {
                         let _ = tx.send((
@@ -600,27 +611,68 @@ impl CtxReadTool {
                     let tuning =
                         crate::tools::ctx_read::ReadTuning::resolve(aggressiveness, &protect_owned);
 
-                    // Helper: acquire write lock with deadline.
+                    // Helper: acquire write lock with deadline. `None` means the
+                    // lock stayed contended past the deadline; callers degrade
+                    // to an uncached read instead of failing it (#1925).
                     macro_rules! acquire_write {
                         ($deadline_secs:expr, $label:expr) => {{
-                            let deadline = std::time::Instant::now()
-                                + std::time::Duration::from_secs($deadline_secs);
+                            let deadline =
+                                std::time::Instant::now() + cache_lock_deadline($deadline_secs);
                             loop {
                                 if cancel_flag.load(Ordering::Relaxed) {
                                     return;
                                 }
                                 if let Ok(guard) = cache_lock.try_write() {
-                                    break guard;
+                                    break Some(guard);
                                 }
                                 if std::time::Instant::now() >= deadline {
-                                    tracing::error!(
-                                        "ctx_read: cache write-lock timeout ({}) for {path_owned}",
+                                    tracing::warn!(
+                                        "ctx_read: cache write-lock timeout ({}) for {path_owned}, \
+                                         serving uncached",
                                         $label,
                                     );
+                                    break None;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                        }};
+                    }
+
+                    // Work that needs no cache state runs before the write lock
+                    // (#1925). The first `count_tokens` call builds the BPE tables
+                    // (seconds in debug builds); done under the lock it starved
+                    // every concurrent read into the deadline. Counting the
+                    // preread here also turns the count inside `cache.store()`
+                    // into a token-cache hit.
+                    let preread_tokens = preread.as_deref().map(crate::core::tokens::count_tokens);
+                    let mode_eff = if mode != "raw"
+                        && !mode.starts_with("lines:")
+                        && crate::core::config::Config::load()
+                            .proxy
+                            .is_path_compress_protected(&path_owned)
+                    {
+                        "full".to_string()
+                    } else {
+                        mode.clone()
+                    };
+
+                    // 2b-i: Brief write lock — prepare cache state, resolve
+                    // mode, check for hits. Sub-millisecond: HashMap lookups,
+                    // staleness checks, raw-content storage for new files.
+                    let (outcome, source_identity) = 'prepare: {
+                        let Some(mut cache) = acquire_write!(10, "prepare 10s") else {
+                            match prepare_uncached(
+                                preread,
+                                preread_tokens,
+                                &path_owned,
+                                &mode_eff,
+                                &tuning,
+                                task_ref,
+                            ) {
+                                Ok(uncached) => break 'prepare (uncached, None),
+                                Err(msg) => {
                                     let _ = tx.send((
-                                        format!(
-                                            "cache lock contention for {path_owned} — retry in a moment"
-                                        ),
+                                        msg,
                                         "error".into(),
                                         0,
                                         false,
@@ -630,36 +682,8 @@ impl CtxReadTool {
                                     ));
                                     return;
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(50));
                             }
-                        }};
-                    }
-
-                    // 2b-i: Brief write lock — prepare cache state, resolve
-                    // mode, check for hits. Sub-millisecond: HashMap lookups,
-                    // staleness checks, raw-content storage for new files.
-                    #[allow(clippy::large_enum_variant)]
-                    enum PrepareOutcome {
-                        Hit(
-                            String,
-                            String,
-                            usize,
-                            bool,
-                            Option<String>,
-                            (u64, u64),
-                            ReuseOutcome,
-                        ),
-                        Compute {
-                            file_ref: String,
-                            resolved_mode: String,
-                            content: String,
-                            original_tokens: usize,
-                            reuse_outcome: ReuseOutcome,
-                        },
-                    }
-
-                    let outcome = {
-                        let mut cache = acquire_write!(10, "prepare 10s");
+                        };
                         let mut reuse_outcome = if cache_policy_bypassed {
                             ReuseOutcome::PolicyBypass
                         } else if fresh {
@@ -668,27 +692,12 @@ impl CtxReadTool {
                             ReuseOutcome::Cold
                         };
 
-                        if let Ok(mut bt) = crate::core::bounce_tracker::global().lock() {
-                            bt.next_seq();
-                        }
-
                         let file_ref = cache.get_file_ref(&path_owned);
 
                         let effective_fresh = fresh
                             || crate::tools::ctx_read::force_fresh_env()
                             || (crate::tools::ctx_read::is_subagent_context()
                                 && !crate::core::conversation::scope_enabled());
-
-                        let mode_eff = if mode != "raw"
-                            && !mode.starts_with("lines:")
-                            && crate::core::config::Config::load()
-                                .proxy
-                                .is_path_compress_protected(&path_owned)
-                        {
-                            "full".to_string()
-                        } else {
-                            mode.clone()
-                        };
 
                         if effective_fresh {
                             cache.invalidate(&path_owned);
@@ -727,22 +736,26 @@ impl CtxReadTool {
                         // "[WARNING: unknown mode 'diff']" and return the entire
                         // file — while the CLI path handled it correctly. Both
                         // paths now share `handle_diff`.
-                        if mode_eff == "diff" {
-                            let (out, _sent) = if fresh {
+                        let outcome = if mode_eff == "diff" {
+                            let (out, _sent, baseline) = if fresh {
                                 let warning = "[warning] fresh+diff is redundant — fresh invalidates the cache, so no baseline is left to diff against. Use mode=full with fresh=true instead.";
                                 (
                                     warning.to_string(),
                                     crate::core::tokens::count_tokens(warning),
+                                    None,
                                 )
                             } else {
-                                crate::tools::ctx_read::handle_diff(
-                                    &mut cache,
-                                    &path_owned,
-                                    &file_ref,
-                                )
+                                crate::tools::ctx_read::prepare_diff(&cache, &path_owned, &file_ref)
                             };
                             let out = crate::core::redaction::redact_text_if_enabled(&out);
-                            let orig = cache.get(&path_owned).map_or(0, |e| e.original_tokens);
+                            let orig = baseline.as_deref().map_or_else(
+                                || cache.get(&path_owned).map_or(0, |e| e.original_tokens),
+                                crate::core::tokens::count_tokens,
+                            );
+                            pending_cache_worker
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .diff_baseline = baseline;
                             let fref = cache.file_ref_map().get(path_owned.as_str()).cloned();
                             let s = cache.get_stats();
                             PrepareOutcome::Hit(
@@ -788,12 +801,15 @@ impl CtxReadTool {
                                     ReuseOutcome::UnchangedStub,
                                 )
                             } else if crate::tools::ctx_read::is_cacheable_mode(&resolved) {
-                                let ck = crate::tools::ctx_read::compressed_cache_key(
-                                    &resolved,
-                                    crp_mode,
-                                    task_ref,
-                                    tuning.aggressiveness,
-                                    tuning.protect,
+                                let ck = crate::tools::ctx_read::request_scoped_key(
+                                    crate::tools::ctx_read::compressed_cache_key(
+                                        &resolved,
+                                        crp_mode,
+                                        task_ref,
+                                        tuning.aggressiveness,
+                                        tuning.protect,
+                                    ),
+                                    mode == "auto",
                                 );
                                 if let Some(hit) = cache.get_compressed(&path_owned, &ck).cloned() {
                                     crate::core::auto_mode_resolver::count_source(
@@ -828,6 +844,7 @@ impl CtxReadTool {
                                         content: c.unwrap_or_default(),
                                         original_tokens: orig_tok,
                                         reuse_outcome,
+                                        cacheable: true,
                                     }
                                 }
                             } else {
@@ -839,6 +856,7 @@ impl CtxReadTool {
                                     content: c.unwrap_or_default(),
                                     original_tokens: orig_tok,
                                     reuse_outcome,
+                                    cacheable: true,
                                 }
                             }
                         } else {
@@ -851,8 +869,8 @@ impl CtxReadTool {
                                             "ctx_read: skipping cache for empty content: {path_owned}"
                                         );
                                         let _ = tx.send((
-                                            format!("File is empty: {path_owned}"),
-                                            "error".into(),
+                                            empty_file_notice(&path_owned),
+                                            "full".into(),
                                             0,
                                             false,
                                             None,
@@ -898,18 +916,27 @@ impl CtxReadTool {
                                 content: raw,
                                 original_tokens: sr.original_tokens,
                                 reuse_outcome,
+                                cacheable: true,
                             }
-                        }
+                        };
+                        let identity = cache.get(&path_owned).map(CacheSourceIdentity::from_entry);
+                        (outcome, identity)
                     }; // write lock released
 
                     if let PrepareOutcome::Hit(c, rm, orig, hit, fref, ss, reuse_outcome) = outcome
                     {
                         // Update last_mode for compressed-cache hits so the auto-mode
                         // resolver can reuse this mode on future re-reads (#E26).
-                        let mut cache = acquire_write!(10, "hit last_mode 10s");
-                        if let Some(entry) = cache.get_mut(&path_owned) {
-                            entry.last_mode.clone_from(&rm);
-                        }
+                        let mut pending = pending_cache_worker
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let diff_baseline = pending.diff_baseline.take();
+                        *pending = PendingCacheDelivery {
+                            identity: source_identity,
+                            last_mode: Some(rm.clone()),
+                            diff_baseline,
+                            ..PendingCacheDelivery::default()
+                        };
                         let _ = tx.send((c, rm, orig, hit, fref, ss, reuse_outcome));
                         return;
                     }
@@ -919,6 +946,7 @@ impl CtxReadTool {
                         content: compute_content,
                         original_tokens,
                         reuse_outcome,
+                        cacheable,
                     } = outcome
                     else {
                         unreachable!()
@@ -938,6 +966,9 @@ impl CtxReadTool {
                         .and_then(|e| e.to_str())
                         .unwrap_or("");
 
+                    let source_hash = blake3::hash(compute_content.as_bytes());
+                    let mut source_fingerprint = [0u8; 12];
+                    source_fingerprint.copy_from_slice(&source_hash.as_bytes()[..12]);
                     let (mut computed, rmode) = if resolved_mode == "full"
                         || resolved_mode == "full-compact"
                     {
@@ -968,6 +999,10 @@ impl CtxReadTool {
                             (out, "full".to_string())
                         }
                     } else {
+                        // #1910: a fallback inside an `auto` read returns the
+                        // bare file, bannerless.
+                        let _auto_guard = (mode == "auto")
+                            .then(crate::tools::ctx_read::render::AutoRequestGuard::new);
                         let (out, _) = crate::tools::ctx_read::process_mode_tuned(
                             &compute_content,
                             &resolved_mode,
@@ -996,83 +1031,57 @@ impl CtxReadTool {
                     };
 
                     computed = crate::core::redaction::redact_text_if_enabled(&computed);
+                    if let Some(note) = crate::core::context_admission::note_for(&compute_content) {
+                        computed.push('\n');
+                        computed.push_str(&note);
+                    }
 
                     if cancel_flag.load(Ordering::Relaxed) {
                         return;
                     }
 
-                    // 2b-iii: Brief write lock — store result + metadata.
-                    // Sub-millisecond: HashMap insert + stats snapshot.
-                    // Graceful degradation: if the lock cannot be acquired
-                    // within 5s, return the result without caching it.
-                    {
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
-                        let cache_guard = loop {
-                            if cancel_flag.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            if let Ok(g) = cache_lock.try_write() {
-                                break Some(g);
-                            }
-                            if std::time::Instant::now() >= deadline {
-                                tracing::warn!(
-                                    "ctx_read: store-lock timeout (5s) for {path_owned},                                      returning without caching"
-                                );
-                                break None;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                    // Warming source bytes is acquisition; variants/full flags imply
+                    // delivery and are committed only if this result is included.
+                    // An uncached fallback (`F?` ref, #1925) never feeds the cache.
+                    let compressed_variant = (cacheable
+                        && crate::tools::ctx_read::is_cacheable_mode(&rmode))
+                    .then(|| {
+                        // #1910: an `auto` request's fallback is bannerless, an
+                        // explicit one is not — they must never share a variant.
+                        let key = crate::tools::ctx_read::request_scoped_key(
+                            crate::tools::ctx_read::compressed_cache_key(
+                                &rmode,
+                                crp_mode,
+                                task_ref,
+                                tuning.aggressiveness,
+                                tuning.protect,
+                            ),
+                            mode == "auto",
+                        );
+                        (key, computed.clone())
+                    });
+                    *pending_cache_worker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        PendingCacheDelivery {
+                            identity: source_identity,
+                            compressed_variant,
+                            full_content: cacheable
+                                && matches!(rmode.as_str(), "full" | "full-compact"),
+                            source_fingerprint: Some(source_fingerprint),
+                            last_mode: cacheable.then(|| rmode.clone()),
+                            record_bounce_read: true,
+                            diff_baseline: None,
                         };
-
-                        if let Some(mut cache) = cache_guard {
-                            if crate::tools::ctx_read::is_cacheable_mode(&rmode) {
-                                let ck = crate::tools::ctx_read::compressed_cache_key(
-                                    &rmode,
-                                    crp_mode,
-                                    task_ref,
-                                    tuning.aggressiveness,
-                                    tuning.protect,
-                                );
-                                cache.set_compressed(&path_owned, &ck, computed.clone());
-                            }
-                            if rmode == "full" || rmode == "full-compact" {
-                                cache.mark_full_delivered(&path_owned);
-                            }
-                            if let Some(entry) = cache.get_mut(&path_owned) {
-                                entry.last_mode.clone_from(&rmode);
-                            }
-                            if let Ok(mut bt) = crate::core::bounce_tracker::global().lock() {
-                                bt.record_read(
-                                    &path_owned,
-                                    &rmode,
-                                    crate::core::tokens::count_tokens(&computed),
-                                    original_tokens,
-                                );
-                            }
-                            let orig = cache.get(&path_owned).map_or(0, |e| e.original_tokens);
-                            let fref = cache.file_ref_map().get(path_owned.as_str()).cloned();
-                            let s = cache.get_stats();
-                            let _ = tx.send((
-                                computed,
-                                rmode,
-                                orig,
-                                false,
-                                fref,
-                                (s.total_reads(), s.cache_hits()),
-                                reuse_outcome,
-                            ));
-                        } else {
-                            let _ = tx.send((
-                                computed,
-                                rmode,
-                                original_tokens,
-                                false,
-                                None,
-                                (0, 0),
-                                reuse_outcome,
-                            ));
-                        }
-                    }
+                    let _ = tx.send((
+                        computed,
+                        rmode,
+                        original_tokens,
+                        false,
+                        Some(file_ref),
+                        (0, 0),
+                        reuse_outcome,
+                    ));
                 });
                 if let Ok(result) = rx.recv_timeout(read_timeout) {
                     result
@@ -1108,214 +1117,55 @@ impl CtxReadTool {
             return Err(ErrorData::invalid_params(output, None));
         }
 
-        let engine_warning =
-            engine_snapshot.record_if_enabled(&ctx.project_root, engine_policy_admission);
+        let mut output = output;
+        // Raw and receipt-backed contracts retain their exact payload. Only a
+        // newly acquired source can produce a current optional Pro hint.
+        let code_hint = if !engine_interface_v1 && resolved_mode != "raw" && !is_cache_hit {
+            engine_snapshot.code_hint(path)
+        } else {
+            None
+        };
+        let engine_warning = engine_snapshot.record_if_enabled(
+            &ctx.project_root,
+            engine_policy_admission,
+            &mut output,
+        );
         let output_tokens = crate::core::tokens::count_tokens(&output);
-        let saved = original.saturating_sub(output_tokens);
 
-        if !is_cache_hit {
-            if let Some((hash, mtime)) = delivery_metadata {
-                crate::tools::ctx_read::record_cross_agent_delivery(
-                    path,
-                    hash,
-                    mtime,
-                    0,
-                    output_tokens,
-                    None,
-                    None,
-                );
-            }
-        }
-
-        // Session updates (bounded lock — 10s timeout, read already succeeded)
-        let mut ensured_root: Option<String> = None;
-        let mut traversal_working_set: Vec<String> = Vec::new();
-        let mut prefetch_paths: Vec<String> = Vec::new();
-        let project_root_snapshot;
-        {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let session_guard = loop {
-                if let Ok(g) = session_lock.clone().try_write_owned() {
-                    break Some(g);
-                }
-                if std::time::Instant::now() >= deadline {
-                    break None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            };
-            if let Some(mut session) = session_guard {
-                session.touch_file(path, file_ref.as_deref(), &resolved_mode, original);
-                prefetch_paths = session.prefetch_predictions(3);
-                // Capture the recent working set (under the lock) so the
-                // background thread can record a traversal/co-access edge (#289).
-                traversal_working_set =
-                    crate::core::tool_lifecycle::recent_working_set(&session, path);
-                let file_summary = extract_file_summary(&output, path);
-                if !file_summary.is_empty() {
-                    session.set_file_summary(path, &file_summary);
-                }
-                if is_cache_hit {
-                    session.record_cache_hit();
-                }
-                if session.active_structured_intent.is_none() && session.files_touched.len() >= 2 {
-                    let touched: Vec<String> = session
-                        .files_touched
-                        .iter()
-                        .map(|f| f.path.clone())
-                        .collect();
-                    let inferred =
-                        crate::core::intent_engine::StructuredIntent::from_file_patterns(&touched);
-                    if inferred.confidence >= 0.4 {
-                        session.active_structured_intent = Some(inferred);
+        let cache_delivery = std::mem::take(
+            &mut *pending_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        // A pre-read disk hash may describe older bytes. Relay only when it
+        // agrees with the source that actually supplied this rendered result.
+        let cross_agent = if is_cache_hit {
+            None
+        } else {
+            delivery_metadata
+                .filter(|fp| cache_delivery.source_fingerprint.as_ref() == Some(&fp.hash))
+                .map(|fp| {
+                    let relay_key = (matches!(resolved_mode.as_str(), "map" | "signatures")
+                        && output.len() <= 8192)
+                        .then(|| {
+                            crate::tools::ctx_read::compressed_cache_key(
+                                &resolved_mode,
+                                ctx.crp_mode,
+                                None,
+                                aggressiveness,
+                                &protect,
+                            )
+                        });
+                    PendingCrossAgentDelivery {
+                        hash: fp.hash,
+                        mtime: fp.mtime,
+                        line_count: fp.line_count,
+                        output_tokens,
+                        output: output.clone(),
+                        relay_key,
                     }
-                }
-                if session.task.is_none() && session.stats.files_read % 5 == 0 {
-                    session.auto_infer_task();
-                }
-                let root_missing = session
-                    .project_root
-                    .as_deref()
-                    .is_none_or(|r| r.trim().is_empty());
-                if root_missing && let Some(root) = crate::core::protocol::detect_project_root(path)
-                {
-                    session.project_root = Some(root.clone());
-                    ensured_root = Some(root);
-                }
-                project_root_snapshot = session
-                    .project_root
-                    .clone()
-                    .unwrap_or_else(|| ".".to_string());
-            } else {
-                tracing::warn!(
-                    "session write-lock timeout (5s) in ctx_read post-update for {path}"
-                );
-                project_root_snapshot = ctx.project_root.clone();
-            }
-        }
-        if let Some(root) = ensured_root.as_deref() {
-            crate::core::index_orchestrator::ensure_all_background(root);
-        }
-
-        if !prefetch_paths.is_empty() {
-            crate::core::context_prefetch::warm_predictions(&prefetch_paths, Some(&cache_lock));
-        }
-
-        // Telemetry + learning are pure side-effects that never influence this
-        // response, yet they did synchronous disk I/O on every read (heatmap
-        // append, ModePredictor load+save, FeedbackStore load). Push them off
-        // the hot path so reads — especially cache-hit stubs — return without
-        // waiting on disk (#149).
-        {
-            let path_bg = path.to_string();
-            let resolved_mode_bg = resolved_mode.clone();
-            let project_root_bg = project_root_snapshot.clone();
-            let (turns, hits) = cache_stats;
-            // #685: model-correct verified-ledger inputs, computed off the hot path.
-            // The default O200kBase model reuses the o200k `original`/`saved` below
-            // (byte-identical, no clone). Only a resolved Claude/Gemini/Llama model
-            // carries the cache handle + output so the bg thread can re-tokenize the
-            // raw source and the sent output in the family the provider actually bills.
-            let ledger_cache = (crate::core::savings_ledger::ledger_family()
-                != crate::core::tokens::TokenizerFamily::O200kBase)
-                .then(|| cache_lock.clone());
-            let ledger_output = ledger_cache.as_ref().map(|_| output.clone());
-            std::thread::spawn(move || {
-                // A panic in telemetry must not poison locks or leave a zombie thread;
-                // it never affects the already-returned read response.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    crate::core::heatmap::record_file_access(&path_bg, original, saved);
-
-                    // #685: verified savings ledger, decoupled from the heatmap so it
-                    // can denominate in the active model's tokenizer family. O200kBase
-                    // reuses the o200k counts; other families re-tokenize raw (cache)
-                    // + output. A cache miss falls back to o200k (conservative).
-                    {
-                        use crate::core::savings_ledger as ledger;
-                        let (lbase, lsaved) = match (&ledger_cache, &ledger_output) {
-                            (Some(cl), Some(out)) => match cl.try_read().ok().and_then(|c| {
-                                c.get(&path_bg)
-                                    .and_then(crate::core::cache::CacheEntry::content)
-                            }) {
-                                Some(raw) => {
-                                    let lo = ledger::count_for_ledger(&raw);
-                                    (lo, lo.saturating_sub(ledger::count_for_ledger(out)))
-                                }
-                                None => (original, saved),
-                            },
-                            _ => (original, saved),
-                        };
-                        ledger::record_read_event(lbase, lsaved, None, None);
-                    }
-
-                    // Traversal/co-access edge: this read fired together with the
-                    // recent working set captured under the session lock (#289).
-                    if let Some(root) =
-                        crate::core::tool_lifecycle::usable_root(Some(project_root_bg.as_str()))
-                    {
-                        crate::core::cooccurrence::record_focus_access(
-                            root,
-                            &path_bg,
-                            &traversal_working_set,
-                        );
-                    }
-                    let sig =
-                        crate::core::mode_predictor::FileSignature::from_path(&path_bg, original);
-                    let density = if output_tokens > 0 {
-                        original as f64 / output_tokens as f64
-                    } else {
-                        1.0
-                    };
-                    let outcome = crate::core::mode_predictor::ModeOutcome {
-                        mode: resolved_mode_bg,
-                        tokens_in: original,
-                        tokens_out: output_tokens,
-                        density: density.min(1.0),
-                    };
-                    let mut predictor = crate::core::mode_predictor::ModePredictor::new();
-                    predictor.set_project_root(&project_root_bg);
-                    predictor.record(sig, outcome);
-                    predictor.save();
-
-                    let ext = std::path::Path::new(&path_bg)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let thresholds =
-                        crate::core::adaptive_thresholds::thresholds_for_path(&path_bg);
-                    let feedback_outcome = crate::core::feedback::CompressionOutcome {
-                        session_id: format!("{}", std::process::id()),
-                        language: ext,
-                        entropy_threshold: thresholds.bpe_entropy,
-                        jaccard_threshold: thresholds.jaccard,
-                        total_turns: turns as u32,
-                        tokens_saved: saved as u64,
-                        tokens_original: original as u64,
-                        cache_hits: hits as u32,
-                        total_reads: turns as u32,
-                        // Real behavioral signal instead of a hardcoded success
-                        // (#593): a compressed read only counts as task-completing
-                        // when this extension is not in a high-bounce state —
-                        // compression that keeps forcing full re-reads is not
-                        // "completing" anything. Unknown (too few reads) stays
-                        // optimistic so the cold start is unchanged. 0.30 mirrors
-                        // bounce_tracker::BOUNCE_RATE_THRESHOLD.
-                        task_completed: crate::core::bounce_tracker::global()
-                            .lock()
-                            .ok()
-                            .and_then(|bt| bt.bounce_rate_for_extension(&path_bg))
-                            .is_none_or(|rate| rate < 0.30),
-                        timestamp: chrono::Local::now().to_rfc3339(),
-                    };
-                    let mut store = crate::core::feedback::FeedbackStore::load();
-                    store.project_root = Some(project_root_bg);
-                    store.record_outcome(feedback_outcome);
-                }));
-            });
-        }
-        if let Some(aid) = resolved_agent_id.as_deref() {
-            crate::core::agent_budget::record_consumption(aid, output_tokens);
-        }
+                })
+        };
 
         // #1098: graph-related hints (callers/callees) are now computed AFTER the
         // cache lock is released. They involve SQLite queries (~50-200ms) that
@@ -1334,9 +1184,11 @@ impl CtxReadTool {
         // Cross-source hints: gated by profile `cross_source_hint` (default off).
         // When enabled, appends issue/PR/schema references from the property
         // graph. Skipped when graph.db doesn't exist (#682).
+        // Legacy graph edges carry no source authority for protected reuse.
         let hints_suffix = if crate::core::profiles::active_profile()
             .output_hints
             .cross_source_hint()
+            && !crate::core::policy::runtime::is_active()
         {
             let graph_db =
                 crate::core::property_graph::graph_dir(&ctx.project_root).join("graph.db");
@@ -1398,6 +1250,7 @@ impl CtxReadTool {
         if let Some(ref w) = instruction_mode_note {
             warnings.push(w.as_str());
         }
+        let file_summary = extract_file_summary(&output, path);
         let graph_suffix = graph_hint.map(|h| format!("\n{h}")).unwrap_or_default();
         // #977: notices (mode override, budget, degradation, delta) go BEFORE the
         // payload so client-side truncation of large outputs cannot hide them.
@@ -1433,6 +1286,13 @@ impl CtxReadTool {
             final_output
         };
 
+        // Keep paid annotations outside the pending source/relay cache payload;
+        // an expired license must never recover an old paid analysis as fresh.
+        let final_output = match code_hint {
+            Some(note) => format!("{final_output}\n\n{note}"),
+            None => final_output,
+        };
+
         // Monotonic guard (#1326): re-count tokens on the fully assembled output
         // (including hints, warnings, proactive context) and verify the compressed
         // result is actually smaller than the original. If annotations inflated the
@@ -1441,25 +1301,42 @@ impl CtxReadTool {
         // but correct the accounting.
         let final_tokens = crate::core::tokens::count_tokens(&final_output);
         let verified_saved = original.saturating_sub(final_tokens);
-        crate::core::cache::record_ctx_read_outcome(reuse_outcome);
 
-        Ok(ToolOutput {
-            text: final_output,
+        let delivery = PendingReadDelivery {
+            path: path.to_owned(),
+            cache_delivery,
+            cross_agent,
+            file_ref,
+            file_summary,
+            resolved_mode: resolved_mode.clone(),
             original_tokens: original,
-            saved_tokens: verified_saved,
-            mode: Some(resolved_mode),
-            path: Some(path.to_string()),
-            changed: false,
-            shell_outcome: None,
-            content_blocks: None,
+            reuse_outcome,
+            is_cache_hit,
+            agent_id: resolved_agent_id,
+        };
+        Ok(PreparedRead {
+            delivery: Some(delivery),
+            output: ToolOutput {
+                text: final_output,
+                original_tokens: original,
+                saved_tokens: verified_saved,
+                mode: Some(resolved_mode),
+                path: Some(path.to_string()),
+                changed: false,
+                shell_outcome: None,
+                content_blocks: None,
+            },
         })
     }
 }
 
 #[path = "ctx_read_engine.rs"]
 mod engine;
+// #660 LOC gate: the MCP tool definition lives in its own module.
 #[path = "ctx_read_image.rs"]
 mod image;
+#[path = "ctx_read_schema.rs"]
+mod schema;
 use image::read_image_file;
 // #660 LOC gate: leaf helpers live in their own module.
 #[path = "ctx_read_helpers.rs"]
@@ -1471,8 +1348,15 @@ pub(crate) use helpers::task_intent_steers_read;
 use helpers::apply_verdict;
 use helpers::{auto_degrade_read_mode, extract_file_summary, record_attribution_result};
 
+// #660 LOC gate: cache-lock deadline and the uncached fallback (#1925).
+#[path = "ctx_read_uncached.rs"]
+mod uncached;
+use uncached::{PrepareOutcome, cache_lock_deadline, empty_file_notice, prepare_uncached};
+
 #[path = "ctx_read_window.rs"]
 mod window;
+// #1993: the batch read resolves `raw=true` the same way.
+pub(super) use window::resolve_explicit_mode;
 #[allow(unused_imports)]
 // lines_mode + resolve_line_window used in #[cfg(test)] ctx_read_inline_tests
 use window::{
@@ -1489,9 +1373,17 @@ mod tests;
 #[path = "ctx_read_security_tests.rs"]
 mod security_tests;
 
+#[cfg(test)]
+#[path = "ctx_read_gateway_tests.rs"]
+mod gateway_tests;
+
 // #660 LOC gate: repo-param tests split out to keep this file under the line
 // cap — see `ctx_read_repo_param_tests.rs`.
 
 #[cfg(test)]
 #[path = "ctx_read_repo_param_tests.rs"]
 mod repo_param_tests;
+
+#[cfg(test)]
+#[path = "ctx_read_override_tests.rs"]
+mod override_tests;

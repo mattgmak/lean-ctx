@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Append-only, task-aware execution ledger.
 //!
 //! The execution ledger is an additive projection beside the Savings Ledger.  It
@@ -6,6 +7,7 @@
 
 pub mod canonical_receipt;
 pub mod event;
+pub(crate) mod host;
 pub mod migration;
 pub mod producer;
 pub mod projection;
@@ -161,16 +163,27 @@ mod tests {
     }
 
     fn model_invoked(task_id: &str, trace_id: &str) -> ExecutionEvent {
+        model_invoked_with(task_id, trace_id, "invocation-1", "model-1", 20, 10)
+    }
+
+    fn model_invoked_with(
+        task_id: &str,
+        trace_id: &str,
+        invocation_id: &str,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) -> ExecutionEvent {
         ExecutionEvent::ModelInvoked {
             task_id: task_id.to_owned(),
             trace_id: trace_id.to_owned(),
             plan_id: "plan-1".to_owned(),
-            invocation_id: "invocation-1".to_owned(),
-            invocation_ref: "sha256:invocation-1".to_owned(),
-            model: "model-1".to_owned(),
+            invocation_id: invocation_id.to_owned(),
+            invocation_ref: format!("sha256:{invocation_id}"),
+            model: model.to_owned(),
             provider: "provider-1".to_owned(),
-            tokens_in: 20,
-            tokens_out: 10,
+            tokens_in,
+            tokens_out,
             latency_ms: 25,
             timestamp: "2026-08-09T12:00:01Z".to_owned(),
             sequence_number: 0,
@@ -280,7 +293,16 @@ mod tests {
         store.append(engine_invoked("task-1", "trace-1")).unwrap();
 
         assert!(store.verify_chain().unwrap());
-        assert_eq!(store.task_cost_summary("task-1").model_calls, 0);
+        let summary = store.task_cost_summary("task-1");
+        assert_eq!(summary.model_calls, 0);
+        assert_eq!(
+            summary.cost_classification(),
+            lean_ctx_protocol::ReceiptValueClassificationV1::Unavailable
+        );
+        assert_eq!(
+            summary.baseline_cost_classification(),
+            lean_ctx_protocol::ReceiptValueClassificationV1::Unavailable
+        );
         assert!(store.legacy_receipt_for_task("task-1").is_none());
     }
 
@@ -797,7 +819,26 @@ mod tests {
         store
             .append(context_delivered("task-1", "trace-1"))
             .unwrap();
-        store.append(model_invoked("task-1", "trace-1")).unwrap();
+        store
+            .append(model_invoked_with(
+                "task-1",
+                "trace-1",
+                "invocation-1",
+                "gpt-4o",
+                20,
+                10,
+            ))
+            .unwrap();
+        store
+            .append(model_invoked_with(
+                "task-1",
+                "trace-1",
+                "invocation-2",
+                "claude-sonnet-4.5",
+                30,
+                15,
+            ))
+            .unwrap();
         store
             .append(ExecutionEvent::ReceiptSigned {
                 task_id: "task-1".to_owned(),
@@ -825,9 +866,43 @@ mod tests {
         ));
 
         let summary = task_cost_summary_from_store(&store, "task-1");
-        assert_eq!(summary.total_tokens, 30);
-        assert_eq!(summary.model_calls, 1);
+        assert_eq!(summary.total_tokens, 75);
+        assert_eq!(summary.model_calls, 2);
+        assert_eq!(
+            summary.cost_classification(),
+            lean_ctx_protocol::ReceiptValueClassificationV1::Estimated
+        );
+        assert_eq!(
+            summary.baseline_cost_classification(),
+            lean_ctx_protocol::ReceiptValueClassificationV1::Unavailable
+        );
+        let last_model_quote =
+            crate::core::gain::model_pricing::ModelPricing::load().quote(Some("claude-sonnet-4.5"));
+        let repriced_at_last_model = (last_model_quote.cost.estimate_usd(
+            summary.total_tokens_in,
+            summary.total_tokens_out,
+            0,
+            0,
+        ) * 1_000_000.0)
+            .round() as u64;
+        assert_ne!(summary.cost_micros, repriced_at_last_model);
         let legacy_receipt = legacy_receipt_for_task_from_store(&store, "task-1").unwrap();
+        assert_eq!(
+            legacy_receipt.cost_classification(),
+            lean_ctx_protocol::ReceiptValueClassificationV1::Estimated
+        );
+        assert_eq!(
+            legacy_receipt.baseline_cost_classification(),
+            lean_ctx_protocol::ReceiptValueClassificationV1::Unavailable
+        );
+        assert_eq!(
+            legacy_receipt.legacy_receipt().actual_cost_micros,
+            summary.cost_micros
+        );
+        assert_eq!(
+            legacy_receipt.legacy_receipt().baseline_cost_micros,
+            legacy_receipt.legacy_receipt().actual_cost_micros
+        );
         let entry = ExecutionLedgerEntryV1 {
             task_id: "task-1".to_owned(),
             legacy_estimated_actual_cost_micros: Some(
@@ -869,8 +944,8 @@ mod tests {
         assert!(serde_json::from_value::<ExecutionLedgerEntryV1>(signature_authority).is_err());
 
         let receipt = legacy_receipt.into_legacy_receipt();
-        assert_eq!(receipt.model_calls, 1);
-        assert_eq!(receipt.output_tokens, 10);
+        assert_eq!(receipt.model_calls, 2);
+        assert_eq!(receipt.output_tokens, 25);
         assert!(receipt.outcome_ref.is_none());
     }
 }

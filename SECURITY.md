@@ -17,7 +17,19 @@ If you discover a security vulnerability in lean-ctx, please report it privately
 
 ## What lean-ctx Does (and Doesn't Do)
 
-lean-ctx is a **local-only CLI tool and MCP server**. Understanding its scope helps assess risk:
+LeanCTX is the **Context Gateway for AI Systems**. **Control what your AI can see.**
+This policy covers the open-source **LeanCTX Engine** and its local CLI, MCP,
+HTTP, hook, and supported proxy paths. **LeanCTX SDK** and commercial Enterprise
+deployments have separate integration and operating contracts.
+
+The Engine runs locally, but enabled providers, upstream model traffic, updates,
+telemetry, and other configured integrations can make network requests. Review
+the configured integration and deployment rather than infer data locality from
+the word “local.”
+
+Context selection determines what AI should see; permissions and configured
+content controls constrain what it may see. Receipts describe observed context
+operations, not prompts or delivery outside the integration's visibility.
 
 **Does:**
 - Read files from your local filesystem (explicit reads and tool-driven scans within the project boundary)
@@ -28,11 +40,27 @@ lean-ctx is a **local-only CLI tool and MCP server**. Understanding its scope he
 
 ### I/O Boundary (PathJail + Roles)
 
-lean-ctx enforces a **project boundary** for filesystem I/O:
+lean-ctx enforces a **filesystem boundary** for tool I/O:
 
-- **PathJail**: all tool path inputs are resolved and jailed under the current `project_root`.
-  - If a path would escape, the call fails with a clear hint to explicitly allow additional roots.
-- **Explicit allow roots**:
+- **PathJail**: all tool path inputs are resolved (symlinks and `..` included) and checked
+  against the jail scope (`path_jail_scope`, global-only):
+  - `home` (default since v3.11.1; read **and write** below `~` since v3.11.3): every path
+    below the user's home directory, except the protected zones — every top-level dot entry (`~/.ssh`, `~/.aws`, `~/.gnupg`,
+    `~/.config`, shell rc files, other agents' `~/.claude` / `~/.codex` / `~/.cursor`),
+    `~/Library`, `~/AppData` / `NTUSER.DAT*` and `~/snap`. Everything outside `~` stays jailed.
+    Zones are a hard deny: a root or allow entry that merely contains a zone does not open it.
+    An implausible `$HOME` (`/`, `/root`, `/tmp`, not owned by the user) disables the scope.
+  - `projects` (the default of v3.11.1–v3.11.2): only paths inside a project below `~` (a folder
+    between it and `~` holds `.git`, `Cargo.toml`, `package.json` or another project marker) are
+    readable; loose personal files stay jailed, and writes stay limited to the session's project,
+    host-declared roots and explicit allow entries.
+  - `project`: only the current `project_root` plus the explicit allow roots below.
+  - If a path would escape, the call fails naming the single command that admits it
+    (`lean-ctx allow-path <dir>`) and asks the agent to defer to the user.
+- **Per-session project binding**: the project root comes from the host session (MCP roots,
+  host project env, working directory). Global agent configs no longer carry a
+  `LEAN_CTX_PROJECT_ROOT` pin; `lean-ctx doctor` reports and `doctor --fix` removes old ones.
+- **Explicit allow roots** (`lean-ctx allow-path <dir>` writes `allow_paths`):
   - Env: `LEAN_CTX_ALLOW_PATH` (or `LCTX_ALLOW_PATH`) — a path list (`:` on Unix, `;` on Windows)
   - Config: `allow_paths` in `~/.lean-ctx/config.toml` (whitelist only); `extra_roots` (whitelist + multi-root scanning)
   - `~`, `$VAR` and `${VAR}` are expanded in these entries (no shell runs for config files)
@@ -59,7 +87,7 @@ In addition, roles can restrict **unsafe I/O**:
 
 ### Threat Model (v2)
 
-**Primary risks (local-only, but high impact):**
+**Primary risks:**
 - **Accidental secret exfiltration to LLMs** via `ctx_read`, `ctx_search`, compressed `ctx_shell`, archives, or exported artifacts.
 - **Boundary escapes** via absolute paths, symlinks, linked projects, or artifact path tricks.
 - **Amplification / token burn** by scanning large files or returning unbounded outputs.
@@ -69,7 +97,7 @@ In addition, roles can restrict **unsafe I/O**:
 **Core mitigations:**
 - **PathJail** + explicit allow roots (`LEAN_CTX_ALLOW_PATH` / `allow_paths`).
 - **Role-gated unsafe I/O** (`ignore_gitignore`, secret-like allow).
-- **Secret path check on all MCP read paths** — `.env`, SSH keys, etc. blocked by default.
+- **Secret-path handling** — search skips recognized secret-like paths; direct-read warnings or rejection depend on the configured I/O boundary, permissions, and role.
 - **Shell CWD jail enforcement** — explicit `cwd` parameters are jail-checked, `cd` targets validated.
 - **Deterministic redaction** on tool outputs (non-admin roles, and for persisted archives).
 - **Hard caps** on reads and outputs to limit DoS/token burn.
@@ -83,15 +111,16 @@ In addition, roles can restrict **unsafe I/O**:
 - **UDS socket permissions** — `0o600` enforced on Unix domain sockets after bind.
 - **Error response sanitization** — internal details logged server-side, generic codes returned to clients.
 
-**Optional network activity (fully disableable):**
+**Optional network activity (review effective configuration):**
 - **Update check**: a lightweight daily GET to `leanctx.com/version.txt` to notify you of new versions. Sends only the current version as User-Agent. Disable with `update_check_disabled = true` in `~/.lean-ctx/config.toml` or `LEAN_CTX_NO_UPDATE_CHECK=1`.
-- **Anonymous telemetry** (opt-in, off by default): if you enable `[telemetry] enabled = true` (via setup or `lean-ctx telemetry on`), a daily heartbeat sends: lean-ctx version, OS, CPU architecture, a random installation UUID, and anonymized compression patterns (file-type, size bucket, mode, ratio). No code, no filenames, no personal data. Inspect the exact payload: `lean-ctx telemetry show`. Regenerate the installation ID: `lean-ctx telemetry reset-id`.
+- **Telemetry**: product telemetry is on by default since v3.11.0 (v3.10.5 and earlier defaulted it off); an explicit earlier opt-out is kept. Inspect your installed build with `lean-ctx telemetry status` and `lean-ctx telemetry show`. Disable sending with `lean-ctx telemetry off`, `DO_NOT_TRACK=1`, or `LEAN_CTX_TELEMETRY=off`. Enabled telemetry sends installation and aggregate usage metadata. Do not infer zero network activity from telemetry being disabled.
+- **Configured providers and integrations**: source connectors, upstream model requests, submitted feedback, and remote endpoints have their own payloads and credentials. Review each enabled path.
 
-**Does NOT:**
-- Collect tracking analytics, fingerprints, or PII
-- Access files outside of requested paths
-- Store or transmit credentials, API keys, or secrets
-- Require elevated privileges (runs as your user)
+**Limits:**
+- Configured detectors recognize supported patterns; they do not detect every secret or sensitive datum.
+- Warning, redaction, and blocking are different actions. Roles, bypasses, allow roots, and disabled controls change the effective boundary.
+- Inputs, caches, archives, and integration credentials require appropriate host protection and retention settings.
+- The normal Engine runs as your user; a container, VM, or operating-system policy can supply an additional boundary.
 
 ---
 
@@ -128,24 +157,10 @@ Changes to these files receive extra scrutiny:
 
 ## Dependency Security
 
-All dependencies in `Cargo.toml` meet these criteria:
-
-- **Established crates**: All 29 dependencies are well-known, widely-used Rust crates
-- **License**: Apache-2.0 compatible
-- **Active maintenance**: Recent commits within 6 months
-- **Minimal network**: `ureq` (lightweight HTTP client) used only for version check and opt-in cloud sync
-
-Key dependencies and their purpose:
-
-| Crate | Purpose | Downloads |
-|-------|---------|-----------|
-| `rmcp` | MCP protocol (stdio transport only) | Rust MCP reference impl |
-| `tiktoken-rs` | Token counting (o200k_base) | OpenAI's tokenizer |
-| `tree-sitter` + grammars | AST parsing for 26 languages | Mozilla's parser |
-| `tokio` | Async runtime (for MCP server) | 200M+ downloads |
-| `serde` / `serde_json` | JSON serialization | 400M+ downloads |
-| `similar` | Myers diff algorithm | Well-established |
-| `walkdir` | Directory traversal | 100M+ downloads |
+The manifests and lockfile define the dependency set for a given release.
+Review `rust/Cargo.toml`, `rust/Cargo.lock`, enabled features, and the security
+workflow when assessing supply-chain exposure. Dependency counts, download
+counts, and recent commits alone are not evidence that a dependency is safe.
 
 ---
 
@@ -154,7 +169,7 @@ Key dependencies and their purpose:
 Rust binaries are frequently flagged by ML-based antivirus engines (particularly Microsoft Defender's `Wacatac.B!ml` classifier). This is a **known issue** affecting many Rust projects:
 
 - [Rust lang discussion on false positives](https://users.rust-lang.org/t/rust-programs-flagged-as-malware/49799)
-- 1/72 engines flagging = definitively a false positive
+- A low number of detections alone does not establish a false positive.
 - The `!ml` suffix in `Wacatac.B!ml` means "Machine Learning detection" (heuristic, not signature-based)
 
 **Why it happens:**
@@ -171,7 +186,7 @@ Rust binaries are frequently flagged by ML-based antivirus engines (particularly
 
 ## Build Reproducibility
 
-To verify that a release binary matches the source code:
+To build the source and inspect its reported version:
 
 ```bash
 # Clone and build
@@ -184,7 +199,7 @@ lean-ctx --version
 ./target/release/lean-ctx --version
 ```
 
-SHA256 checksums for all release binaries are published in each [GitHub Release](https://github.com/yvgude/lean-ctx/releases).
+Use the checksums attached to the relevant [GitHub Release](https://github.com/yvgude/lean-ctx/releases) to check a downloaded artifact. Matching version strings does not prove byte-for-byte reproducibility or establish that a binary matches source.
 
 ---
 
@@ -216,7 +231,11 @@ A race window exists between `jail_path` validation and the subsequent file oper
 
 **Status:** Documented limitation.
 
-The `ctx_execute` tool provides **timeout enforcement** and **output capping** but does **not** provide OS-level sandboxing (no containers, namespaces, or seccomp filters). The term "sandbox" in tool descriptions refers to the execution boundary, not kernel-level isolation.
+The `ctx_execute` tool provides timeout enforcement and output capping.
+OS isolation depends on `sandbox_level`, platform support, and the selected
+execution path. Configured level 1 uses Seatbelt on macOS or Landlock on Linux;
+unsupported platforms can fall back to level 0. Do not treat the tool name as
+proof of OS isolation. Inspect `rust/src/core/sandbox.rs` for the release in use.
 
 **Recommendation for regulated environments:** Disable `ctx_execute` via role configuration (`denied: ["ctx_execute"]`) or run lean-ctx in a pre-existing container sandbox.
 
@@ -229,8 +248,9 @@ The `ctx_execute` tool provides **timeout enforcement** and **output capping** b
 - a deny-by-default executable allowlist when configured (AST-segmented: every segment of a pipeline/compound command must be allowed),
 - `eval`/`exec`/`source` unconditionally blocked; `$()`/backticks blocked at command position,
 - **interpreter inline-code blocking**: `bash -c`, `sh -c`, `python -c`, `node -e`, … are rejected (including via delegation wrappers like `env`, `timeout`, `xargs`) — quoting a payload inside `bash -c '…'` does not bypass the file-write or allowlist checks because the interpreter call itself is refused,
-- file-write detection (`>`, `>>`, `tee`, heredoc-to-file, `dd of=`, `curl -o/-O`, `wget` to file) — writes belong to the editor's native Write/Edit tools where the agent's permission UI governs them,
-- dangerous-flag blocking (`git --upload-pack`, `tar --to-command`, `find -exec`, `awk system()`), inline env hijack blocking (`PATH=`, `LD_PRELOAD=`, `GIT_SSH_COMMAND=`, …), and dangerous env-key filtering on the MCP `env` parameter.
+- file-write detection (`>`, `>>`, `tee`, heredoc-to-file, `dd of=`, `curl -o/-O`, `wget` to file) — output capture (`>`, `>>`, `tee`) may go to the session's project, `allow_paths` / `extra_roots`, `write_allow_paths` or a scratch path (never `/`, `~`, an ancestor of `~` or a `read_only_roots` entry); downloads only to scratch paths and `write_allow_paths`; everything else belongs to the editor's native Write/Edit tools where the agent's permission UI governs them,
+- dangerous-flag blocking (`git --upload-pack`, `tar --to-command`, `find -exec`, `awk system()`), inline env hijack blocking (`PATH=`, `LD_PRELOAD=`, `GIT_SSH_COMMAND=`, …), and dangerous env-key filtering on the MCP `env` parameter,
+- **no self-loosening** (allowlist mode, the default): lean-ctx subcommands that widen its own guardrails — `yolo`, `allow <cmd>`, `allow-path <dir>`, `trust`, `security open`, `security secrets off`, `config set` of a security or path/allowlist key — are refused, so an agent cannot undo a refusal it just received. Listing, `--remove`, `secure`, `untrust` and `security secrets on` still run. The user runs the blocked commands in their own terminal (warn-only there, see below). `ctx_execute` is not covered — see the next paragraph.
 
 Enforcement applies to the MCP path, hook-child mode and every non-interactive CLI invocation; an interactive human terminal gets a warning instead (`LEAN_CTX_ALLOWLIST_WARN_ONLY=1` opts out explicitly). Cloud/infra mutation CLIs (terraform, kubectl, aws, …) are excluded from the default allowlist and require per-tool opt-in (`lean-ctx allow <cmd>`). `shell_strict_mode = true` upgrades the warn-only heuristics (command substitution in arguments, pipe-to-bare-interpreter) to hard blocks.
 
@@ -302,9 +322,11 @@ policy — per-session I/O limits live on the active role, which is selected via
 ```toml
 update_check_disabled = true   # no daily update check
 path_jail = true               # keep the filesystem jail on (default)
+path_jail_scope = "project"    # only the active project (default "home": all of ~ except protected zones)
 
 [telemetry]
-enabled = false                # no anonymous telemetry (default)
+enabled = false                # explicitly disable telemetry
+preference = "explicitly_disabled"
 ```
 
 **2. A locked-down role — `~/.lean-ctx/roles/bank.toml`:**
@@ -337,7 +359,7 @@ export LEAN_CTX_ROLE=bank
 | Endpoint | Purpose | Disable |
 |----------|---------|---------|
 | `leanctx.com/version.txt` | Update check (daily GET) | `update_check_disabled = true` |
-| `api.leanctx.com` | Opt-in anonymous telemetry (version, OS, arch, install ID, compression patterns) | `[telemetry] enabled = false` (default) |
+| `api.leanctx.com` | Enabled telemetry (version, OS/arch, installation ID, client/setup categories, aggregate tool usage) | `lean-ctx telemetry off` or `DO_NOT_TRACK=1` |
 | `huggingface.co` | Embedding model download | Pre-provision models, set `LEAN_CTX_EMBEDDING_MODEL_DIR` |
 | `localhost:PORT` | Dashboard (local TCP) | Don't start dashboard, or bind to loopback only |
 | UDS socket | Daemon IPC | Permissions `0o600`, owner-only access |
@@ -369,4 +391,4 @@ The team server is part of `lean-ctx-enterprise` (ADR-023). When deployed:
 
 ---
 
-**Last updated**: 2026-06-21
+**Last updated**: 2026-10-02

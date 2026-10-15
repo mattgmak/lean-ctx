@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
 //! BuiltinSavingsLedger — records compression savings with evidence refs.
 //!
-//! Wraps `core/savings_ledger/` behind the OCLA trait. Emits SavingsRecorded
-//! events to OclaBus. Evidence references are content-addressed (blake3 of
+//! Wraps `core/savings_ledger/` behind the OCLA trait. Evidence references
+//! are content-addressed (blake3 of
 //! the evidence payload), ensuring deterministic, replay-safe identifiers.
 
 use std::sync::Mutex;
@@ -9,7 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::ocla::traits::{OclaService, SavingsLedger};
 use crate::core::ocla::types::{OclaCapability, OclaCapabilityKind, OclaResult, SavingsEvidence};
-use crate::core::ocla_bus::{self, OclaEvent, SavingsSource};
 
 const MAX_EVIDENCE_ENTRIES: usize = 4096;
 
@@ -90,6 +90,10 @@ impl Default for BuiltinSavingsLedger {
 }
 
 impl OclaService for BuiltinSavingsLedger {
+    fn manifest(&self) -> crate::core::ocla::OclaResult<lean_ctx_protocol::CapabilityManifestV1> {
+        crate::core::ocla::capability_fabric::builtin_manifest(&self.capability())
+    }
+
     fn capability(&self) -> OclaCapability {
         OclaCapability::available(OclaCapabilityKind::SavingsLedger)
     }
@@ -107,6 +111,10 @@ impl SavingsLedger for BuiltinSavingsLedger {
             );
         });
 
+        self.project_savings(evidence)
+    }
+
+    fn project_savings(&self, evidence: SavingsEvidence) -> OclaResult<String> {
         let saved = evidence
             .original_tokens
             .saturating_sub(evidence.delivered_tokens);
@@ -115,15 +123,6 @@ impl SavingsLedger for BuiltinSavingsLedger {
             .fetch_add(evidence.original_tokens, Ordering::Relaxed);
 
         let ref_id = evidence.evidence_ref.clone();
-
-        ocla_bus::emit(OclaEvent::SavingsRecorded {
-            input_saved: saved,
-            output_saved: 0,
-            source: SavingsSource::Compression,
-            attribution_id: None,
-            evidence_class: None,
-            measurement_method: None,
-        });
 
         let mut entries = self
             .entries
@@ -166,6 +165,10 @@ mod tests {
 
     #[test]
     fn records_and_accumulates() {
+        // Every recording test isolates: record_savings writes the verified
+        // ledger under the data dir, which would otherwise land in another
+        // test's isolated dir (or the developer's real ledger).
+        let _dir = crate::core::data_dir::isolated_data_dir();
         let ledger = BuiltinSavingsLedger::new();
         ledger.record_savings(evidence(1000, 300)).unwrap();
         ledger.record_savings(evidence(500, 200)).unwrap();
@@ -175,6 +178,7 @@ mod tests {
 
     #[test]
     fn ratio_calculation() {
+        let _dir = crate::core::data_dir::isolated_data_dir();
         let ledger = BuiltinSavingsLedger::new();
         ledger.record_savings(evidence(1000, 250)).unwrap();
 

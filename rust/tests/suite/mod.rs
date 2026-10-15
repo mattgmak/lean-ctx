@@ -1,15 +1,23 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Integration tests merged into one binary (tests/main.rs) so target/
 //! holds one linked test artifact instead of ~100 (was 17-25 GB of disk).
 //! Add new integration tests as modules here, NOT as new tests/*.rs files —
 //! unless the test mutates process env (set_var) or depends on exclusive
 //! process-global state (Config cache, graph-idx lock): those need their own
 //! process and stay as standalone tests/*.rs binaries.
+//!
+//! The whole binary runs against a throwaway data dir with the ambient agent
+//! scope removed — see `hermetic_env`.
 
 mod adversarial_compression;
 mod benchmark_compare_integration;
 mod capabilities_contract_up_to_date;
+mod capability_comparison_fixtures;
 mod cli_anti_inflation;
+mod cli_cache_errors;
 mod cli_characterization;
+mod cli_help_safety_1906;
 mod cloud_pro_features_e2e;
 mod compaction_cache_scenarios;
 mod compaction_survival_tests;
@@ -24,6 +32,7 @@ mod context_cortex_phase3;
 mod context_radar_perf;
 mod contracts_frozen;
 mod cortex_wiring_integration;
+mod critical_module_integration;
 mod cross_agent_delivery_e2e;
 mod ctx_read_lmd_md_raw;
 mod daviddatu_powershell_scenarios;
@@ -35,14 +44,20 @@ mod engine_call;
 mod entrypoints_wired;
 mod etpao_benchmark_suite;
 mod eval_harness_integration;
+mod evidence_bundle_v2_contract;
+mod execution_receipt_roundtrip;
 mod gateway_e2e;
 mod glob_cli_556;
+mod graph_export_contract;
 mod hardening_ir_traits;
+mod hermetic_env;
 mod hn_hardening_scenarios;
 mod hook_connect_only_566;
 mod http_server_streamable;
+mod init_help_safety_1849;
 mod integration_tests;
 mod io_health_scenarios;
+mod issue_1088_batch_replace_unique;
 mod issue_885_anchored_after_patch;
 mod knowledge_task_flow;
 mod legacy_path_firewall;
@@ -54,14 +69,21 @@ mod mcp_fast_initialize_669;
 mod mcp_manifest_up_to_date;
 mod mcp_optout_281;
 mod mcp_preinit_method_not_found_1454;
+#[path = "mcp_fast_initialize_669/process.rs"]
+mod mcp_process;
 #[cfg(unix)]
 mod mcp_pty_startup_1595;
 mod metrics_contract;
+mod ocla_capability_path_benchmark;
+mod ocla_contract_suite_v1;
+mod ocla_drift_check;
+mod ocla_manifest_conformance;
 mod ocla_wire_contract_suite;
 mod onboard_doctor_clean;
 mod openapi_contract_up_to_date;
 mod openapi_stability;
 mod outline_machine_readable_e2e;
+mod package_assets;
 mod pattern_snapshots;
 mod performance_stress;
 mod plan_mode_scenarios;
@@ -73,6 +95,7 @@ mod provider_wiring_proof;
 mod proxy_smoke;
 mod quick_settings_427;
 mod read_fidelity;
+mod read_observation_acceptance;
 mod reference_docs_drift;
 mod reranking_scenarios;
 mod retrieval_eval;
@@ -91,12 +114,16 @@ mod session_lock_timeout_scenarios;
 mod settlement_evidence_v2_gate;
 mod setup_ci_smoke;
 mod setup_symlink_596;
+mod shadow_scheduler_invariant;
 mod shell_and_agent_tests;
 mod shell_hook_595;
+mod solution_integration;
+mod task_trace_vertical;
 mod tcc_sandbox;
 mod tdd_schema_up_to_date;
 mod terse_eval;
 mod tool_schema_strictness;
+mod trust_isolation_suite;
 mod ultimate_context_os_integration;
 mod unified_ledger_evidence_v2_gate;
 mod uninstall_help_safety_476;

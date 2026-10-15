@@ -3,7 +3,8 @@ use super::super::{
     mcp_server_quiet_mode, resolve_binary_path_for_bash, resolve_hook_command_binary,
     shell_quoted_binary, write_file, write_wrapper_file,
 };
-use super::shared::remove_all_blocks;
+use super::claude_delegation::ensure_bash_rewrite_hook;
+use super::shared::{contains_managed_md_block, managed_md_is_current, remove_managed_md_blocks};
 
 pub(crate) fn install_claude_hook_with_mode(global: bool, mode: HookMode) {
     let Some(home) = crate::core::home::resolve_home_dir() else {
@@ -13,6 +14,7 @@ pub(crate) fn install_claude_hook_with_mode(global: bool, mode: HookMode) {
 
     install_claude_hook_scripts(&home);
     install_claude_hook_config(&home);
+    super::claude_statusline::install_claude_statusline(&home);
 
     // #281: register the MCP server only when MCP updates are enabled. The hook
     // scripts/config above and the rules/skill below still install, so an
@@ -23,7 +25,7 @@ pub(crate) fn install_claude_hook_with_mode(global: bool, mode: HookMode) {
         install_claude_mcp_server(&home);
     }
 
-    if mode == HookMode::Replace {
+    if super::super::claude_hides_native_search(mode) {
         install_claude_permissions_deny_replace(&home);
     }
 
@@ -60,8 +62,8 @@ fn install_claude_mcp_server(home: &std::path::Path) {
 
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     if existing.contains("\"lean-ctx\"") && existing.contains("mcpServers") {
-        // Entry already exists — ensure autoApprove is set (#1467).
-        ensure_claude_mcp_auto_approve(&config_path, &existing);
+        // Entry already exists — ensure autoApprove (#1467) and alwaysLoad.
+        ensure_claude_mcp_entry_defaults(&config_path, &existing);
         return;
     }
 
@@ -87,7 +89,8 @@ fn install_claude_mcp_server(home: &std::path::Path) {
                 serde_json::json!({
                     "command": binary,
                     "args": [],
-                    "autoApprove": auto_approve
+                    "autoApprove": auto_approve,
+                    "alwaysLoad": true
                 }),
             );
             write_file(
@@ -101,8 +104,11 @@ fn install_claude_mcp_server(home: &std::path::Path) {
     }
 }
 
-/// Backfill `autoApprove` on existing MCP entries that lack it.
-fn ensure_claude_mcp_auto_approve(config_path: &std::path::Path, content: &str) {
+/// Backfill `autoApprove` and `alwaysLoad` on an existing entry. Without
+/// `alwaysLoad`, Claude Code lists lean-ctx tools by name only behind
+/// ToolSearch: agents pay a round trip to load a schema and fall back to the
+/// one generic tool they already have (`ctx_shell`) for everything.
+fn ensure_claude_mcp_entry_defaults(config_path: &std::path::Path, content: &str) {
     let Ok(mut root) = crate::core::jsonc::parse_jsonc(content) else {
         return;
     };
@@ -114,10 +120,14 @@ fn ensure_claude_mcp_auto_approve(config_path: &std::path::Path, content: &str) 
     };
     let desired = crate::core::editor_registry::writers::auto_approve_tools();
     let desired_json = serde_json::json!(desired);
-    if entry.get("autoApprove") == Some(&desired_json) {
+    let always_load = serde_json::Value::Bool(true);
+    if entry.get("autoApprove") == Some(&desired_json)
+        && entry.get("alwaysLoad") == Some(&always_load)
+    {
         return;
     }
     entry.insert("autoApprove".to_string(), desired_json);
+    entry.insert("alwaysLoad".to_string(), always_load);
     if let Ok(out) = serde_json::to_string_pretty(&root) {
         write_file(config_path, &out);
     }
@@ -267,7 +277,7 @@ pub(crate) fn install_claude_permissions_allow_mcp(home: &std::path::Path) {
 /// appended a duplicate (GH #549).
 pub(crate) const CLAUDE_MD_BLOCK_START: &str = crate::core::rules_canonical::AGENTS_BLOCK_START;
 const CLAUDE_MD_BLOCK_END: &str = crate::core::rules_canonical::AGENTS_BLOCK_END;
-const CLAUDE_MD_BLOCK_VERSION: &str = "lean-ctx-claude-v9";
+const CLAUDE_MD_BLOCK_VERSION: &str = "lean-ctx-claude-v10";
 
 // v3 (GL #555): self-contained, no `@rules/lean-ctx.md` import. Claude Code
 // expands `@` imports inline at launch ("imports do not reduce context usage"
@@ -300,13 +310,17 @@ const CLAUDE_MD_BLOCK_VERSION: &str = "lean-ctx-claude-v9";
 //
 // v9 (#1399): native Read must remain a narrow edit-gate carve-out, not imply
 // that it is suitable for exploration. Existing blocks must be rewritten.
+//
+// v10 (#1909): drop the "~13 tokens" re-read claim. Under Claude Code the
+// scope is process-derived and sub-agents share the MCP process, so re-read
+// stubs are withheld (#1801) and the claim did not hold.
 const CLAUDE_MD_BLOCK_CONTENT_MCP: &str = "\
 <!-- lean-ctx -->
-<!-- lean-ctx-claude-v9 -->
+<!-- lean-ctx-claude-v10 -->
 ## lean-ctx — Context Runtime
 
 When the `ctx_*` MCP tools are listed in this session, prefer them over native equivalents:
-- `ctx_read` instead of `Read` / `cat` for exploration (cached, 10 modes, unchanged full/auto re-reads ~13 tokens)
+- `ctx_read` instead of `Read` / `cat` for exploration (cached, 10 modes incl. map/signatures)
 - `ctx_shell` instead of `bash` / `Shell` (95+ compression patterns)
 - `ctx_search` instead of `Grep` / `rg` (compact results)
 - `ctx_tree` instead of `ls` / `find` (compact directory maps)
@@ -324,11 +338,11 @@ Details live in the `lean-ctx` skill (loads on demand — keep this file lean).
 
 const CLAUDE_MD_BLOCK_CONTENT_REPLACE: &str = "\
 <!-- lean-ctx -->
-<!-- lean-ctx-claude-v9 -->
+<!-- lean-ctx-claude-v10 -->
 ## lean-ctx — Replace Mode (native Grep/Glob denied by policy)
 
 Native Grep/Glob are denied by policy. Prefer `ctx_*` MCP tools for project work:
-- `ctx_read` for exploration reads (cached, 10 modes, unchanged full/auto re-reads ~13 tokens)
+- `ctx_read` for exploration reads (cached, 10 modes incl. map/signatures)
 - `ctx_shell` for shell commands (95+ compression patterns)
 - `ctx_search` instead of Grep/rg (compact results)
 - `ctx_tree` instead of ls/find (compact directory maps)
@@ -365,9 +379,13 @@ fn install_claude_global_claude_md_for_mode(home: &std::path::Path, mode: HookMo
     }
 
     let existing = std::fs::read_to_string(&claude_md_path).unwrap_or_default();
-    let base_block = match mode {
-        HookMode::Replace => CLAUDE_MD_BLOCK_CONTENT_REPLACE,
-        HookMode::Mcp | HookMode::Hybrid => CLAUDE_MD_BLOCK_CONTENT_MCP,
+    // The block describes the tool list Claude actually has: the Grep/Glob
+    // block whenever they are hidden, which the default mode keeps.
+    let hides_search = super::super::claude_hides_native_search(mode);
+    let base_block = if hides_search {
+        CLAUDE_MD_BLOCK_CONTENT_REPLACE
+    } else {
+        CLAUDE_MD_BLOCK_CONTENT_MCP
     };
 
     // A single up-to-date block needs no rewrite. Check both version tag AND
@@ -379,17 +397,15 @@ fn install_claude_global_claude_md_for_mode(home: &std::path::Path, mode: HookMo
     } else {
         format!("{base_block}\n\n{solution_block}")
     };
-    let block_count = existing.matches(CLAUDE_MD_BLOCK_START).count();
     let is_replace_block = existing.contains("denied by policy");
-    let mode_matches = matches!(mode, HookMode::Replace) == is_replace_block;
-    if block_count == 1
+    let mode_matches = hides_search == is_replace_block;
+    if managed_md_is_current(&existing, CLAUDE_MD_BLOCK_START, &block)
         && existing.contains(CLAUDE_MD_BLOCK_VERSION)
-        && existing.contains(&block)
         && mode_matches
     {
         return;
     }
-    let cleaned = remove_all_blocks(&existing, CLAUDE_MD_BLOCK_START, CLAUDE_MD_BLOCK_END);
+    let cleaned = remove_managed_md_blocks(&existing, CLAUDE_MD_BLOCK_START, CLAUDE_MD_BLOCK_END);
     let cleaned = cleaned.trim();
     let updated = if cleaned.is_empty() {
         format!("{block}\n")
@@ -411,7 +427,7 @@ pub(crate) fn sync_claude_global_rules_block(
     install_claude_global_claude_md_for_mode(home, mode);
     let after = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read {} after sync: {e}", path.display()))?;
-    if !after.contains(CLAUDE_MD_BLOCK_START) {
+    if !crate::marked_block::contains_marker_line(&after, CLAUDE_MD_BLOCK_START) {
         return Err(format!(
             "{} is missing the canonical lean-ctx pointer block after sync",
             path.display()
@@ -420,16 +436,17 @@ pub(crate) fn sync_claude_global_rules_block(
     Ok(removed_legacy || before != after)
 }
 
-/// Remove the lean-ctx block from `CLAUDE.md` (dedicated mode). Deletes the file
-/// entirely if it becomes empty (i.e. lean-ctx was its only content).
+/// Remove the lean-ctx block (and its solution block) from `CLAUDE.md`
+/// (dedicated/off mode). Deletes the file entirely if it becomes empty (i.e.
+/// lean-ctx was its only content).
 fn strip_claude_md_block(claude_md_path: &std::path::Path) {
     let Ok(existing) = std::fs::read_to_string(claude_md_path) else {
         return;
     };
-    if !existing.contains(CLAUDE_MD_BLOCK_START) {
+    if !contains_managed_md_block(&existing, CLAUDE_MD_BLOCK_START) {
         return;
     }
-    let cleaned = remove_all_blocks(&existing, CLAUDE_MD_BLOCK_START, CLAUDE_MD_BLOCK_END);
+    let cleaned = remove_managed_md_blocks(&existing, CLAUDE_MD_BLOCK_START, CLAUDE_MD_BLOCK_END);
     if cleaned.trim().is_empty() {
         let _ = std::fs::remove_file(claude_md_path);
     } else {
@@ -551,9 +568,11 @@ pub(crate) fn install_claude_hook_scripts(home: &std::path::Path) {
 /// The `Read|…` tool matcher shared by every Claude redirect hook (global + project).
 const REDIRECT_MATCHER: &str = "Read|read|ReadFile|read_file|View|view|Grep|grep|Search|search|ListFiles|list_files|ListDirectory|list_directory|Glob|glob";
 
-/// PostToolUse matcher for the guard-safe re-read dedup (GL #1140): Read only —
-/// the handler mirrors the Read result shape and must never see another tool's.
-const READ_DEDUP_MATCHER: &str = "Read";
+/// PostToolUse matcher for the guard-safe re-read dedup (GL #1140): the native
+/// Read and lean-ctx's own `ctx_read`, whose server-side stub is withheld on
+/// Claude Code (#1801) — the hook knows the reading agent, the server does not.
+/// The handler mirrors each result shape and passes every other tool through.
+pub(super) const READ_DEDUP_MATCHER: &str = "Read|mcp__lean-ctx__ctx_read|mcp__lean_ctx__ctx_read";
 
 /// Ensure the PostToolUse `hook read-dedup` entry exists exactly once (GL #1140).
 ///
@@ -578,7 +597,7 @@ fn ensure_read_dedup_hook(
 /// Commands are rendered as `<binary> hook <action>`, where `<binary>` is either a bare
 /// `lean-ctx` (when it is on `PATH`) or an absolute path (when it is not). The action token
 /// is therefore the only path-independent way to recognise a lean-ctx hook.
-fn lean_ctx_action_token(command: &str) -> &str {
+pub(super) fn lean_ctx_action_token(command: &str) -> &str {
     match command.rfind(" hook ") {
         Some(i) => command[i + 1..].trim_end(),
         None => command.trim_end(),
@@ -588,7 +607,7 @@ fn lean_ctx_action_token(command: &str) -> &str {
 /// True if `hook` is a lean-ctx command hook for `action`, regardless of how the binary path
 /// was rendered (bare `lean-ctx` vs an absolute path) and including the legacy script form
 /// (`…/lean-ctx-rewrite.sh`) written by pre-3.x installs.
-fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
+pub(super) fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
     if hook.get("type").and_then(|t| t.as_str()) != Some("command") {
         return false;
     }
@@ -598,8 +617,13 @@ fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
     if !cmd.contains("lean-ctx") {
         return false;
     }
-    if cmd.trim_end().ends_with(action) {
-        return true;
+    // Only `<lean-ctx binary> hook <action>` is ours. A user wrapper that merely *mentions*
+    // lean-ctx (`redact-wrap lean-ctx hook rewrite`) ends with the same action but must never
+    // be stripped (#1879).
+    if let Some(program) = cmd.trim_end().strip_suffix(action) {
+        if let Some(program) = program.strip_suffix(' ') {
+            return is_lean_ctx_program(program);
+        }
     }
     let legacy = if action.ends_with("rewrite") {
         "lean-ctx-rewrite"
@@ -611,18 +635,23 @@ fn is_lean_ctx_command_for(hook: &serde_json::Value, action: &str) -> bool {
     cmd.contains(legacy)
 }
 
-/// Ensure exactly one lean-ctx hook for `command`'s action exists under `matcher`.
-///
-/// Earlier versions deduped on the *full* command string, but `resolve_binary_path()` renders
-/// the binary as a bare `lean-ctx` (on `PATH`) or an absolute path (off `PATH`), so the
-/// rendering flips between `install` and `update` and the exact-string compare missed the
-/// existing hook — appending a duplicate on every run. We now strip every stale lean-ctx hook
-/// for this action (any path, any matcher group, including legacy `.sh` hooks) and re-add a
-/// single fresh one. This is idempotent across re-runs *and* self-heals settings files already
-/// duplicated by older versions, while leaving any non-lean-ctx hooks untouched.
-fn ensure_command_hook(pre_arr: &mut Vec<serde_json::Value>, matcher: &str, command: &str) {
-    let action = lean_ctx_action_token(command);
+/// True if `program` (the part of a hook command before ` hook <action>`) is the lean-ctx
+/// binary: a bare `lean-ctx`, any path to it (quoted or not, with spaces, `.exe`, `$HOME/…`
+/// portable forms), the configured `hook_binary` override verbatim, or the binary path the
+/// installer currently renders (covers renamed binaries, which would otherwise be re-added on
+/// every refresh).
+fn is_lean_ctx_program(program: &str) -> bool {
+    let program = program.trim().trim_matches(|c| c == '"' || c == '\'');
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name.eq_ignore_ascii_case("lean-ctx")
+        || name.eq_ignore_ascii_case("lean-ctx.exe")
+        || crate::core::portable_binary::hook_binary_override().is_some_and(|o| o == program)
+        || crate::hooks::resolve_binary_path() == program
+}
 
+/// Remove every lean-ctx hook for `action` (any path, any matcher group), dropping groups
+/// left empty. Non-lean-ctx hooks are untouched.
+pub(super) fn strip_lean_ctx_hooks(pre_arr: &mut Vec<serde_json::Value>, action: &str) {
     for group in pre_arr.iter_mut() {
         if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
             hooks.retain(|h| !is_lean_ctx_command_for(h, action));
@@ -633,6 +662,23 @@ fn ensure_command_hook(pre_arr: &mut Vec<serde_json::Value>, matcher: &str, comm
             .and_then(|h| h.as_array())
             .is_none_or(|hooks| !hooks.is_empty())
     });
+}
+
+/// Ensure exactly one lean-ctx hook for `command`'s action exists under `matcher`.
+///
+/// Earlier versions deduped on the *full* command string, but `resolve_binary_path()` renders
+/// the binary as a bare `lean-ctx` (on `PATH`) or an absolute path (off `PATH`), so the
+/// rendering flips between `install` and `update` and the exact-string compare missed the
+/// existing hook — appending a duplicate on every run. We now strip every stale lean-ctx hook
+/// for this action (any path, any matcher group, including legacy `.sh` hooks) and re-add a
+/// single fresh one. This is idempotent across re-runs *and* self-heals settings files already
+/// duplicated by older versions, while leaving any non-lean-ctx hooks untouched.
+pub(super) fn ensure_command_hook(
+    pre_arr: &mut Vec<serde_json::Value>,
+    matcher: &str,
+    command: &str,
+) {
+    strip_lean_ctx_hooks(pre_arr, lean_ctx_action_token(command));
 
     let desired = serde_json::json!({ "type": "command", "command": command });
     if let Some(group) = pre_arr
@@ -768,7 +814,7 @@ pub(crate) fn install_claude_hook_config(home: &std::path::Path) {
                     .entry("PreToolUse".to_string())
                     .or_insert_with(|| serde_json::json!([]));
                 if let Some(pre_arr) = pre.as_array_mut() {
-                    ensure_command_hook(pre_arr, bash_matcher, &rewrite_cmd);
+                    ensure_bash_rewrite_hook(pre_arr, bash_matcher, &rewrite_cmd, home);
                     ensure_command_hook(pre_arr, REDIRECT_MATCHER, &redirect_cmd);
                 }
                 ensure_claude_observe_hooks(hooks_obj, &observe_cmd);
@@ -842,7 +888,10 @@ pub(crate) fn install_claude_project_hooks(cwd: &std::path::Path) {
                     .entry("PreToolUse".to_string())
                     .or_insert_with(|| serde_json::json!([]));
                 if let Some(pre_arr) = pre.as_array_mut() {
-                    ensure_command_hook(pre_arr, bash_matcher, &rewrite_cmd);
+                    // Project wrappers reference `~/…` scripts too; without a resolvable home
+                    // only inline delegation is detected.
+                    let home = crate::core::home::resolve_home_dir().unwrap_or_default();
+                    ensure_bash_rewrite_hook(pre_arr, bash_matcher, &rewrite_cmd, &home);
                     ensure_command_hook(pre_arr, REDIRECT_MATCHER, &redirect_cmd);
                 }
                 ensure_claude_project_observe_hooks(hooks_obj, &observe_cmd);
@@ -1025,6 +1074,65 @@ mod tests {
         );
     }
 
+    fn all_commands(pre: &[serde_json::Value]) -> Vec<String> {
+        pre.iter()
+            .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
+            .flatten()
+            .filter_map(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
+            .collect()
+    }
+
+    fn cmd_hook(command: &str) -> serde_json::Value {
+        json!({ "type": "command", "command": command })
+    }
+
+    #[test]
+    fn own_hook_recognised_in_every_rendering() {
+        for cmd in [
+            "lean-ctx hook rewrite",
+            "/Users/x/.local/bin/lean-ctx hook rewrite",
+            "\"/Users/First Last/bin/lean-ctx\" hook rewrite",
+            "C:\\Program Files\\lean-ctx\\lean-ctx.exe hook rewrite",
+            "$HOME/.cargo/bin/lean-ctx hook rewrite",
+            "/home/u/.claude/hooks/lean-ctx-rewrite.sh",
+        ] {
+            assert!(
+                is_lean_ctx_command_for(&cmd_hook(cmd), "hook rewrite"),
+                "not recognised as own: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_wrapper_mentioning_lean_ctx_is_not_own() {
+        // #1879: a wrapper that ends in the same action is the user's, not ours.
+        for cmd in [
+            "redact-wrap lean-ctx hook rewrite",
+            "sh -c 'lean-ctx hook rewrite'",
+            "/opt/bin/not-lean-ctx hook rewrite",
+        ] {
+            assert!(
+                !is_lean_ctx_command_for(&cmd_hook(cmd), "hook rewrite"),
+                "user wrapper treated as own: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_wrapper_survives_install() {
+        let mut pre = vec![json!({
+            "matcher": "Bash",
+            "hooks": [cmd_hook("redact-wrap lean-ctx hook rewrite")]
+        })];
+        ensure_command_hook(&mut pre, BASH, "lean-ctx hook rewrite");
+        assert!(
+            all_commands(&pre)
+                .iter()
+                .any(|c| c == "redact-wrap lean-ctx hook rewrite"),
+            "user wrapper stripped: {pre:?}"
+        );
+    }
+
     #[test]
     fn redirect_matcher_covers_glob() {
         // #556: shadow mode must intercept the Glob tool, so it has to be part
@@ -1061,9 +1169,15 @@ mod tests {
         assert_eq!(dedup_entries.len(), 1, "exactly one read-dedup group");
         assert_eq!(
             dedup_entries[0].get("matcher").and_then(|m| m.as_str()),
-            Some("Read"),
-            "read-dedup must match ONLY the Read tool (shape safety)"
+            Some("Read|mcp__lean-ctx__ctx_read|mcp__lean_ctx__ctx_read"),
+            "read-dedup must match ONLY Read and lean-ctx ctx_read (shape safety)"
         );
+        for tool in crate::hook_handlers::read_dedup_tools() {
+            assert!(
+                READ_DEDUP_MATCHER.split('|').any(|m| m == tool),
+                "installer matcher misses {tool}, which the handler dedups"
+            );
+        }
         let observe_present = post.iter().any(|g| {
             g.get("hooks").and_then(|h| h.as_array()).is_some_and(|h| {
                 h.iter().any(|hook| {
@@ -1182,6 +1296,64 @@ mod tests {
             "duplicates must collapse to one, got:\n{after}"
         );
         assert!(after.contains("# my notes"), "user content must survive");
+    }
+
+    #[test]
+    fn prose_marker_mention_does_not_stack_solution_blocks() {
+        // #1901: a prose mention of `<!-- lean-ctx -->` made the substring
+        // count 2, forcing a rewrite that removed only the lean-ctx block and
+        // left the solution block behind — every run stacked another copy.
+        let _lock = crate::core::data_dir::test_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let dir = crate::core::editor_registry::claude_state_dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("CLAUDE.md");
+        let prose = "# Test\n\n- The `<!-- lean-ctx -->` block below is auto-generated.\n";
+        let solution = crate::core::rules_canonical::SOLUTION_BLOCK_START;
+        let solution_end = crate::core::rules_canonical::SOLUTION_BLOCK_END;
+        let stacked = format!(
+            "{prose}\n{solution}\nold\n{solution_end}\n\n{solution}\nold\n{solution_end}\n"
+        );
+        std::fs::write(&md, stacked).unwrap();
+
+        crate::test_env::set_var("LEAN_CTX_RULES_INJECTION", "shared");
+        for _ in 0..3 {
+            install_claude_global_claude_md_for_mode(home, HookMode::Replace);
+        }
+        let after = std::fs::read_to_string(&md).unwrap();
+        install_claude_global_claude_md_for_mode(home, HookMode::Replace);
+        let again = std::fs::read_to_string(&md).unwrap();
+        crate::test_env::remove_var("LEAN_CTX_RULES_INJECTION");
+
+        let expected_solutions =
+            usize::from(!crate::core::rules_canonical::enabled_solution_rules_block().is_empty());
+        assert_eq!(
+            super::super::shared::count_marker_lines(&after, solution),
+            expected_solutions,
+            "stale solution blocks must collapse, got:\n{after}"
+        );
+        assert_eq!(
+            super::super::shared::count_marker_lines(&after, CLAUDE_MD_BLOCK_START),
+            1,
+            "{after}"
+        );
+        assert!(
+            after.starts_with(prose),
+            "user prose must survive:\n{after}"
+        );
+        assert_eq!(after, again, "a current file must not be rewritten");
+    }
+
+    #[test]
+    fn strip_removes_orphaned_solution_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let md = tmp.path().join("CLAUDE.md");
+        let start = crate::core::rules_canonical::SOLUTION_BLOCK_START;
+        let end = crate::core::rules_canonical::SOLUTION_BLOCK_END;
+        std::fs::write(&md, format!("# notes\n\n{start}\nrules\n{end}\n")).unwrap();
+        strip_claude_md_block(&md);
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "# notes\n");
     }
 
     #[test]

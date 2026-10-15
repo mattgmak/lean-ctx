@@ -56,10 +56,13 @@ pub fn add_evidence_ref(
     digest: &str,
 ) {
     observation.evidence_refs.push(EvidenceRefV1 {
+        schema_version: Some(1),
         kind,
         uri: uri.to_owned(),
         digest: digest.to_owned(),
         signature_status: SignatureStatus::NotSigned,
+        media_type: None,
+        extensions: Default::default(),
     });
 }
 
@@ -87,7 +90,11 @@ mod tests {
         assert_eq!(observation.local_cost_estimate.currency, "USD");
         assert_eq!(observation.local_cost_estimate.coefficient, 1_234);
         assert_eq!(observation.local_cost_estimate.scale, 6);
-        assert!(observation.evidence_refs.is_empty());
+        assert!(
+            observation.evidence_refs.is_empty(),
+            "{:?}",
+            observation.evidence_refs
+        );
         assert_eq!(observation.runtime_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(observation.sequence_number, 7);
         assert!(chrono::DateTime::parse_from_rfc3339(&observation.observed_at).is_ok());
@@ -101,14 +108,17 @@ mod tests {
             &mut observation,
             EvidenceKind::RuntimeLog,
             "file:///ledger.jsonl",
-            "sha256:abc",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
 
         assert_eq!(observation.evidence_refs.len(), 1);
         let evidence = &observation.evidence_refs[0];
         assert_eq!(evidence.kind, EvidenceKind::RuntimeLog);
         assert_eq!(evidence.uri, "file:///ledger.jsonl");
-        assert_eq!(evidence.digest, "sha256:abc");
+        assert_eq!(
+            evidence.digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(evidence.signature_status, SignatureStatus::NotSigned);
     }
 

@@ -150,7 +150,7 @@ pub fn build_or_update(root: &Path, bm25: &super::bm25_index::BM25Index) -> Embe
             Ok(engine) => engine,
             Err(e) => {
                 let reason = format!(
-                    "embedding model files found but engine failed to load: {e}. Fix: run `lean-ctx embeddings provision` to install the managed ONNX Runtime"
+                    "embedding model files found but engine failed to load: {e}. Check with `lean-ctx embeddings status`"
                 );
                 tracing::warn!("[embedding_index] build_or_update failed: {reason}");
                 return EmbeddingBuildOutcome::ModelNotAvailable(reason);
@@ -185,22 +185,22 @@ pub fn build_or_update(root: &Path, bm25: &super::bm25_index::BM25Index) -> Embe
                 "[embedding_index] all {} chunks up-to-date, nothing to embed",
                 bm25.chunks.len()
             );
+            clear_partial_marker(root);
             return EmbeddingBuildOutcome::Ready;
         }
 
         let changed_set: std::collections::HashSet<&str> =
             changed_files.iter().map(String::as_str).collect();
-        let mut changed_indices: Vec<usize> = Vec::new();
-        let mut changed_texts: Vec<&str> = Vec::new();
-        for (i, c) in bm25.chunks.iter().enumerate() {
-            if changed_set.contains(c.file_path.as_str()) {
-                changed_indices.push(i);
-                changed_texts.push(&c.content);
-            }
-        }
+        let changed_indices: Vec<usize> = bm25
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| changed_set.contains(c.file_path.as_str()))
+            .map(|(i, _)| i)
+            .collect();
 
         let count = changed_files.len();
-        let chunk_total = changed_texts.len() as u64;
+        let chunk_total = changed_indices.len() as u64;
         tracing::info!(
             "[embedding_index] embedding {count} changed files ({total} chunks in index)",
             total = bm25.chunks.len()
@@ -213,16 +213,47 @@ pub fn build_or_update(root: &Path, bm25: &super::bm25_index::BM25Index) -> Embe
             chunk_total,
         );
 
+        // A file is committed to the index once all of its chunks are embedded.
+        // Files without chunks (deleted since the last build) are ready at once.
+        let file_hashes = compute_file_hashes(&bm25.chunks);
+        let mut remaining: HashMap<&str, usize> = HashMap::new();
+        for &i in &changed_indices {
+            *remaining
+                .entry(bm25.chunks[i].file_path.as_str())
+                .or_default() += 1;
+        }
+        let mut checkpoint = EmbedCheckpoint {
+            pending: Vec::new(),
+            ready_files: changed_files
+                .iter()
+                .filter(|f| !remaining.contains_key(f.as_str()))
+                .cloned()
+                .collect(),
+        };
+
         // Micro-batch so CLI can show determinate % (single giant embed_batch
         // would only report 0% → 100%).
         const EMBED_PROGRESS_BATCH: usize = 32;
-        let mut batch_embeddings: Vec<Vec<f32>> = Vec::with_capacity(changed_texts.len());
         let mut embedded = 0usize;
-        for text_chunk in changed_texts.chunks(EMBED_PROGRESS_BATCH) {
-            match engine.embed_batch(text_chunk) {
-                Ok(mut v) => {
-                    embedded += text_chunk.len();
-                    batch_embeddings.append(&mut v);
+        let mut last_save = std::time::Instant::now();
+        for batch in changed_indices.chunks(EMBED_PROGRESS_BATCH) {
+            let texts: Vec<&str> = batch
+                .iter()
+                .map(|&i| bm25.chunks[i].content.as_str())
+                .collect();
+            match engine.embed_batch(&texts) {
+                Ok(vectors) => {
+                    embedded += batch.len();
+                    for (&i, vector) in batch.iter().zip(vectors) {
+                        let file = bm25.chunks[i].file_path.as_str();
+                        checkpoint.pending.push((i, vector));
+                        if let Some(left) = remaining.get_mut(file) {
+                            *left -= 1;
+                            if *left == 0 {
+                                checkpoint.ready_files.push(file.to_string());
+                            }
+                        }
+                    }
                     crate::core::index_progress::report(
                         &root_key,
                         crate::core::index_progress::IndexComponent::Semantic,
@@ -232,17 +263,29 @@ pub fn build_or_update(root: &Path, bm25: &super::bm25_index::BM25Index) -> Embe
                 }
                 Err(e) => {
                     tracing::error!("[embedding_index] batch embed failed: {e}");
+                    // Keep what is done: the next build resumes from here.
+                    checkpoint.commit(&mut idx, &bm25.chunks, &file_hashes);
+                    if let Err(e) = save_progress(&idx, root, bm25.chunks.len()) {
+                        tracing::warn!("[embedding_index] checkpoint save failed: {e}");
+                    }
                     return EmbeddingBuildOutcome::Failed;
                 }
             }
+            // Periodic checkpoint: an interrupted build (CLI exit, editor
+            // restart, memory abort) must not throw away hours of CPU work.
+            if last_save.elapsed() >= EMBED_CHECKPOINT_INTERVAL
+                && checkpoint.commit(&mut idx, &bm25.chunks, &file_hashes)
+            {
+                if let Err(e) = save_progress(&idx, root, bm25.chunks.len()) {
+                    tracing::warn!("[embedding_index] checkpoint save failed: {e}");
+                }
+                last_save = std::time::Instant::now();
+            }
         }
 
-        let new_embeddings: Vec<(usize, Vec<f32>)> =
-            changed_indices.into_iter().zip(batch_embeddings).collect();
+        checkpoint.commit(&mut idx, &bm25.chunks, &file_hashes);
 
-        idx.update(&bm25.chunks, &new_embeddings, &changed_files, None);
-
-        if let Err(e) = idx.save(root) {
+        if let Err(e) = save_progress(&idx, root, bm25.chunks.len()) {
             tracing::error!("[embedding_index] save failed: {e}");
             return EmbeddingBuildOutcome::Failed;
         }
@@ -258,6 +301,44 @@ pub fn build_or_update(root: &Path, bm25: &super::bm25_index::BM25Index) -> Embe
     {
         let _ = (root, bm25);
         EmbeddingBuildOutcome::Skipped
+    }
+}
+
+/// Minimum time between checkpoint saves during a build.
+#[cfg(feature = "embeddings")]
+const EMBED_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Embeddings computed but not yet merged into the index. Only whole files are
+/// merged, so a persisted checkpoint never records a hash for a half-embedded
+/// file and the next build re-embeds exactly the unfinished ones.
+#[cfg(feature = "embeddings")]
+struct EmbedCheckpoint {
+    pending: Vec<(usize, Vec<f32>)>,
+    ready_files: Vec<String>,
+}
+
+#[cfg(feature = "embeddings")]
+impl EmbedCheckpoint {
+    /// Merge every fully embedded file into `idx`. Returns whether anything changed.
+    fn commit(
+        &mut self,
+        idx: &mut EmbeddingIndex,
+        chunks: &[CodeChunk],
+        file_hashes: &HashMap<String, String>,
+    ) -> bool {
+        if self.ready_files.is_empty() {
+            return false;
+        }
+        let ready: std::collections::HashSet<&str> =
+            self.ready_files.iter().map(String::as_str).collect();
+        let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|(i, _)| ready.contains(chunks[*i].file_path.as_str()));
+        drop(ready);
+        idx.update(chunks, &done, &self.ready_files, Some(file_hashes));
+        self.pending = rest;
+        self.ready_files.clear();
+        true
     }
 }
 
@@ -401,16 +482,24 @@ impl EmbeddingIndex {
         chunks: &[CodeChunk],
         new_embeddings: &[(usize, Vec<f32>)],
         changed_files: &[String],
-        precomputed_hashes: Option<HashMap<String, String>>,
+        precomputed_hashes: Option<&HashMap<String, String>>,
     ) {
+        let changed: std::collections::HashSet<&str> =
+            changed_files.iter().map(String::as_str).collect();
         self.entries
-            .retain(|e| !changed_files.contains(&e.file_path));
+            .retain(|e| !changed.contains(e.file_path.as_str()));
 
         for file in changed_files {
             self.file_hashes.remove(file);
         }
 
-        let current_hashes = precomputed_hashes.unwrap_or_else(|| compute_file_hashes(chunks));
+        let computed;
+        let current_hashes = if let Some(hashes) = precomputed_hashes {
+            hashes
+        } else {
+            computed = compute_file_hashes(chunks);
+            &computed
+        };
         for file in changed_files {
             if let Some(hash) = current_hashes.get(file) {
                 self.file_hashes.insert(file.clone(), hash.clone());
@@ -471,7 +560,9 @@ impl EmbeddingIndex {
         std::fs::create_dir_all(&dir)?;
         // Binary (postcard) — compact, fast, deterministic.
         let data = postcard::to_allocvec(self).map_err(std::io::Error::other)?;
-        std::fs::write(dir.join("embeddings.bin"), data)?;
+        // `load` deletes an undecodable index; a torn write would force a
+        // full re-embed instead of costing nothing.
+        crate::core::atomic_fs::try_atomic_write(&dir.join("embeddings.bin"), &data, None)?;
         Ok(())
     }
 
@@ -506,6 +597,46 @@ impl EmbeddingIndex {
 
 fn index_dir(root: &Path) -> PathBuf {
     crate::core::index_namespace::vectors_dir(root)
+}
+
+/// Written next to `embeddings.bin` while it holds an interrupted build's
+/// checkpoint: `<embedded chunks> <total chunks>`. Removed by the final save.
+fn partial_marker_path(root: &Path) -> PathBuf {
+    index_dir(root).join("embeddings.partial")
+}
+
+/// `(embedded, total)` chunks when the persisted index is an incomplete
+/// checkpoint that `lean-ctx index build-semantic` would resume.
+pub fn partial_progress(root: &Path) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(partial_marker_path(root)).ok()?;
+    let mut parts = text.split_whitespace().map(str::parse::<u64>);
+    match (parts.next(), parts.next()) {
+        (Some(Ok(done)), Some(Ok(total))) => Some((done, total)),
+        _ => None,
+    }
+}
+
+/// Drop the partial marker once a caller has persisted a fully covering index.
+pub fn clear_partial_marker(root: &Path) {
+    let _ = std::fs::remove_file(partial_marker_path(root));
+}
+
+/// Persist `idx` as a resumable checkpoint (`done < total`) or as the finished
+/// index, keeping the partial marker in step with what is on disk.
+#[cfg(feature = "embeddings")]
+fn save_progress(idx: &EmbeddingIndex, root: &Path, total_chunks: usize) -> std::io::Result<()> {
+    idx.save(root)?;
+    let marker = partial_marker_path(root);
+    if idx.entries.len() < total_chunks {
+        let body = format!("{} {total_chunks}\n", idx.entries.len());
+        crate::core::atomic_fs::try_atomic_write(&marker, body.as_bytes(), None)?;
+    } else {
+        match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn hash_content(content: &str) -> String {
@@ -609,6 +740,81 @@ pub mod tests {
         ];
         let needs = idx.files_needing_update(&chunks);
         assert_eq!(needs.len(), 2);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn checkpoint_commits_only_fully_embedded_files() {
+        let chunks = vec![
+            make_chunk("a.rs", "fn_a1", "fn a1() {}", 1, 3),
+            make_chunk("b.rs", "fn_b", "fn b() {}", 1, 3),
+            make_chunk("a.rs", "fn_a2", "fn a2() {}", 5, 7),
+        ];
+        let hashes = compute_file_hashes(&chunks);
+        let mut idx = EmbeddingIndex::new(384);
+        // a.rs has one of its two chunks embedded; b.rs is complete.
+        let mut checkpoint = EmbedCheckpoint {
+            pending: vec![(0, dummy_embedding(384)), (1, dummy_embedding(384))],
+            ready_files: vec!["b.rs".to_string()],
+        };
+
+        assert!(checkpoint.commit(&mut idx, &chunks, &hashes));
+        assert_eq!(idx.entries.len(), 1);
+        assert_eq!(idx.entries[0].file_path, "b.rs");
+        assert_eq!(
+            checkpoint.pending.len(),
+            1,
+            "a.rs chunk waits for its sibling"
+        );
+        assert!(
+            checkpoint.ready_files.is_empty(),
+            "{:?}",
+            checkpoint.ready_files
+        );
+        // The half-embedded file gets no hash, so a resumed build re-embeds it.
+        assert_eq!(idx.files_needing_update(&chunks), vec!["a.rs".to_string()]);
+        assert!(!checkpoint.commit(&mut idx, &chunks, &hashes));
+
+        checkpoint.pending.push((2, dummy_embedding(384)));
+        checkpoint.ready_files.push("a.rs".to_string());
+        assert!(checkpoint.commit(&mut idx, &chunks, &hashes));
+        assert_eq!(idx.entries.len(), 3);
+        {
+            let found = &idx.files_needing_update(&chunks);
+            assert!(found.is_empty(), "{found:?}");
+        }
+        assert!(idx.get_aligned_flat(&chunks).is_some());
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn checkpoint_marker_tracks_partial_and_clears_on_completion() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::test_env::set_var("LEAN_CTX_DATA_DIR", data_dir.path());
+        let project_dir = tempfile::tempdir().unwrap();
+        let root = project_dir.path();
+
+        let chunks = vec![
+            make_chunk("a.rs", "fn_a", "fn a() {}", 1, 3),
+            make_chunk("b.rs", "fn_b", "fn b() {}", 1, 3),
+        ];
+        let mut idx = EmbeddingIndex::new(3);
+        idx.update(&chunks, &[(0, vec![1.0, 0.0, 0.0])], &["a.rs".into()], None);
+        save_progress(&idx, root, chunks.len()).unwrap();
+        assert_eq!(partial_progress(root), Some((1, 2)));
+        // The checkpoint itself is a loadable index that resumes at b.rs.
+        let resumed = EmbeddingIndex::load(root).unwrap();
+        assert_eq!(
+            resumed.files_needing_update(&chunks),
+            vec!["b.rs".to_string()]
+        );
+
+        idx.update(&chunks, &[(1, vec![0.0, 1.0, 0.0])], &["b.rs".into()], None);
+        save_progress(&idx, root, chunks.len()).unwrap();
+        assert_eq!(partial_progress(root), None);
+
+        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
     }
 
     #[test]

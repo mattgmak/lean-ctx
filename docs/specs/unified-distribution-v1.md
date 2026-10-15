@@ -1,8 +1,9 @@
 # Historical / Research — unified distribution
 
-> **Superseded planning record.** This document is not an accepted product
-> direction and does not authorize a public registry, marketplace, commerce
-> rail, managed addon distribution, or package-management service.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older definitions and availability below are historical.
 
 ## Current boundary
 

@@ -1,4 +1,5 @@
 use crate::core::archive;
+use crate::core::context_admission::recovery;
 use crate::core::context_handles::HandleRegistry;
 use crate::core::context_ledger::ContextLedger;
 
@@ -15,21 +16,26 @@ pub fn handle(args: &serde_json::Value) -> String {
     }
 }
 
+fn normalized_handle_ref(id: &str) -> Option<&str> {
+    let clean = id.strip_prefix('@').unwrap_or(id);
+    if clean.len() < 2
+        || !matches!(clean.chars().next()?, 'F' | 'S' | 'K' | 'M' | 'P')
+        || !clean[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(clean)
+}
+
+/// Whether `id` has a handle-reference shape accepted by `ctx_expand`.
+pub(crate) fn is_handle_ref(id: &str) -> bool {
+    normalized_handle_ref(id).is_some()
+}
+
 /// Try to resolve a handle reference (@F1, @K1, etc.) to a file path.
 /// Returns None if the ID is not a handle reference.
 pub fn resolve_handle_ref(id: &str) -> Option<String> {
-    let clean = id.strip_prefix('@').unwrap_or(id);
-    if clean.len() < 2 {
-        return None;
-    }
-    let prefix = clean.chars().next()?;
-    if !matches!(prefix, 'F' | 'S' | 'K' | 'M' | 'P') {
-        return None;
-    }
-    if !clean[1..].chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-
+    let clean = normalized_handle_ref(id)?;
     let ledger = ContextLedger::load();
     let mut registry = HandleRegistry::new();
     for entry in &ledger.entries {
@@ -63,6 +69,19 @@ fn handle_retrieve(args: &serde_json::Value) -> String {
 
     // Handle reference resolution: @F1, @K1, @S1, etc.
     if let Some(path) = resolve_handle_ref(id) {
+        // Expanding a file that was read compressed is that read's signal;
+        // after a full read it is nobody's. An unknown read leaves the
+        // current task's signals unknown.
+        use crate::core::context_store::task_signals::{self, Signal};
+        let last = crate::core::bounce_tracker::global()
+            .lock()
+            .ok()
+            .and_then(|tracker| tracker.last_read(&path));
+        match last {
+            Some((true, Some(origin))) => task_signals::record(&origin, Signal::Expand),
+            Some((false, _)) => {}
+            Some((true, None)) | None => task_signals::record_unattributed(),
+        }
         let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("full");
         return format!(
             "[handle:{id} -> {path}]\nUse ctx_read(path=\"{path}\", mode=\"{mode}\") to load content."
@@ -77,7 +96,7 @@ fn handle_retrieve(args: &serde_json::Value) -> String {
     // (`ref_`) and archive (hex) stores below. The agent pulls back just the
     // slice it needs (head / tail / search / json_path / range) instead of
     // re-injecting the whole original — the surgical front-end the issue calls
-    // "preferred when available". Works with a plain native file read too.
+    // "preferred when available". Admit the complete original before selecting.
     if let Some(path) = crate::proxy::ccr::resolve_tee(id) {
         return expand_tee_file(&path, args);
     }
@@ -90,20 +109,25 @@ fn handle_retrieve(args: &serde_json::Value) -> String {
     if id.starts_with("ref_") {
         let Some(content) = crate::server::reference_store::resolve(id) else {
             return format!(
-                "Reference '{id}' not found or expired (5-min TTL). \
-                 Use the HTTP proxy at /v1/references/{id} if available."
+                "Reference '{id}' unavailable, expired (5-min TTL), or no longer authorized."
             );
+        };
+        // Recovery is a new delivery: re-admitted under the current policy
+        // before any selector sees it (G5).
+        let content = match recovery::admit_recovered(&content, "reference") {
+            Ok(content) => content,
+            Err(reason) => return format!("ERROR: {reason}"),
         };
         return dispatch_selectors(id, &content, "Reference", args);
     }
     let archive_id = if id.starts_with("shell_") {
-        let Some(archive_id) = archive::resolve_alias(id) else {
-            return format!(
-                "Background job '{id}' has no retrievable output archive. \
-                 The archive is unavailable or expired."
-            );
-        };
-        archive_id
+        match archive::resolve_alias(id) {
+            Some(archive_id) => archive_id,
+            None => match archive_finished_job(id) {
+                Ok(archive_id) => archive_id,
+                Err(message) => return message,
+            },
+        }
     } else {
         id.to_string()
     };
@@ -112,7 +136,49 @@ fn handle_retrieve(args: &serde_json::Value) -> String {
             "Archive '{archive_id}' not found or expired. Use ctx_expand(action=\"list\") to see available archives."
         );
     };
+    let content = match recovery::admit_recovered(&content, "archive") {
+        Ok(content) => content,
+        Err(reason) => return format!("ERROR: {reason}"),
+    };
     dispatch_selectors(&archive_id, &content, "Archive", args)
+}
+
+/// GH #2005: a background job is archived when a status poll first reports it
+/// finished, so `ctx_expand(id=<jobId>)` used to find nothing before that poll
+/// and answered "expired" for a running job, a finished one and an unknown ID
+/// alike. Ask the job table instead: archive a finished job's output now (the
+/// same redaction and alias as the status path), and name the other two cases.
+fn archive_finished_job(id: &str) -> Result<String, String> {
+    use crate::server::background_shell::{JobState, status};
+    let (output, label) = match status(id) {
+        None => {
+            return Err(format!(
+                "Background job '{id}' does not exist, or finished more than 5 minutes ago \
+                 without being polled or expanded."
+            ));
+        }
+        Some(JobState::Running { .. }) => {
+            return Err(format!(
+                "Background job '{id}' is still running. Expand it once it has finished, or \
+                 read its progress with ctx_shell(background_action=\"status\", job_id=\"{id}\")."
+            ));
+        }
+        Some(JobState::Completed { output, exit_code }) => (output, format!("exit {exit_code}")),
+        Some(JobState::Cancelled { output }) => (output, "cancelled".to_string()),
+    };
+    if output.trim().is_empty() {
+        return Err(format!(
+            "Background job '{id}' finished ({label}) without output."
+        ));
+    }
+    let redacted = crate::core::redaction::redact_text_if_enabled(&output);
+    archive::store_background("ctx_shell", id, &redacted, None)
+        .map(|stored| stored.id)
+        .ok_or_else(|| {
+            format!(
+                "Background job '{id}' finished ({label}), but its output could not be archived."
+            )
+        })
 }
 
 /// Apply the structured selector ladder (head / tail / json_keys / search /
@@ -180,11 +246,9 @@ fn dispatch_selectors(id: &str, content: &str, noun: &str, args: &serde_json::Va
 /// the verbatim tee content on disk, so the agent pulls back only the slice it
 /// needs rather than undoing the proxy's compression with a full re-inject.
 fn expand_tee_file(path: &std::path::Path, args: &serde_json::Value) -> String {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return format!(
-            "ERROR: CCR tee file is no longer available: {}",
-            path.display()
-        );
+    let content = match crate::proxy::ccr::read_tee_detailed(path) {
+        Ok(content) => content,
+        Err(reason) => return format!("ERROR: {reason}"),
     };
     let label = path.file_name().and_then(|n| n.to_str()).unwrap_or("ccr");
 
@@ -321,10 +385,16 @@ fn handle_search_all(args: &serde_json::Value) -> String {
 
     let mut out = format!("{} result(s) for \"{}\":\n", results.len(), query);
     for r in &results {
-        out.push_str(&format!(
-            "  {} | {} | {} | …{}…\n",
-            r.archive_id, r.tool, r.command, r.snippet
-        ));
+        // Index rows are recovered text too: each row is re-admitted as a
+        // whole, and a row the gateway withholds is listed without content.
+        let row = format!("{} | …{}…", r.command, r.snippet);
+        match recovery::admit_recovered(&row, "archive-index") {
+            Ok(row) => out.push_str(&format!("  {} | {} | {row}\n", r.archive_id, r.tool)),
+            Err(_) => out.push_str(&format!(
+                "  {} | {} | [withheld by the context gateway]\n",
+                r.archive_id, r.tool
+            )),
+        }
     }
     out.push_str("\nRetrieve full: ctx_expand(id=\"<archive_id>\")");
     out
@@ -482,8 +552,31 @@ mod tests {
         );
     }
 
+    /// #1911: the HTML→markdown crush footer tells the agent to call
+    /// `ctx_expand(id=<html_ handle>, search=…)`; that exact call must slice the
+    /// persisted page instead of reporting "not found or expired".
+    #[test]
+    fn ctx_expand_retrieves_html_crush_original() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        let original = (1..=40)
+            .map(|i| format!("<h2>Section {i}</h2><p>body of section {i}</p>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let handle_path = crate::proxy::ccr::persist_html(&original).expect("html tee handle");
+        assert!(handle_path.contains("html_"), "html_ prefix: {handle_path}");
+
+        let out = handle(&json!({ "id": handle_path, "search": "Section 7<" }));
+        assert!(
+            out.contains("body of section 7<") && !out.contains("body of section 8<"),
+            "html section recoverable: {out}"
+        );
+        assert!(!out.contains("not found"), "{out}");
+    }
+
     #[test]
     fn ctx_expand_resolves_reference_store_ids() {
+        let _data = crate::core::data_dir::isolated_data_dir();
+        let _policy = crate::core::policy::runtime::TestPolicyOverride::set(None);
         // #498: `ref_`-prefixed IDs route to the in-memory reference store, not
         // the on-disk archive. Exercises the resolve-then-dispatch ladder end to
         // end through the public `handle` entry point.
@@ -491,7 +584,7 @@ mod tests {
             .map(|i| format!("ref row {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let id = crate::server::reference_store::store(body);
+        let id = crate::server::reference_store::store(&body).unwrap();
         assert!(id.starts_with("ref_"), "store must mint a ref_ id: {id}");
 
         let full = handle(&json!({"id": id}));
@@ -518,7 +611,9 @@ mod tests {
 
     #[test]
     fn ctx_expand_reference_json_keys_and_missing() {
-        let id = crate::server::reference_store::store(r#"{"a":1,"b":[1,2,3]}"#.to_string());
+        let _data = crate::core::data_dir::isolated_data_dir();
+        let _policy = crate::core::policy::runtime::TestPolicyOverride::set(None);
+        let id = crate::server::reference_store::store(r#"{"a":1,"b":[1,2,3]}"#).unwrap();
         let keys = handle(&json!({"id": id, "json_keys": true}));
         assert!(keys.contains("object (2 keys)"), "got: {keys}");
         assert!(keys.contains("array(3)"), "got: {keys}");
@@ -527,7 +622,7 @@ mod tests {
         // the archive's "not found" message.
         let missing = handle(&json!({"id": "ref_deadbeefcafef00d"}));
         assert!(
-            missing.contains("not found or expired") && missing.contains("5-min TTL"),
+            missing.contains("unavailable") && missing.contains("5-min TTL"),
             "got: {missing}"
         );
     }

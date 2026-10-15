@@ -1,9 +1,11 @@
-# LeanCTX as the local context layer
+# Integrating the LeanCTX Context Gateway
 
-> **Give every agent a context system.**
+> **Context Gateway for AI Systems. Control what your AI can see.**
 
-LeanCTX is the **Context SDK for AI Agents**. It runs inside or alongside an
-existing agent and makes the context path before inference explicit:
+LeanCTX sits between AI and the systems it reads: **SELECT → CONTROL → PROVE**.
+LeanCTX Engine implements context selection, supported controls, and bounded
+evidence. LeanCTX SDK connects applications to that runtime.
+Within the Engine, the technical context lifecycle is:
 
     select → shape → reuse → recover
 
@@ -29,7 +31,7 @@ outside that visibility.
 | --- | --- | --- |
 | Attach | Available | Operate around a supported coding agent through local CLI, MCP, hooks, or proxy paths. |
 | Wrap | Preview | Use the declared Python SDK v1 reference-wrapper scope. |
-| Embed | Preview | Integrate natively into a custom host while the host retains ownership of its agent loop. |
+| Embed with the standalone LeanCTX SDK | Available stable contract | Use the released context lifecycle and Agent Tools interfaces; the host retains ownership of its agent loop. Preview namespace operations remain Preview. |
 
 ## Research: shared project context
 
@@ -50,10 +52,12 @@ platform, marketplace, model router, or generic agent framework. A source
 connector, index, provider, plugin, or implementation module does not itself
 create a public product promise.
 
-Context Plans are **Preview**. Performance Profiles, Context Kits, broad
-provider composition, and organization-scale operation are **Research** according to the
-Product Architecture (`docs/internal/vision/PRODUCT-ARCHITECTURE.md`, internal — not in this repository). They must
-be status-labelled where they appear.
+The standalone SDK's released ContextPlan belongs to its stable lifecycle.
+Older planning proposals do not set that package's status. Performance Profiles,
+first-class Context Kits, and cross-agent product directions remain Research.
+Commercial Enterprise organization capabilities have a separate contract and
+license; they are not promoted or demoted by this Engine guide. See
+[current positioning](../POSITIONING_CANONICAL.md) and [SDK boundaries](../reference/sdk-surface.md).
 
 ## Evidence
 

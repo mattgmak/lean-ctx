@@ -78,12 +78,58 @@ fn key_enum_with_env(values: &[&str], default: &str, desc: &str, env: &str) -> K
     }
 }
 
+/// `hook_mode` (root section); kept here so `sections_core.rs` stays under the
+/// LOC gate.
+fn hook_mode_key() -> KeySchema {
+    key_enum_with_env(
+        &["auto", "hybrid", "replace", "mcp"],
+        "auto",
+        "How lean-ctx integrates with agents. auto (default): Hybrid for every \
+         hook-capable agent — native calls are not refused, known commands are \
+         rewritten through lean-ctx; Claude Code's tool list leaves out native \
+         Grep/Glob (no refusals, searches stay compressed). hybrid: the same, \
+         with Grep/Glob back in Claude Code. replace: deny native \
+         Grep/Glob (and non-rewritable shell where the host supports it) so \
+         ctx_* MCP tools are the only path; also set by `lean-ctx harden \
+         --hard`. mcp: MCP server only, no hooks",
+        "LEAN_CTX_HOOK_MODE",
+    )
+}
+
+/// `daemon_max_rss_mb` (root section); kept here so `sections_core.rs` stays
+/// under the LOC gate.
+fn daemon_max_rss_key(cfg: &crate::core::config::Config) -> KeySchema {
+    key_with_env(
+        "u64",
+        serde_json::json!(cfg.daemon_max_rss_mb),
+        "Process RSS target (MB) of the background daemon; the guardian evicts above \
+         the lower of this and max_ram_percent (default 2048, 0 = percent only)",
+        "LEAN_CTX_DAEMON_MAX_RSS_MB",
+    )
+}
+
 impl ConfigSchema {
     pub fn generate() -> Self {
         let mut sections = BTreeMap::new();
         sections_core::build(&mut sections);
         sections_features::build(&mut sections);
         sections_advanced::build(&mut sections);
+        sections.insert("intelligence_runtime".into(), SectionSchema {
+            description: "Global-only optional runtime consent and independent staging pins; project overrides never apply".into(),
+            keys: [
+                ("enabled", key("bool", serde_json::json!(false), "Opt in to the verified local runtime")),
+                ("accept_proprietary", key("bool", serde_json::json!(false), "Explicit user acceptance of the separately licensed runtime")),
+                ("staging", key("bool", serde_json::json!(false), "Staging-only delivery; not production release approval")),
+                ("root", key("string", serde_json::json!(""), "Absolute private installation root")),
+                ("manifest_sha256", key("string", serde_json::json!(""), "Independently selected manifest digest")),
+                ("trust_key_hex", key("string", serde_json::json!(""), "Independently provisioned Ed25519 public key, lowercase hex")),
+                ("channel_url", key("string", serde_json::json!(""), "Explicit staging catalog URL; fetched only after consent")),
+                ("channel_signature_url", key("string", serde_json::json!(""), "Detached staging catalog signature URL")),
+                ("channel_root_key_hex", key("string", serde_json::json!(""), "Independently provisioned catalog root; never learned from a download")),
+                ("license_configuration", key("string", serde_json::json!(""), "Explicit user-global path to private license configuration; saved after installed device provisioning")),
+                ("context_policy_apply", key("bool", serde_json::json!(false), "Apply the promoted read-strategy policy in planning instead of recording it in shadow; security and explicit choices still win")),
+            ].into_iter().map(|(name, value)| (name.into(), value)).collect(),
+        });
 
         ConfigSchema {
             version: 1,
@@ -239,6 +285,7 @@ mod tests {
         let schema = ConfigSchema::generate();
         for key in [
             "path_jail",
+            "path_jail_scope",
             "persona",
             "bypass_hints",
             "shell_security",

@@ -1,6 +1,9 @@
 mod amp;
 mod antigravity;
 mod claude;
+mod claude_delegation;
+pub mod claude_mod;
+mod claude_statusline;
 mod cline;
 mod codebuddy;
 mod codex;
@@ -9,7 +12,7 @@ mod crush;
 mod cursor;
 mod gemini;
 mod grok;
-mod hermes;
+pub mod hermes;
 mod jetbrains;
 mod kiro;
 mod openclaw;
@@ -30,6 +33,9 @@ pub(super) use claude::{
     install_claude_hook_config, install_claude_hook_scripts, install_claude_hook_with_mode,
     install_claude_permissions_allow_mcp, install_claude_permissions_deny_replace,
     install_claude_project_hooks,
+};
+pub(crate) use claude_statusline::{
+    install_claude_statusline, is_lean_ctx_statusline, remove_lean_ctx_statusline,
 };
 pub(super) use cline::install_cline_rules;
 pub(crate) use codebuddy::CODEBUDDY_MD_BLOCK_START;
@@ -58,6 +64,7 @@ pub(super) use jetbrains::install_jetbrains_hook;
 pub(super) use kiro::install_kiro_hook;
 pub(super) use openclaw::install_openclaw_hook;
 pub(super) use opencode::install_opencode_hook_with_mode;
+pub(crate) use opencode::release_opencode_native_tool_gates;
 pub(crate) use opencode::unregister_opencode_instructions;
 pub(super) use pi::install_pi_hook_with_mode;
 pub(super) use qoder::{install_qoder_hook_with_mode, install_qoder_runtime_hook_with_mode};

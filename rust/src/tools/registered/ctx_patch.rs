@@ -4,6 +4,7 @@ use serde_json::{Map, Value, json};
 
 use crate::server::tool_trait::{
     McpTool, ToolContext, ToolOutput, get_bool, get_int, get_str, require_resolved_path,
+    tool_execution_error,
 };
 use crate::tool_defs::tool_def;
 
@@ -77,6 +78,9 @@ impl McpTool for CtxPatchTool {
         args: &Map<String, Value>,
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ErrorData> {
+        let inferred = infer_replace_unique(args);
+        let args = inferred.as_ref().unwrap_or(args);
+
         // replace_symbol is a whole-symbol rewrite — delegate to the LSP/IDE-aware
         // ctx_refactor so there is one symbol-edit implementation (epic #1008).
         if crate::tools::ctx_patch::is_replace_symbol(args) {
@@ -162,7 +166,8 @@ fn handle_anchored(args: &Map<String, Value>, ctx: &ToolContext) -> Result<ToolO
             allow_lossy_utf8,
             validate_syntax,
         };
-        let output = apply_one(ctx, &patch_params)?;
+        let output =
+            apply_one(ctx, &patch_params).map_err(|error| with_prior_edits(error, &texts))?;
         texts.push(format!("[{path}]\n{output}"));
     }
 
@@ -176,6 +181,34 @@ fn handle_anchored(args: &Map<String, Value>, ctx: &ToolContext) -> Result<ToolO
         shell_outcome: None,
         content_blocks: None,
     })
+}
+
+/// An edit that carries old and new text but no `op` can only be
+/// `replace_unique` (every other op needs line numbers or a symbol). Infer it,
+/// at the top level and per `ops[]` entry, instead of rejecting the call with
+/// "missing 'op'". `None` when nothing needed inferring.
+fn infer_replace_unique(args: &Map<String, Value>) -> Option<Map<String, Value>> {
+    fn is_text_replacement(obj: &Map<String, Value>) -> bool {
+        let text = |keys: [&str; 2]| keys.iter().find_map(|key| obj.get(*key)?.as_str());
+        !obj.contains_key("op")
+            && text(["old_text", "old_string"]).is_some_and(|old| !old.is_empty())
+            && text(["new_text", "new_string"]).is_some()
+    }
+    let mut out = args.clone();
+    let mut inferred = false;
+    if !out.contains_key("ops") && is_text_replacement(&out) {
+        out.insert("op".into(), json!("replace_unique"));
+        inferred = true;
+    }
+    if let Some(Value::Array(ops)) = out.get_mut("ops") {
+        for op in ops.iter_mut().filter_map(Value::as_object_mut) {
+            if is_text_replacement(op) {
+                op.insert("op".into(), json!("replace_unique"));
+                inferred = true;
+            }
+        }
+    }
+    inferred.then_some(out)
 }
 
 /// `Some(op)` when a batch op must be dispatched through its own single-op
@@ -235,19 +268,16 @@ fn handle_mixed_batch(
         };
         flush_anchored_run(args, ctx, &mut run, &mut texts)?;
 
-        let (sub_args, sub_ctx) = delegated_op_call(args, obj, ctx, i, kind)?;
+        let (sub_args, sub_ctx) = delegated_op_call(args, obj, ctx, i, kind)
+            .map_err(|error| with_prior_edits(error, &texts))?;
         let out = if kind == "replace_unique" {
             delegate_replace_unique(&sub_args, &sub_ctx)
         } else {
             delegate_replace_symbol(&sub_args, &sub_ctx)
         }
-        .map_err(|e| {
-            let applied = if texts.is_empty() {
-                ""
-            } else {
-                " (earlier ops in this batch were already applied)"
-            };
-            ErrorData::invalid_params(format!("ops[{i}] ({kind}): {}{applied}", e.message), None)
+        .map_err(|mut e| {
+            e.message = format!("ops[{i}] ({kind}): {}", e.message).into();
+            with_prior_edits(e, &texts)
         })?;
         let label = get_str(&sub_args, "path").unwrap_or_else(|| kind.to_string());
         texts.push(format!("[{label}]\n{}", out.text));
@@ -269,8 +299,27 @@ fn flush_anchored_run(
     }
     let mut sub = args.clone();
     sub.insert("ops".into(), Value::Array(std::mem::take(run)));
-    texts.push(handle_anchored(&sub, ctx)?.text);
+    texts.push(
+        handle_anchored(&sub, ctx)
+            .map_err(|error| with_prior_edits(error, texts))?
+            .text,
+    );
     Ok(())
+}
+
+/// A cross-file or mixed batch is not a transaction across completed runs.
+/// Preserve their receipts when a later edit fails, and stop before more writes.
+fn with_prior_edits(mut error: ErrorData, texts: &[String]) -> ErrorData {
+    if !texts.is_empty() {
+        error.code = crate::server::tool_trait::TOOL_EXECUTION_ERROR;
+        error.message = format!(
+            "{}\nEarlier ops in this batch were already applied:\n{}",
+            error.message,
+            texts.join("\n\n")
+        )
+        .into();
+    }
+    error
 }
 
 /// Build the (args, ctx) for one delegated batch op: the op object inherits the
@@ -511,8 +560,9 @@ fn apply_one(
         // Heavy disk I/O — no global cache lock held here.
         let before = std::fs::read(&path).unwrap_or_default();
         let (output, effect) = crate::tools::ctx_patch::run_io(params, &last_mode);
+        let written = matches!(effect, crate::tools::ctx_edit::CacheEffect::Invalidate);
 
-        if matches!(effect, crate::tools::ctx_edit::CacheEffect::Invalidate) {
+        if written {
             let after = std::fs::read(&path).unwrap_or_default();
             super::ctx_edit::observe_mcp_edit(ctx, &path, "ctx_patch", &before, &after);
         }
@@ -531,6 +581,10 @@ fn apply_one(
                     );
                 }
             }
+        }
+
+        if !written {
+            return Err(tool_execution_error(output));
         }
 
         if let Some(session_lock) = ctx.session.as_ref() {
@@ -577,6 +631,9 @@ fn delegate_replace_symbol(
     let args_value = Value::Object(refactor_args);
     let result = crate::tools::ctx_refactor::handle(&args_value, &ctx.project_root, &abs_path);
     let changed = !result.starts_with("ERROR") && !result.starts_with("CONFLICT");
+    if !changed {
+        return Err(tool_execution_error(result));
+    }
 
     Ok(ToolOutput {
         text: result,
@@ -596,30 +653,45 @@ fn delegate_replace_symbol(
 /// ops) meant "delete every match" and still reported success. Now: reject
 /// replacement keys that belong to other ops, and require `replace` to be
 /// present. An empty deletion must be opted into explicitly with `replace=""`.
+///
+/// The other ops' names are accepted as aliases — `old_string`/`old_text` for
+/// `find`, `new_string`/`new_text` for `replace` — because agents carry them
+/// over and the mapping is unambiguous. What stays closed is the #879 hole: a
+/// replacement must still be *named*, so a missing one is never read as "".
 fn resolve_find_replace(args: &Map<String, Value>) -> Result<(String, String), String> {
-    let find = get_str(args, "find")
+    let find = aliased(args, "find", &["old_string", "old_text"])?
         .filter(|s| !s.is_empty())
-        .ok_or("replace_all requires non-empty 'find'")?;
+        .ok_or("replace_all requires non-empty 'find' (old_string also accepted)")?;
+    let replace = aliased(args, "replace", &["new_string", "new_text"])?.ok_or(
+        "replace_all requires 'replace' (the replacement text, new_string also accepted); \
+         pass replace=\"\" explicitly to delete every match",
+    )?;
+    Ok((find, replace))
+}
 
-    for foreign in ["new_text", "new_string", "old_string"] {
-        if args.contains_key(foreign) {
-            return Err(format!(
-                "replace_all names its replacement 'replace', not '{foreign}' — rename it \
-                 (an unrecognized replacement key would silently delete every match)"
-            ));
+/// The string under `key` or one of its `aliases`. Two spellings that
+/// disagree are an error rather than a silent pick.
+fn aliased(
+    args: &Map<String, Value>,
+    key: &str,
+    aliases: &[&str],
+) -> Result<Option<String>, String> {
+    let mut found: Option<(&str, &str)> = None;
+    for name in std::iter::once(key).chain(aliases.iter().copied()) {
+        let Some(value) = args.get(name).and_then(Value::as_str) else {
+            continue;
+        };
+        match found {
+            Some((first, seen)) if seen != value => {
+                return Err(format!(
+                    "'{first}' and '{name}' name the same field with different values — pass only one"
+                ));
+            }
+            Some(_) => {}
+            None => found = Some((name, value)),
         }
     }
-
-    let replace = args
-        .get("replace")
-        .and_then(Value::as_str)
-        .map(String::from)
-        .ok_or(
-            "replace_all requires 'replace' (the replacement text); pass replace=\"\" \
-             explicitly to delete every match",
-        )?;
-
-    Ok((find, replace))
+    Ok(found.map(|(_, value)| value.to_string()))
 }
 
 /// #825: Bulk literal find-and-replace — no anchors needed.
@@ -633,7 +705,7 @@ fn handle_replace_all(
     let dry_run = get_bool(args, "dry_run").unwrap_or(false);
 
     let content = std::fs::read_to_string(&path)
-        .map_err(|e| ErrorData::internal_error(format!("cannot read {path}: {e}"), None))?;
+        .map_err(|e| tool_execution_error(format!("cannot read {path}: {e}")))?;
 
     let count = content.matches(find.as_str()).count();
     if count == 0 {
@@ -655,7 +727,7 @@ fn handle_replace_all(
 
     let new_content = content.replace(find.as_str(), &replace);
     crate::config_io::write_atomic(std::path::Path::new(&path), &new_content)
-        .map_err(|e| ErrorData::internal_error(format!("write failed: {e}"), None))?;
+        .map_err(|e| tool_execution_error(format!("write failed: {e}")))?;
     super::ctx_edit::observe_mcp_edit(
         ctx,
         &path,
@@ -708,14 +780,33 @@ mod replace_all_tests {
     }
 
     #[test]
-    fn foreign_replacement_key_is_rejected() {
-        for key in ["new_string", "new_text", "old_string"] {
-            let err = resolve_find_replace(&obj(json!({"find": "a", key: "b"}))).unwrap_err();
-            assert!(
-                err.contains(key),
-                "must name the offending key {key}: {err}"
-            );
+    fn other_ops_names_are_aliases() {
+        for (old, new) in [("old_string", "new_string"), ("old_text", "new_text")] {
+            let (f, r) = resolve_find_replace(&obj(json!({old: "a", new: "b"}))).unwrap();
+            assert_eq!((f.as_str(), r.as_str()), ("a", "b"), "{old}/{new}");
         }
+    }
+
+    #[test]
+    fn alias_never_turns_a_missing_replacement_into_a_delete() {
+        let err = resolve_find_replace(&obj(json!({"old_string": "a"}))).unwrap_err();
+        assert!(err.contains("requires 'replace'"), "got: {err}");
+    }
+
+    #[test]
+    fn conflicting_spellings_are_rejected() {
+        let err = resolve_find_replace(&obj(
+            json!({"find": "a", "old_string": "x", "replace": "b"}),
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("find") && err.contains("old_string"),
+            "got: {err}"
+        );
+        let same = resolve_find_replace(&obj(
+            json!({"find": "a", "old_string": "a", "replace": "b"}),
+        ));
+        assert!(same.is_ok(), "identical spellings agree");
     }
 
     #[test]
@@ -818,5 +909,36 @@ mod batch_grouping_tests {
             args.get("dry_run").and_then(Value::as_bool) == Some(true),
             "dry_run flag preserved in original args"
         );
+    }
+
+    #[test]
+    fn text_replacement_without_op_is_inferred_as_replace_unique() {
+        let top = Map::from_iter([
+            ("path".into(), json!("a.rs")),
+            ("old_string".into(), json!("old")),
+            ("new_string".into(), json!("new")),
+        ]);
+        let inferred = infer_replace_unique(&top).expect("op inferred");
+        assert_eq!(inferred.get("op"), Some(&json!("replace_unique")));
+
+        let batch = Map::from_iter([(
+            "ops".into(),
+            json!([
+                {"path": "a.rs", "old_text": "a", "new_text": "b"},
+                {"op": "set_line", "line": 1, "hash": "aa", "new_text": "x"}
+            ]),
+        )]);
+        let inferred = infer_replace_unique(&batch).expect("op inferred in ops[]");
+        assert_eq!(inferred["ops"][0]["op"], json!("replace_unique"));
+        assert_eq!(inferred["ops"][1]["op"], json!("set_line"));
+
+        // An explicit op, an empty old text or a missing new text stay as sent.
+        for unchanged in [
+            json!({"op": "set_line", "old_text": "a", "new_text": "b"}),
+            json!({"old_text": "", "new_text": "b"}),
+            json!({"old_text": "a"}),
+        ] {
+            assert!(infer_replace_unique(unchanged.as_object().unwrap()).is_none());
+        }
     }
 }

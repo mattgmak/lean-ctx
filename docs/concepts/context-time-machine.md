@@ -1,12 +1,9 @@
 # Historical Context Time Machine proposal
 
-> **Status: historical research — not a current product surface or availability
-> claim.** This proposal predates LeanCTX's current product boundary and must not
-> be used to advertise a dashboard, hosted registry, Context Snapshot product,
-> public sharing, or universal performance proof. LeanCTX is **The Context SDK
-> for AI Agents**: an available local context system for existing agents that
-> selects, shapes, reuses, and recovers task-fit context. Current scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> **Status: Historical / Research.** This retained proposal is not a current
+> product or release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md); product definitions
+> and availability in the original proposal below are historical.
 
 ## TL;DR
 

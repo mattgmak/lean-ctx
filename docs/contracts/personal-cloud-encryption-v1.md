@@ -1,10 +1,9 @@
 # personal-cloud-encryption-v1 — Zero-Knowledge Vaults (Knowledge + Gotchas)
 
-> **Status: historical research contract — unavailable.** This proposed Personal
-> Cloud/account synchronization service is not a current LeanCTX product or
-> endpoint. LeanCTX is **The Context SDK for AI Agents**; available evidence and
-> verification paths are local. Current scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 Status: historical research · Engine: `core/knowledge_vault.rs` ·
 Server: `lean-ctx-enterprise: cloud_server/knowledge.rs` (`knowledge_blobs`),

@@ -141,7 +141,7 @@ or the single dir for legacy/mixed installs — see §1); per-project override a
 |---------|------------------|
 | (root keys) | compression, cache, shell hook, profiles, memory caps, savings footer, proxy tri-state |
 | `[tools]` | `profile` (minimal/standard/power), explicit `enabled` list |
-| `[setup]` | `auto_inject_rules`, `auto_inject_skills`, `auto_update_mcp` |
+| `[setup]` | `auto_inject_rules`, `auto_inject_skills`, `auto_update_mcp`, `manage_hooks` |
 | `[archive]` | Zero-loss tool-output archive: `enabled`, `threshold_chars` (800), `max_age_hours` (48), `max_disk_mb` (500) |
 | `[search]` | BM25/dense/splade weights + candidate counts |
 | `[autonomy]` | Auto preload/dedup/consolidate, cognition loop |
@@ -150,18 +150,20 @@ or the single dir for legacy/mixed installs — see §1); per-project override a
 | `[knowledge_routing]` | Add focused cross-source knowledge hints: `enabled`, `max_references` |
 | `[providers]` | GitHub/GitLab/Jira/Postgres + MCP bridges |
 | `[loop_detection]` | Per-tool call limits to prevent agent loops |
-| `[updates]` | `auto_update`, `check_interval_hours` (6), `notify_only` |
+| `[updates]` | `auto_update`, `check_interval_hours` (6), `notify_only`, `pinned_version` |
 | `[boundary_policy]` | Cross-project search/import + universal gotchas |
 | `[secret_detection]` | Secret redaction in output |
 | `[cloud]` | `contribute_enabled` + sync timestamps |
 | `[proxy]` | Upstream URLs for Anthropic/OpenAI/Gemini |
 | `[memory.*]` | Knowledge/episodic/procedural/lifecycle/gotcha/embeddings caps |
 | `[llm]` | Optional local LLM enhance (Ollama) |
+| `[value_display]` | How lean-ctx shows its value outside the model's context: `mode` (`off`/`minimal`/`milestones`/`verbose`), recap cadence, notifications, git trailer |
 
 Key defaults worth knowing:
 - `compression_level = "lite"` (root) — light compression on by default.
-- `savings_footer = "always"` config default, but the **`SavingsFooter` enum
-  default is `Never`** so no inline footer tokens are emitted unless enabled.
+- `savings_footer = "never"` — no inline footer tokens are emitted unless
+  enabled. The value surface (`[value_display]`, `lean-ctx value`) shows the
+  savings without spending model context.
 - `memory_profile = "performance"`, `memory_cleanup = "aggressive"`.
 - `[memory.knowledge] max_facts = 200` — the source of doctor's "facts at
   capacity" warning.
@@ -218,9 +220,44 @@ between `<!-- lean-ctx -->` markers — your own content is preserved.
 
 ## 5. Filesystem boundary — `path_jail`, `allow_paths`, `extra_roots` (GH #392)
 
-All tool file access (`ctx_read`, `ctx_edit`, `ctx_tree`, …) is jailed under the
-current `project_root` (**PathJail**). Three knobs widen or remove that boundary —
-they overlap, so here is exactly what each one does:
+Without an explicit path, multi-root tools such as `ctx_search` use the active
+engine's project root and configured extra roots, not the daemon's process
+working directory. With neither an explicit path nor an absolute active project
+root, the default search fails instead of scanning an unrelated directory;
+configured extra roots do not bypass this check.
+
+All tool file access (`ctx_read`, `ctx_edit`, `ctx_tree`, …) is checked by
+**PathJail**. What it admits is set by `path_jail_scope` (since v3.11.1):
+
+- **`home` (default):** everything below your home directory is readable and,
+  since v3.11.3, writable — so all your projects and files work at once. Excepted
+  are the protected zones: every
+  top-level dot entry (`~/.ssh`, `~/.aws`, `~/.config`, `~/.zshrc`, other
+  agents' `~/.claude` / `~/.codex` / `~/.cursor`, …) plus `~/Library` (macOS),
+  `~/AppData` / `NTUSER.DAT*` (Windows) and `~/snap` (Linux).
+  Paths outside `~` stay jailed. The home directory itself is not admitted as a
+  root, so a tree walk never starts there. Zones stay closed even when a root
+  or allow entry contains them; only an entry inside a zone opens it. With an
+  implausible `$HOME` (`/`, `/root`, `/tmp`, not owned by you) the scope falls
+  back to `project`.
+- **`projects`:** the default of v3.11.1–v3.11.2. Only paths inside a *project*
+  below `~` are readable — a folder between it and `~` holds a project marker
+  (`.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`,
+  `Makefile`, …); loose personal files (`~/Documents/taxes.pdf`, `~/Downloads`,
+  `~/Desktop`) stay jailed, and *writes* stay limited to the session's project,
+  host-declared roots and allow entries.
+- **`project`:** only the session's `project_root` plus the knobs below — the
+  pre-3.11.1 behaviour.
+
+`path_jail_scope` is global-only (a project-local `.lean-ctx.toml` cannot set
+it); env override `LEAN_CTX_PATH_JAIL_SCOPE`.
+
+The quickest way to admit one more directory — outside `~`, a sibling project
+to edit, or a single protected one — is `lean-ctx allow-path <dir>` (appends to
+`allow_paths`, read + write, effective immediately; `--list`, `--remove`). It
+refuses `/`, `~` and any directory containing `~`.
+Further knobs widen or remove the boundary — they overlap, so here is exactly
+what each one does:
 
 | Knob | Effect | Use when |
 |------|--------|----------|
@@ -231,6 +268,20 @@ they overlap, so here is exactly what each one does:
 
 Env equivalents (path-list syntax, `:` on Unix / `;` on Windows):
 `LEAN_CTX_ALLOW_PATH` (= `allow_paths`), `LEAN_CTX_EXTRA_ROOTS` (= `extra_roots`).
+Env vars are read when the MCP server starts, so prefer the config keys: they
+apply on the next tool call.
+
+**Project binding is per session.** The active `project_root` comes from the
+host (MCP roots, `CLAUDE_PROJECT_DIR` / `CURSOR_PROJECT_DIR` / workspace
+folders) or the server's working directory. Do not put `LEAN_CTX_PROJECT_ROOT`
+into an agent's *global* MCP config (`~/.codex/config.toml`, `~/.grok/config.toml`,
+a global `mcp.json`): that pins one project for every session of the agent.
+lean-ctx versions before 3.11.1 wrote such pins during `setup`; current versions
+remove them on the next agent refresh, `lean-ctx doctor` lists any that remain
+("Project binding") and `lean-ctx doctor --fix` removes them — line by line, so
+JSON key order and comments survive; a `LEAN_CTX_EXTRA_ROOTS` value moves into
+`extra_roots`. Per-project entries (`projects.*` in `~/.claude.json`) are left
+alone. A session started inside a different real project ignores a stale pin.
 
 Notes that save debugging time:
 

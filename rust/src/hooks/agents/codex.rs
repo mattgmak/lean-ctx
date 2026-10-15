@@ -160,6 +160,8 @@ fn install_codex_hook_config(codex_dir: &std::path::Path) -> bool {
     let config_toml_path = crate::core::home::resolve_codex_config_path()
         .unwrap_or_else(|| codex_dir.join("config.toml"));
     let config_content = std::fs::read_to_string(&config_toml_path).unwrap_or_default();
+    // The refresh below strips a global project pin; keep the extra roots.
+    crate::hooks::project_pins::migrate_extra_roots(&config_content);
 
     // Hybrid mode: ensure MCP server entry exists in config.toml so Codex
     // Desktop/Cloud can reach lean-ctx even without CLI hooks.
@@ -190,6 +192,10 @@ fn install_codex_hook_config(codex_dir: &std::path::Path) -> bool {
 
 fn ensure_codex_observe_hooks(root: &mut serde_json::Value, observe_cmd: &str) -> bool {
     let original = root.clone();
+    let is_observe = |command: &str| {
+        command == observe_cmd
+            || crate::hooks::support::is_lean_ctx_hook_command(command, "observe")
+    };
     let Some(hooks_obj) = root
         .as_object_mut()
         .and_then(|r| r.get_mut("hooks"))
@@ -243,19 +249,11 @@ fn ensure_codex_observe_hooks(root: &mut serde_json::Value, observe_cmd: &str) -
                 && hooks[0]
                     .get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|c| c.contains("hook observe"))
+                    .is_some_and(is_observe)
         });
-        let leanctx_entry_idx = entries.iter().position(|e| {
-            e.get("hooks")
-                .and_then(|h| h.as_array())
-                .is_some_and(|hooks| {
-                    hooks.iter().any(|hook| {
-                        hook.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains("lean-ctx") && !c.contains("hook observe"))
-                    })
-                })
-        });
+        let leanctx_entry_idx = entries
+            .iter()
+            .position(|entry| crate::hooks::support::is_lean_ctx_codex_managed_entry(event, entry));
         if let (Some(standalone), Some(target)) = (observe_standalone_idx, leanctx_entry_idx) {
             // Remove standalone first (shifts indices if standalone < target)
             entries.remove(standalone);
@@ -273,7 +271,7 @@ fn ensure_codex_observe_hooks(root: &mut serde_json::Value, observe_cmd: &str) -
                 let already = hooks_arr.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains("hook observe"))
+                        .is_some_and(is_observe)
                 });
                 if !already {
                     hooks_arr.push(observe_hook.clone());
@@ -290,7 +288,7 @@ fn ensure_codex_observe_hooks(root: &mut serde_json::Value, observe_cmd: &str) -
                     hooks.iter().any(|hook| {
                         hook.get("command")
                             .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains("hook observe"))
+                            .is_some_and(is_observe)
                     })
                 })
         });
@@ -301,16 +299,7 @@ fn ensure_codex_observe_hooks(root: &mut serde_json::Value, observe_cmd: &str) -
         // Merge into existing lean-ctx entry instead of creating a duplicate
         // that fires a separate `hook: <Event>` log line (GL #1398).
         let merged = entries.iter_mut().any(|entry| {
-            let dominated = entry
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .is_some_and(|hooks| {
-                    hooks.iter().any(|hook| {
-                        hook.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains("lean-ctx"))
-                    })
-                });
+            let dominated = crate::hooks::support::is_lean_ctx_codex_managed_entry(event, entry);
             if !dominated {
                 return false;
             }
@@ -364,10 +353,14 @@ fn normalize_codex_observe_hooks(
             let is_observe = hook
                 .get("command")
                 .and_then(|command| command.as_str())
-                .is_some_and(|command| command == observe_cmd || command.contains("hook observe"));
+                .is_some_and(|command| {
+                    command == observe_cmd
+                        || crate::hooks::support::is_lean_ctx_hook_command(command, "observe")
+                });
             if is_observe {
                 contains_observe = true;
                 if let Some(object) = hook.as_object_mut() {
+                    object.insert("command".to_string(), serde_json::json!(observe_cmd));
                     object.insert("timeout".to_string(), serde_json::json!(timeout_secs));
                 }
             } else {
@@ -441,12 +434,17 @@ fn ensure_codex_mcp_server(
         lean_tbl["tool_timeout_sec"] = toml_edit::value(120);
     }
 
-    let env = lean_tbl["env"].or_insert(toml_edit::table());
-    if let Some(env_tbl) = env.as_table_mut() {
-        for (key, val) in env_pairs {
-            let key = key.as_str();
-            if env_tbl.get(key).and_then(toml_edit::Item::as_str) != Some(val.as_str()) {
-                env_tbl[key] = toml_edit::value(val.as_str());
+    // A user-global entry must not pin one project for every session; heal the
+    // pins earlier builds wrote (see `mcp_server_env_pairs`).
+    crate::hooks::strip_project_scoped_env_toml(lean_tbl);
+    if !env_pairs.is_empty() {
+        let env = lean_tbl["env"].or_insert(toml_edit::table());
+        if let Some(env_tbl) = env.as_table_mut() {
+            for (key, val) in env_pairs {
+                let key = key.as_str();
+                if env_tbl.get(key).and_then(toml_edit::Item::as_str) != Some(val.as_str()) {
+                    env_tbl[key] = toml_edit::value(val.as_str());
+                }
             }
         }
     }
@@ -639,6 +637,81 @@ mod tests {
             !crate::hooks::support::is_lean_ctx_codex_managed_entry("PreToolUse", &custom),
             "custom Codex hooks must be preserved"
         );
+    }
+
+    #[test]
+    fn legacy_cleanup_preserves_custom_wrappers_and_shell_mentions() {
+        for command in [
+            "/custom/lean-ctx-wrapper hook rewrite",
+            "/custom/lean-ctx-wrapper hook deny",
+            "echo lean-ctx hook rewrite",
+            "\"echo\" \"/custom/lean-ctx\" hook rewrite",
+        ] {
+            let flat = json!({"command": command});
+            let grouped = json!({"matcher": "Bash", "hooks": [{"command": command}]});
+            for entry in [flat, grouped] {
+                assert!(
+                    !crate::hooks::support::is_lean_ctx_codex_managed_entry("PreToolUse", &entry),
+                    "custom command must remain: {command}"
+                );
+            }
+        }
+        for command in ["lean-ctx hook deny", "/old/lean-ctx hook rewrite"] {
+            assert!(crate::hooks::support::is_lean_ctx_codex_managed_entry(
+                "PreToolUse",
+                &json!({"command": command})
+            ));
+        }
+    }
+
+    #[test]
+    fn refresh_removes_stale_binaries_and_preserves_shared_custom_hooks() {
+        let mut input = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash|Read|Grep|Glob",
+                    "hooks": [
+                        {"command": "/private/tmp/leanctx-check/lean-ctx hook codex-pretooluse"},
+                        {"command": "echo keep-pre"},
+                        {"command": "/custom/guard hook codex-pretooluse"}
+                    ]
+                }],
+                "SessionStart": [{
+                    "matcher": "startup|resume|clear",
+                    "hooks": [
+                        {"command": "/private/tmp/leanctx-check/lean-ctx hook codex-session-start"},
+                        {"command": "echo keep-session"},
+                        {"command": "/custom/guard hook codex-session-start"}
+                    ]
+                }]
+            }
+        });
+        let session = "/current/lean-ctx hook codex-session-start";
+        let pretool = "/current/lean-ctx hook codex-pretooluse";
+        assert!(upsert_lean_ctx_codex_hook_entries(
+            &mut input, session, pretool
+        ));
+        for (event, custom, current) in [
+            ("PreToolUse", "echo keep-pre", pretool),
+            ("SessionStart", "echo keep-session", session),
+        ] {
+            let commands: Vec<_> = input["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|entry| entry["hooks"].as_array().unwrap())
+                .map(|hook| hook["command"].as_str().unwrap())
+                .collect();
+            let guard = if event == "PreToolUse" {
+                "/custom/guard hook codex-pretooluse"
+            } else {
+                "/custom/guard hook codex-session-start"
+            };
+            assert_eq!(commands, vec![custom, guard, current]);
+        }
+        assert!(!upsert_lean_ctx_codex_hook_entries(
+            &mut input, session, pretool
+        ));
     }
 
     #[test]
@@ -975,76 +1048,71 @@ command = \"other\"
     }
 
     #[test]
-    fn ensure_mcp_server_writes_project_and_extra_roots() {
-        // #403: when init captured a project root + sibling worktrees, those
-        // must be propagated into the env block so the long-lived MCP server
-        // resolves explicit paths under every root.
-        let pairs = vec![
-            (
-                "LEAN_CTX_DATA_DIR".to_string(),
-                "/home/u/.lean-ctx".to_string(),
-            ),
-            (
-                "LEAN_CTX_PROJECT_ROOT".to_string(),
-                "/work/main".to_string(),
-            ),
-            (
-                "LEAN_CTX_EXTRA_ROOTS".to_string(),
-                "/work/wt-a:/work/wt-b".to_string(),
-            ),
-        ];
-        let result =
-            ensure_codex_mcp_server("", "lean-ctx", &pairs).expect("fresh config must be created");
+    fn ensure_mcp_server_heals_a_global_project_pin() {
+        // A pre-fix install pinned the installing session's project into the
+        // user-global Codex config, so every later session — in any repo —
+        // bound to that project. The refresh must drop the pin (and nothing
+        // else), and a second pass must be a no-op.
+        let input = "[mcp_servers.lean-ctx]\ncommand = \"lean-ctx\"\nargs = [\"mcp\"]\n\n\
+                     [mcp_servers.lean-ctx.env]\n\
+                     LEAN_CTX_EXTRA_ROOTS = \"/work/other\"\n\
+                     LEAN_CTX_PROJECT_ROOT = \"/work/main\"\n\
+                     LEAN_CTX_QUIET = \"1\"\n";
 
+        let result = ensure_codex_mcp_server(input, "lean-ctx", &data_dir_pairs())
+            .expect("a pinned project must be healed");
+        assert_eq!(result.matches("[mcp_servers.lean-ctx]").count(), 1);
         let doc = result
             .parse::<toml_edit::DocumentMut>()
             .expect("output must be valid TOML");
         let env = &doc["mcp_servers"]["lean-ctx"]["env"];
-        assert_eq!(env["LEAN_CTX_PROJECT_ROOT"].as_str(), Some("/work/main"));
-        assert_eq!(
-            env["LEAN_CTX_EXTRA_ROOTS"].as_str(),
-            Some("/work/wt-a:/work/wt-b")
+        assert!(env.get("LEAN_CTX_PROJECT_ROOT").is_none(), "{result}");
+        assert!(env.get("LEAN_CTX_EXTRA_ROOTS").is_none(), "{result}");
+        assert_eq!(env["LEAN_CTX_QUIET"].as_str(), Some("1"));
+
+        assert!(
+            ensure_codex_mcp_server(&result, "lean-ctx", &data_dir_pairs()).is_none(),
+            "heal must be idempotent"
         );
-        assert_eq!(env["LEAN_CTX_DATA_DIR"].as_str(), Some("/home/u/.lean-ctx"));
     }
 
     #[test]
-    fn ensure_mcp_server_upserts_missing_keys_into_existing_env() {
-        // Pre-existing install (only DATA_DIR) must gain the new roots without
-        // duplicating the section, and the operation must be idempotent.
-        let input = "[mcp_servers.lean-ctx]\ncommand = \"lean-ctx\"\nargs = []\n\n\
-                     [mcp_servers.lean-ctx.env]\nLEAN_CTX_DATA_DIR = \"/home/u/.lean-ctx\"\n";
-        let pairs = vec![
-            (
-                "LEAN_CTX_DATA_DIR".to_string(),
-                "/home/u/.lean-ctx".to_string(),
-            ),
-            (
-                "LEAN_CTX_PROJECT_ROOT".to_string(),
-                "/work/main".to_string(),
-            ),
-        ];
-
-        let result = ensure_codex_mcp_server(input, "lean-ctx", &pairs)
-            .expect("should upsert the missing project root");
-        assert_eq!(
-            result.matches("[mcp_servers.lean-ctx]").count(),
-            1,
-            "must not duplicate the parent section"
-        );
-        let doc = result
-            .parse::<toml_edit::DocumentMut>()
-            .expect("output must be valid TOML");
-        assert_eq!(
-            doc["mcp_servers"]["lean-ctx"]["env"]["LEAN_CTX_PROJECT_ROOT"].as_str(),
-            Some("/work/main")
-        );
-
-        // Second pass over the upserted config is a no-op.
-        assert!(
-            ensure_codex_mcp_server(&result, "lean-ctx", &pairs).is_none(),
-            "upsert must be idempotent"
-        );
+    fn observe_refresh_preserves_custom_handlers_and_replaces_stale_owned_commands() {
+        let custom = serde_json::json!({
+            "matcher": "custom-event",
+            "hooks": [{"type": "command", "command": "/custom/guard hook observe", "timeout": 99}]
+        });
+        let mut root = serde_json::json!({"hooks": {}});
+        for event in ["PostToolUse", "SessionStart", "SessionEnd"] {
+            root["hooks"][event] = serde_json::json!([
+                custom.clone(),
+                {"matcher": ".*", "hooks": [{"type": "command", "command": "/old/lean-ctx hook observe", "timeout": 99}]}
+            ]);
+        }
+        root["hooks"]["SessionStart"].as_array_mut().unwrap().push(serde_json::json!({
+            "matcher": "startup|resume|clear",
+            "hooks": [{"type": "command", "command": "/current/lean-ctx hook codex-session-start"}]
+        }));
+        let command = "/current/lean-ctx hook observe";
+        assert!(ensure_codex_observe_hooks(&mut root, command));
+        for event in ["PostToolUse", "SessionStart", "SessionEnd"] {
+            let entries = root["hooks"][event].as_array().unwrap();
+            assert_eq!(
+                entries[0], custom,
+                "custom {event} handler must stay intact"
+            );
+            let commands: Vec<_> = entries
+                .iter()
+                .flat_map(|entry| entry["hooks"].as_array().unwrap())
+                .map(|hook| hook["command"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                commands.iter().filter(|value| **value == command).count(),
+                1
+            );
+            assert!(!commands.contains(&"/old/lean-ctx hook observe"));
+        }
+        assert!(!ensure_codex_observe_hooks(&mut root, command));
     }
 
     #[test]

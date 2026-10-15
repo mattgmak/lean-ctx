@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
 //! BuiltinOutcomeTracker — captures accept/reject/partial signals.
 //!
-//! Records outcome feedback and emits OutcomeRecorded events to OclaBus.
+//! Records outcome feedback in a bounded buffer.
 //! Replaces the legacy P3 version with canonical OCLA types from `types.rs`.
 
 use std::collections::VecDeque;
@@ -8,7 +9,6 @@ use std::sync::Mutex;
 
 use crate::core::ocla::traits::{OclaService, OutcomeTracker};
 use crate::core::ocla::types::{OclaCapability, OclaCapabilityKind, OclaResult, Outcome};
-use crate::core::ocla_bus::{self, OclaEvent};
 
 const MAX_OUTCOMES: usize = 500;
 
@@ -41,6 +41,10 @@ impl Default for BuiltinOutcomeTracker {
 }
 
 impl OclaService for BuiltinOutcomeTracker {
+    fn manifest(&self) -> crate::core::ocla::OclaResult<lean_ctx_protocol::CapabilityManifestV1> {
+        crate::core::ocla::capability_fabric::builtin_manifest(&self.capability())
+    }
+
     fn capability(&self) -> OclaCapability {
         OclaCapability::available(OclaCapabilityKind::OutcomeTracker)
     }
@@ -48,14 +52,6 @@ impl OclaService for BuiltinOutcomeTracker {
 
 impl OutcomeTracker for BuiltinOutcomeTracker {
     fn record_outcome(&self, outcome: Outcome) -> OclaResult<()> {
-        let accepted = outcome.accepted.unwrap_or(false);
-
-        ocla_bus::emit(OclaEvent::OutcomeRecorded {
-            session_id: outcome.context.session_id.clone(),
-            accepted,
-            implicit: false,
-        });
-
         let mut state = self
             .outcomes
             .lock()

@@ -1,7 +1,9 @@
 pub mod backend;
+pub mod capabilities;
 pub mod client;
 pub mod config;
 pub mod edit_apply;
+pub mod editor_bridge;
 pub mod format;
 pub mod jetbrains_backend;
 pub mod port_discovery;

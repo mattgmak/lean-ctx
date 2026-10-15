@@ -1,5 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::core::config;
 use crate::core::theme;
+
+mod cache;
+pub use cache::cmd_cache;
 
 pub fn cmd_config(args: &[String]) {
     let cfg = config::Config::load();
@@ -68,8 +73,9 @@ pub fn cmd_config(args: &[String]) {
                     .is_none() =>
                 {
                     eprintln!(
-                        "Unknown embedding model '{val}'. Available: minilm (default), \
-                         nomic — or hf:org/repo[@revision] for any HuggingFace repo with an \
+                        "Unknown embedding model '{val}'. Available: minilm, potion-code \
+                         (no ONNX Runtime needed), nomic — or hf:org/repo[@revision] for any \
+                         HuggingFace repo with an \
                          ONNX export, e.g. hf:jinaai/jina-embeddings-v2-base-code for code \
                          (see docs/guides/custom-embeddings.md)."
                     );
@@ -903,115 +909,6 @@ pub fn cmd_stats(args: &[String]) {
     }
 }
 
-pub fn cmd_cache(args: &[String]) {
-    use crate::core::cli_cache;
-    match args.first().map(std::string::String::as_str) {
-        Some("clear") => {
-            let count = cli_cache::clear();
-            println!("Cleared {count} cached entries.");
-        }
-        Some("reset") => {
-            let project_flag = args.get(1).map(std::string::String::as_str) == Some("--project");
-            if project_flag {
-                let root =
-                    crate::core::session::SessionState::load_latest().and_then(|s| s.project_root);
-                if let Some(root) = root {
-                    let count = cli_cache::clear_project(&root);
-                    println!("Reset {count} cache entries for project: {root}");
-                } else {
-                    eprintln!("No active project root found. Start a session first.");
-                    std::process::exit(1);
-                }
-            } else {
-                let count = cli_cache::clear();
-                println!("Reset all {count} cache entries.");
-            }
-        }
-        Some("stats") => {
-            let (hits, reads, entries) = cli_cache::stats();
-            let rate = if reads > 0 {
-                (hits as f64 / reads as f64 * 100.0).round() as u32
-            } else {
-                0
-            };
-            println!("CLI Cache Stats (lean-ctx read / lean-ctx grep):");
-            println!("  Entries:   {entries}");
-            println!("  Reads:     {reads}");
-            println!("  Hits:      {hits}");
-            println!("  Hit Rate:  {rate}%");
-
-            if let Some(value) = load_mcp_live_stats() {
-                println!();
-                for line in mcp_cache_stats_lines(&value) {
-                    println!("{line}");
-                }
-            } else {
-                println!();
-                println!("MCP Session Cache: no data yet (start a session with your AI editor)");
-            }
-        }
-        Some("invalidate") => {
-            if args.len() < 2 {
-                eprintln!("Usage: lean-ctx cache invalidate <path>");
-                std::process::exit(1);
-            }
-            cli_cache::invalidate(&args[1]);
-            println!("Invalidated cache for {}", args[1]);
-        }
-        Some("prune") => {
-            let bm25 = prune_bm25_caches();
-            let graph = prune_graph_caches();
-            // Enforce the archive TTL + on-disk size budget alongside the index
-            // caches so a manual prune reclaims the (often largest) store too (#417).
-            let archive_before = crate::core::archive::disk_usage_bytes()
-                + crate::core::archive_fts::db_size_bytes();
-            let archive_removed = crate::core::archive::cleanup();
-            let _ = crate::core::archive_fts::enforce_cap();
-            let archive_after = crate::core::archive::disk_usage_bytes()
-                + crate::core::archive_fts::db_size_bytes();
-            let archive_freed = archive_before.saturating_sub(archive_after);
-
-            // Reclaim knowledge stores whose project_root was deleted (removed
-            // worktrees, thrown-away projects): they can never be written again,
-            // so their per-store eviction cap can never self-heal — pure bloat (#615).
-            let orphans = crate::core::knowledge::maintenance::prune_orphaned_stores();
-
-            let removed = bm25.removed + graph.removed + archive_removed + orphans.removed as u32;
-            let failed = bm25.failed + graph.failed;
-            let freed =
-                bm25.bytes_freed + graph.bytes_freed + archive_freed + orphans.reclaimed_bytes;
-            println!(
-                "Pruned {} entries, freed {:.1} MB (BM25: {}, graphs: {}, archive: {}, orphaned stores: {}, failed: {})",
-                removed,
-                freed as f64 / 1_048_576.0,
-                bm25.removed,
-                graph.removed,
-                archive_removed,
-                orphans.removed,
-                failed,
-            );
-        }
-        _ => {
-            let (hits, reads, entries) = cli_cache::stats();
-            let rate = if reads > 0 {
-                (hits as f64 / reads as f64 * 100.0).round() as u32
-            } else {
-                0
-            };
-            println!("CLI File Cache: {entries} entries, {hits}/{reads} hits ({rate}%)");
-            println!();
-            println!("Subcommands:");
-            println!("  cache stats       Show detailed stats");
-            println!("  cache clear       Clear all cached entries");
-            println!("  cache reset       Reset all cache (or --project for current project only)");
-            println!("  cache invalidate  Remove specific file from cache");
-            println!(
-                "  cache prune       Reclaim BM25 + graph indexes, archive, and orphaned knowledge stores"
-            );
-        }
-    }
-}
-
 pub struct PruneResult {
     pub scanned: u32,
     pub removed: u32,
@@ -1227,6 +1124,18 @@ memory_profile = "balanced"
 # Maximum % of system RAM lean-ctx may use (1-50)
 max_ram_percent = 5
 
+# Per-process RSS target (MB) of each stdio MCP server; the lower of this and
+# max_ram_percent applies (0 = percent only).
+# mcp_max_rss_mb = 512
+
+# Process RSS target (MB) of the background daemon; the lower of this and
+# max_ram_percent applies (0 = percent only).
+# daemon_max_rss_mb = 2048
+
+# Exit a stdio MCP server after N minutes without a tool call (0 = never).
+# Codex does not restart exited servers, so leave this off for Codex.
+# mcp_idle_exit_minutes = 0
+
 # Total disk budget in MB (0 = use individual limits).
 # Distributes proportionally: archive ~25%, BM25 cache ~10%.
 # max_disk_mb = 2000
@@ -1281,6 +1190,24 @@ fn cmd_show_effective() {
         " max_ram_percent     = {:10}  {}",
         cfg.max_ram_percent,
         source_hint("LEAN_CTX_MAX_RAM_PERCENT", cfg.max_ram_percent != 5)
+    ));
+    box_row(&format!(
+        " mcp_max_rss_mb      = {:10}  {}",
+        cfg.mcp_max_rss_mb_effective(),
+        source_hint("LEAN_CTX_MCP_MAX_RSS_MB", cfg.mcp_max_rss_mb != 512)
+    ));
+    box_row(&format!(
+        " daemon_max_rss_mb   = {:10}  {}",
+        cfg.daemon_max_rss_mb_effective(),
+        source_hint("LEAN_CTX_DAEMON_MAX_RSS_MB", cfg.daemon_max_rss_mb != 2048)
+    ));
+    box_row(&format!(
+        " mcp_idle_exit_minutes = {:8}  {}",
+        cfg.mcp_idle_exit_minutes_effective(),
+        source_hint(
+            "LEAN_CTX_MCP_IDLE_EXIT_MINUTES",
+            cfg.mcp_idle_exit_minutes > 0
+        )
     ));
     box_row(&format!(
         " session_retention_days = {:8}  {}",

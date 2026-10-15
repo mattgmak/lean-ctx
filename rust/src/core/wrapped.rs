@@ -1,3 +1,5 @@
+use crate::core::eval_ab::speed::SpeedHeadline;
+use crate::core::security_events::SecurityCounts;
 use crate::core::session::SessionState;
 use crate::core::stats;
 
@@ -23,6 +25,14 @@ pub struct WrappedReport {
     /// Estimated percentile rank among lean-ctx users (0-100). Based on tokens saved.
     /// None if insufficient data or user hasn't opted into community metrics.
     pub percentile: Option<u8>,
+    /// ✓ measured security events of the period, re-counted from the signed
+    /// audit trail. `None` when nothing happened or the chain fails
+    /// verification — an unproven count is never shown.
+    pub security: Option<SecurityCounts>,
+    /// The latest `lean-ctx prove speed` result, only when its signature
+    /// verifies and lean-ctx was faster without answering worse. Speed is
+    /// never extrapolated from live sessions.
+    pub speed: Option<SpeedHeadline>,
 }
 
 impl WrappedReport {
@@ -51,6 +61,10 @@ impl WrappedReport {
         };
         let bounce_tokens = crate::core::savings_ledger::bounce_tokens(period_days);
         let tokens_saved = gross_tokens_saved.saturating_sub(bounce_tokens);
+        let security = crate::core::value::proof::verified_security_since(
+            period_days.map(|d| chrono::Utc::now() - chrono::Duration::days(i64::from(d))),
+        )
+        .filter(|c| !c.is_empty());
 
         let env_model = std::env::var("LEAN_CTX_MODEL")
             .or_else(|_| std::env::var("LCTX_MODEL"))
@@ -138,7 +152,18 @@ impl WrappedReport {
             model_key,
             pricing_estimated,
             percentile: estimate_percentile(tokens_saved),
+            security,
+            speed: SpeedHeadline::latest(),
         }
+    }
+
+    /// The period's security events in the contract's wording, one phrase per
+    /// kind; empty when there is nothing verified to show.
+    pub fn security_phrases(&self) -> Vec<String> {
+        self.security
+            .as_ref()
+            .map(crate::core::value::format::security_phrases)
+            .unwrap_or_default()
     }
 
     /// One-line, conservative explanation of how the headline numbers were derived.
@@ -251,6 +276,29 @@ impl WrappedReport {
             out.push(box_line(""));
         }
 
+        // Security: only counts re-derived from the verified audit trail.
+        let security = self.security_phrases();
+        if !security.is_empty() {
+            out.push(format!("  {}", t.box_mid(w)));
+            for phrase in &security {
+                out.push(box_line(&format!("   {sc}✓{rst}  {phrase}")));
+            }
+            out.push(box_line(&format!(
+                "      {dim}measured · signed audit trail intact{rst}"
+            )));
+        }
+
+        // Speed: only from a signed A/B proof (`lean-ctx prove speed`).
+        if let Some(speed) = &self.speed {
+            out.push(format!("  {}", t.box_mid(w)));
+            out.push(box_line(&format!(
+                "   {c3}⚡{rst}  {:.0}% faster model answers with lean-ctx",
+                speed.faster_pct
+            )));
+            let detail = theme::truncate_visual(&speed.detail(), w - 6);
+            out.push(box_line(&format!("      {dim}{detail}{rst}")));
+        }
+
         // Top commands (truncated to fit the inner box width).
         if !self.top_commands.is_empty() {
             let prefix_visible = 8; // "   top  "
@@ -308,8 +356,20 @@ impl WrappedReport {
         } else {
             ""
         };
+        let security = self.security_phrases();
+        let security_str = if security.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " | Security: {} (audit trail verified)",
+                security.join(", ")
+            )
+        };
+        let speed_str = self.speed.as_ref().map_or_else(String::new, |s| {
+            format!(" | Speed: {} ({}, signed)", s.phrase(), s.detail())
+        });
         format!(
-            "WRAPPED [{}]: {} tok saved, {} avoided{}, {} sessions, {} cmds | Top: {} | Compression: {:.1}% | Energy: {} | model={}",
+            "WRAPPED [{}]: {} tok saved, {} avoided{}, {} sessions, {} cmds | Top: {} | Compression: {:.1}% | Energy: {}{}{} | model={}",
             self.period,
             saved_str,
             cost_str,
@@ -319,6 +379,8 @@ impl WrappedReport {
             top_str,
             self.compression_rate_pct,
             crate::core::energy::format_for_tokens(self.tokens_saved),
+            security_str,
+            speed_str,
             self.model_key,
         )
     }
@@ -417,6 +479,8 @@ pub mod tests {
             model_key: "claude-3.5-sonnet".into(),
             pricing_estimated: false,
             percentile: Some(95),
+            security: None,
+            speed: None,
         }
     }
 
@@ -526,5 +590,66 @@ pub mod tests {
         );
         assert!(r.format_compact().contains("(est.)"));
         assert!(r.methodology_line().contains("fallback"));
+    }
+
+    #[test]
+    fn verified_security_is_shown_and_absent_security_is_not() {
+        assert!(!sample().format_ascii().contains("audit trail"));
+        assert!(!sample().format_compact().contains("Security:"));
+
+        let mut r = sample();
+        r.security = Some(SecurityCounts {
+            secrets_redacted: 2,
+            shell_blocked: 1,
+            ..SecurityCounts::default()
+        });
+        let ascii = r.format_ascii();
+        assert!(ascii.contains("2 secrets kept out of context"), "{ascii}");
+        assert!(ascii.contains("1 risky command blocked"), "{ascii}");
+        assert!(ascii.contains("signed audit trail intact"), "{ascii}");
+        let compact = r.format_compact();
+        assert!(
+            compact.contains("Security: 2 secrets kept out of context, 1 risky command blocked"),
+            "{compact}"
+        );
+        assert!(!compact.contains('\n'));
+    }
+
+    #[test]
+    fn speed_is_shown_only_from_a_proof() {
+        assert!(!sample().format_ascii().contains("faster"));
+        assert!(!sample().format_compact().contains("Speed:"));
+
+        let mut r = sample();
+        r.speed = Some(SpeedHeadline {
+            faster_pct: 41.2,
+            measured_on: "2026-09-25".into(),
+            tasks: 12,
+            runs: 3,
+            model: "gpt-4o-mini".into(),
+        });
+        let ascii = r.format_ascii();
+        assert!(
+            ascii.contains("41% faster model answers with lean-ctx"),
+            "{ascii}"
+        );
+        assert!(
+            ascii.contains("measured 2026-09-25 · 12 tasks × 3 runs"),
+            "{ascii}"
+        );
+        // The speed rows keep the box closed: same width as the title row.
+        let width_of = |needle: &str| {
+            ascii
+                .lines()
+                .find(|l| l.contains(needle))
+                .map(crate::core::theme::visual_len)
+        };
+        assert_eq!(width_of("faster"), width_of("Wrapped"), "{ascii}");
+        assert_eq!(width_of("measured 2026"), width_of("Wrapped"), "{ascii}");
+        let compact = r.format_compact();
+        assert!(
+            compact.contains("Speed: model answered 41% faster with lean-ctx context"),
+            "{compact}"
+        );
     }
 }

@@ -199,6 +199,15 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         ),
     );
     proxy.insert(
+        "compression_holdout".into(),
+        key_with_env(
+            "f64",
+            serde_json::json!(cfg.proxy.compression_holdout_fraction()),
+            "Fraction 0.0-1.0 of conversations placed in the input-compression control arm (#1905). 0 (default) = no holdout. When > 0, a deterministic cohort (salted independently of output_holdout) puts ~this fraction in a control arm forwarded without any of the proxy's input compression (tool-output compression, history pruning, prose rewriting, cold-prefix repack) but still metered, so the input-token reduction is measured against a real uncompressed baseline (lean-ctx output-savings). Answer quality is not measured by this holdout and is reported as unknown",
+            "LEAN_CTX_PROXY_COMPRESSION_HOLDOUT",
+        ),
+    );
+    proxy.insert(
         "verbosity_steer".into(),
         key_with_env(
             "bool",
@@ -615,6 +624,14 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             "Register lean-ctx MCP server in editor configs during setup/update",
         ),
     );
+    setup_keys.insert(
+        "manage_hooks".into(),
+        key(
+            "bool",
+            serde_json::json!(true),
+            "Refresh already-installed agent hooks, permissions.deny and status line on MCP server start. false = only explicit setup/init/doctor --fix writes them",
+        ),
+    );
     sections.insert(
             "setup".into(),
             SectionSchema {
@@ -727,6 +744,39 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         SectionSchema {
             description: "User-controlled never-lossy zones (#1570 P4)".into(),
             keys: protection,
+        },
+    );
+
+    let mut agents = BTreeMap::new();
+    agents.insert(
+        "serialize_build_commands".into(),
+        key(
+            "bool",
+            serde_json::json!(cfg.agents.serialize_build_commands),
+            "Opt-in: run only one cargo/npm build or test at a time across all lean-ctx sessions on this machine; ctx_shell waits for the slot. Off by default",
+        ),
+    );
+    agents.insert(
+        "cargo_build_jobs".into(),
+        key(
+            "usize",
+            serde_json::json!(cfg.agents.cargo_build_jobs),
+            "Opt-in: CARGO_BUILD_JOBS for builds run through ctx_shell. 0 (default) leaves cargo's own setting alone",
+        ),
+    );
+    agents.insert(
+        "shared_cargo_target".into(),
+        key(
+            "bool",
+            serde_json::json!(cfg.agents.shared_cargo_target),
+            "Opt-in: builds run through ctx_shell use one machine-wide CARGO_TARGET_DIR (<data dir>/build-cache/cargo-target) instead of ./target. Off by default — when on, a binary run from ./target is stale. An explicit CARGO_TARGET_DIR always wins",
+        ),
+    );
+    sections.insert(
+        "agents".into(),
+        SectionSchema {
+            description: "Build handling for ctx_shell in multi-agent setups. All opt-in; by default lean-ctx neither queues, throttles nor relocates your builds".into(),
+            keys: agents,
         },
     );
 }

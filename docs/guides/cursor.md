@@ -2,8 +2,8 @@
 
 > **Status: Available first-class local setup path.** LeanCTX attaches to
 > Cursor through local Runtime wiring; its coverage is limited to observable
-> context behavior. Product scope and claim discipline are governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> context behavior. See the [canonical positioning](../POSITIONING_CANONICAL.md)
+> for current product scope and claim boundaries.
 
 Complete guide to setting up and optimally using lean-ctx with Cursor IDE.
 
@@ -72,7 +72,7 @@ The injector re-syncs the profile automatically when hooks are installed or
 removed later — no manual step. Rationale: Cursor's harness makes native
 tools first-class and MCP tools two-step; a "NEVER use native tools" rule
 there is unenforceable and only creates instruction dissonance, while the
-hooks already bank the savings on every native call.
+hooks route supported native calls through the configured context handling.
 
 Editing is native-first in both profiles: use Cursor's Edit/StrReplace (Write,
 Delete, Glob as normal). If native Edit is ever unavailable, the anchored
@@ -104,7 +104,8 @@ ctx_search(pattern, path) → replaces native Grep tool
 ctx_tree(path, depth)     → replaces native ls/find
 ```
 
-MCP tools benefit from session caching — re-reads cost ~13 tokens instead of re-reading the full file.
+For eligible unchanged reads, session caching may return a compact reference;
+its emitted size depends on the mode and integration.
 
 ### CLI Commands (for shell operations)
 
@@ -186,7 +187,7 @@ For projects using the `AGENTS.md` convention, lean-ctx's rules can also be plac
 # Your project agent instructions
 
 <!-- lean-ctx section (auto-managed) -->
-# lean-ctx — Context Engineering Layer
+# LeanCTX — Context Gateway for AI Systems
 <!-- lean-ctx-rules -->
 ...
 <!-- /lean-ctx -->
@@ -215,10 +216,10 @@ When you start a new Cursor session, lean-ctx restores:
 
 ### Context Manager Dashboard
 
-Monitor real-time token savings:
+Inspect local usage and token/cost estimates for observed activity:
 
 ```bash
-lean-ctx gain --live        # real-time savings
+lean-ctx gain --live        # local usage and estimates
 lean-ctx dashboard          # browser-based dashboard
 lean-ctx watch              # TUI monitor
 ```
@@ -312,9 +313,11 @@ lean-ctx init --global
 
 With the hooks installed this is **expected and fine**: the `redirect` hook
 compresses native Read/Grep and the `rewrite` hook compresses native Shell
-transparently — the savings are banked either way (verify with
-`lean-ctx gain --live`). The hook-covered rules profile documents exactly
-this.
+transparently. Use `lean-ctx gain --live` to inspect local usage and token/cost
+estimates for activity it observes. Provider usage and billing depend on the
+routed path and provider reporting; the local estimate does not establish
+invoice savings or answer quality. The hook-covered rules profile documents
+this behavior.
 
 Only in an MCP-only install (no `~/.cursor/hooks.json` entries) should the
 agent prefer `ctx_read`/`ctx_search` directly. If it doesn't there:
@@ -334,10 +337,10 @@ lean-ctx daemon start
 
 ## Performance Tips
 
-1. **Use `map` mode aggressively** — most context reads don't need full file content
-2. **Let the cache work** — re-reads cost ~13 tokens vs. ~2000 for native reads
-3. **Use `ctx_overview` at session start** — primes the cache for common files
-4. **Monitor with `lean-ctx gain --live`** — see savings in real time
+1. **Choose a fitting read mode** — use `map` or `signatures` when structure is enough
+2. **Use unchanged-read caching where supported** — eligible reads may return a compact reference
+3. **Use `ctx_overview` at session start** — gather task-relevant project context
+4. **Inspect with `lean-ctx gain --live`** — see local usage and token/cost estimates for observed activity
 5. **Use `ctx_compress` proactively** — when context grows large, create a checkpoint
 
 ## Further Reading

@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn default_is_empty() {
     let cfg = Config::default();
-    assert!(cfg.extra_roots.is_empty());
+    assert!(cfg.extra_roots.is_empty(), "{:?}", cfg.extra_roots);
 }
 
 #[test]
@@ -53,7 +53,11 @@ fn merge_local_empty_shell_allowlist_disables_restriction() {
         ..Config::default()
     };
     base.merge_local(r"shell_allowlist = []", true);
-    assert!(base.shell_allowlist.is_empty());
+    assert!(
+        base.shell_allowlist.is_empty(),
+        "{:?}",
+        base.shell_allowlist
+    );
 }
 
 #[test]
@@ -98,6 +102,24 @@ fn merge_local_trusted_applies_sensitive() {
     assert_eq!(base.extra_roots, vec!["/etc"]);
 }
 
+/// The Context Gateway is global-only: not even a trusted workspace file can
+/// switch detectors off or loosen them.
+#[test]
+fn merge_local_never_weakens_the_context_gateway() {
+    for trusted in [false, true] {
+        let mut base = Config::default();
+        base.merge_local(
+            "[context_gateway]\nenabled = false\nsecrets = \"off\"\ninjection = \"off\"\n",
+            trusted,
+        );
+        assert_eq!(
+            base.context_gateway,
+            crate::core::context_admission::ContextGatewayConfig::default(),
+            "trusted={trusted}"
+        );
+    }
+}
+
 /// GH #833: untrusted workspace must not disable gitignore-respecting indexing.
 #[test]
 fn merge_local_untrusted_withholds_respect_gitignore_833() {
@@ -113,6 +135,70 @@ fn merge_local_untrusted_withholds_respect_gitignore_833() {
     );
 }
 
+/// `semantic_mode = "eager"` would let background enrichment start language
+/// servers, which execute project code: an untrusted workspace may only lower
+/// the mode, a trusted one may raise it.
+#[test]
+fn merge_local_semantic_mode_escalation_requires_trust() {
+    use crate::core::config::SemanticMode;
+    let mut untrusted = Config::default();
+    untrusted.merge_local("semantic_mode = \"eager\"\n", false);
+    assert_eq!(untrusted.semantic_mode, SemanticMode::Auto);
+
+    let mut lowered = Config::default();
+    lowered.merge_local("semantic_mode = \"off\"\n", false);
+    assert_eq!(lowered.semantic_mode, SemanticMode::Off);
+
+    let mut trusted = Config::default();
+    trusted.merge_local("semantic_mode = \"eager\"\n", true);
+    assert_eq!(trusted.semantic_mode, SemanticMode::Eager);
+}
+
+/// Regression (review): the semantic mode for a project must come from *that*
+/// project's `.lean-ctx.toml` and trust — a daemon serving several roots must
+/// not apply the ambient (cwd) project's `eager` to an untrusted repo.
+#[test]
+fn semantic_mode_is_evaluated_for_the_target_project() {
+    use crate::core::config::SemanticMode;
+    let _lock = crate::core::data_dir::test_env_lock();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repo.path().join(".lean-ctx.toml"),
+        "semantic_mode = \"eager\"\n",
+    )
+    .unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let root = repo.path().to_string_lossy().to_string();
+    let global_only = Config::load_for_project_root(&empty.path().to_string_lossy()).semantic_mode;
+
+    crate::test_env::remove_var("LEAN_CTX_TRUST_WORKSPACE");
+    assert_eq!(
+        Config::load_for_project_root(&root).semantic_mode,
+        global_only,
+        "untrusted repo cannot raise the mode"
+    );
+
+    crate::test_env::set_var("LEAN_CTX_TRUST_WORKSPACE", "1");
+    let trusted = Config::load_for_project_root(&root).semantic_mode;
+    crate::test_env::remove_var("LEAN_CTX_TRUST_WORKSPACE");
+    assert_eq!(
+        trusted,
+        SemanticMode::Eager,
+        "its own trusted config applies"
+    );
+
+    // Review round 2: `eager` from the user's environment must not start
+    // servers in an untrusted repo either — it runs as `auto` there.
+    crate::test_env::set_var("LEAN_CTX_SEMANTIC_MODE", "eager");
+    let untrusted_env = SemanticMode::for_project(&root);
+    crate::test_env::set_var("LEAN_CTX_TRUST_WORKSPACE", "1");
+    let trusted_env = SemanticMode::for_project(&root);
+    crate::test_env::remove_var("LEAN_CTX_TRUST_WORKSPACE");
+    crate::test_env::remove_var("LEAN_CTX_SEMANTIC_MODE");
+    assert_eq!(untrusted_env, SemanticMode::Auto);
+    assert_eq!(trusted_env, SemanticMode::Eager);
+}
+
 /// GH #833: trusted workspace CAN disable gitignore respect.
 #[test]
 fn merge_local_trusted_allows_respect_gitignore_833() {
@@ -121,6 +207,34 @@ fn merge_local_trusted_allows_respect_gitignore_833() {
     assert!(
         !base.index.respect_gitignore,
         "trusted workspace must be able to disable gitignore respect"
+    );
+}
+
+/// GH #1419 follow-up: untrusted workspace must not weaken shell-allowlist
+/// subcommand scoping back to the vulnerable base-binary-only matching.
+#[test]
+fn merge_local_untrusted_withholds_shell_allowlist_subcommand_scoping() {
+    let mut base = Config::default();
+    assert!(
+        base.shell_allowlist_subcommand_scoping,
+        "default must scope multi-word allowlist entries to their subcommand"
+    );
+    base.merge_local("shell_allowlist_subcommand_scoping = false\n", false);
+    assert!(
+        base.shell_allowlist_subcommand_scoping,
+        "untrusted workspace must not disable subcommand scoping"
+    );
+}
+
+/// GH #1419 follow-up: trusted workspace CAN opt back into the pre-fix,
+/// base-binary-only matching as a deliberate compat/rollback path.
+#[test]
+fn merge_local_trusted_allows_shell_allowlist_subcommand_scoping() {
+    let mut base = Config::default();
+    base.merge_local("shell_allowlist_subcommand_scoping = false\n", true);
+    assert!(
+        !base.shell_allowlist_subcommand_scoping,
+        "trusted workspace must be able to disable subcommand scoping"
     );
 }
 
@@ -153,6 +267,24 @@ fn merge_local_untrusted_withholds_tool_surface_overrides() {
         base.default_tool_categories.is_empty(),
         "default_tool_categories override must be withheld for untrusted workspace"
     );
+}
+
+#[test]
+fn redirect_exclude_follows_workspace_trust() {
+    // `redirect_exclude` routes native reads around the lean-ctx redirect (and
+    // its redaction), so an untrusted repo's own list is withheld; the global
+    // list stays in force either way.
+    let global = || Config {
+        redirect_exclude: vec!["CLAUDE.md".to_string()],
+        ..Config::default()
+    };
+    let mut untrusted = global();
+    untrusted.merge_local(r#"redirect_exclude = ["**"]"#, false);
+    assert_eq!(untrusted.redirect_exclude, vec!["CLAUDE.md"]);
+
+    let mut trusted = global();
+    trusted.merge_local(r#"redirect_exclude = ["docs/**"]"#, true);
+    assert_eq!(trusted.redirect_exclude, vec!["CLAUDE.md", "docs/**"]);
 }
 
 #[test]

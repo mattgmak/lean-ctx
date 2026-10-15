@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +51,18 @@ impl LeanCtxServer {
             }
         }
 
+        // A host replaces a native tool's output with a host hook's success
+        // body, so a gate refusal on such a call must be an error: then the host
+        // keeps the original output instead of a block message (#2089).
+        let host_hook = crate::server::dynamic_tools::targets_internal_host_tool(name, args);
+        let refuse = |text: String| {
+            if host_hook {
+                Err(ErrorData::invalid_request(text, None))
+            } else {
+                Ok((text, 0, None, None))
+            }
+        };
+
         let agent_id = self
             .agent_id
             .read()
@@ -59,98 +73,28 @@ impl LeanCtxServer {
             if let crate::core::a2a::rate_limiter::RateLimitResult::Limited { retry_after_ms } =
                 crate::core::a2a::rate_limiter::check_rate_limit(&agent_id, name)
             {
-                return Ok((
-                    format_rate_limited(name, &agent_id, retry_after_ms, args),
-                    0,
-                    None,
-                    None,
-                ));
+                return refuse(format_rate_limited(name, &agent_id, retry_after_ms, args));
             }
         }
 
         if name.starts_with("ctx_") {
             crate::server::tool_visibility::mark_auto_ctx_tool_used();
         }
+        // Background semantic passes yield to tool calls in flight.
+        let _activity = crate::core::graph_enricher::ToolActivity::begin();
 
         match name {
             "ctx_call" => {
-                let inner = get_str(args, "name").ok_or_else(|| {
-                    // Agents commonly guess {"tool": …}; name the fix explicitly.
-                    let hint = args
-                        .and_then(|m| {
-                            ["tool", "tool_name", "toolName"]
-                                .iter()
-                                .find(|k| m.contains_key(**k))
-                        })
-                        .map_or(String::new(), |bad| {
-                            format!(" (found '{bad}' — the key is 'name')")
-                        });
-                    ErrorData::invalid_params(format!("name is required{hint}"), None)
-                })?;
-                if inner == "ctx_call" {
-                    return Err(ErrorData::invalid_params(
-                        "ctx_call cannot invoke itself",
-                        None,
-                    ));
-                }
-
-                let arg_map = match args.and_then(|m| m.get("arguments")) {
-                    None | Some(Value::Null) => {
-                        // Common misspellings would silently invoke the inner
-                        // tool with NO arguments — the inner error ("x is
-                        // required") then points at the wrong culprit (#658).
-                        if let Some(m) = args
-                            && let Some(bad) = ["args", "params", "parameters", "arg"]
-                                .iter()
-                                .find(|k| m.contains_key(**k))
-                        {
-                            return Err(ErrorData::invalid_params(
-                                format!(
-                                    "unknown key '{bad}' — pass the inner tool's arguments \
-                                     under 'arguments'"
-                                ),
-                                None,
-                            ));
-                        }
-                        // #1604: agents also *flatten* the call —
-                        // ctx_call(name="ctx_edit", path=…, old_string=…) —
-                        // and the inner tool then answered "path is required",
-                        // naming a parameter the caller demonstrably supplied.
-                        // That message sent one reporter hunting a marshalling
-                        // bug through three identical retries and a hand-rolled
-                        // stdio probe. `name` is the only key ctx_call reserves,
-                        // so a flattened call is unambiguous: forward the rest.
-                        let flattened: serde_json::Map<String, Value> = args
-                            .map(|m| {
-                                m.iter()
-                                    .filter(|(k, _)| k.as_str() != "name")
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if flattened.is_empty() {
-                            None
-                        } else {
-                            Some(flattened)
-                        }
-                    }
-                    Some(Value::Object(map)) => Some(map.clone()),
-                    Some(_) => {
-                        return Err(ErrorData::invalid_params(
-                            "arguments must be an object",
-                            None,
-                        ));
-                    }
-                };
+                let (inner, arg_map) = crate::tools::registered::ctx_call::resolve_inner(args)?;
 
                 if let crate::core::a2a::rate_limiter::RateLimitResult::Limited { retry_after_ms } =
                     crate::core::a2a::rate_limiter::check_rate_limit(&agent_id, &inner)
                 {
-                    return Ok((
-                        format_rate_limited(&inner, &agent_id, retry_after_ms, arg_map.as_ref()),
-                        0,
-                        None,
-                        None,
+                    return refuse(format_rate_limited(
+                        &inner,
+                        &agent_id,
+                        retry_after_ms,
+                        arg_map.as_ref(),
                     ));
                 }
 
@@ -163,7 +107,7 @@ impl LeanCtxServer {
                         .first()
                         .and_then(|c| c.as_text())
                         .map_or_else(|| "Blocked by role policy".to_string(), |t| t.text.clone());
-                    return Ok((msg, 0, None, None));
+                    return refuse(msg);
                 }
 
                 if !super::WORKFLOW_PASSTHROUGH_TOOLS.contains(&inner.as_str()) {
@@ -181,16 +125,11 @@ impl LeanCtxServer {
                                 let mut shown = allowed.clone();
                                 shown.sort();
                                 shown.truncate(30);
-                                return Ok((
-                                    format!(
-                                        "Tool '{inner}' blocked by workflow '{}' (state: {}). Allowed: {}. Use ctx_workflow(action=\"stop\") to exit.",
-                                        run.spec.name,
-                                        run.current,
-                                        shown.join(", ")
-                                    ),
-                                    0,
-                                    None,
-                                    None,
+                                return refuse(format!(
+                                    "Tool '{inner}' blocked by workflow '{}' (state: {}). Allowed: {}. Use ctx_workflow(action=\"stop\") to exit.",
+                                    run.spec.name,
+                                    run.current,
+                                    shown.join(", ")
                                 ));
                             }
                         }
@@ -241,6 +180,8 @@ impl LeanCtxServer {
         if let Some(tool) = self.registry.as_ref().and_then(|r| r.get_arc(name)) {
             let empty = serde_json::Map::new();
             let args_map = args.unwrap_or(&empty);
+            let aliased = canonicalize_arg_aliases(tool.as_ref(), args_map);
+            let args_map = aliased.as_ref().unwrap_or(args_map);
             let project_root = {
                 let session = self.session.read().await;
                 session.project_root.clone().unwrap_or_default()
@@ -309,6 +250,13 @@ impl LeanCtxServer {
                 Some(ledger.pressure())
             };
             let extra_roots = self.session.read().await.extra_roots.clone();
+            // The home jail scope opens other projects for reading only; the
+            // session's own roots stay writable (pathjail_scope). Re-read the
+            // root: path resolution above may have re-rooted the session.
+            let bound_root = self.session.read().await.project_root.clone();
+            for root in bound_root.iter().chain(extra_roots.iter()) {
+                crate::core::pathjail_scope::register_session_root(root);
+            }
             let ctx = crate::server::tool_trait::ToolContext {
                 project_root,
                 extra_roots,
@@ -347,8 +295,27 @@ impl LeanCtxServer {
             // would crash with "Cannot read properties of undefined (reading
             // 'invoke')". `spawn_blocking` keeps the core workers free and lets
             // the watchdog always return a response.
+            let provider_snapshot =
+                name == "ctx_provider" && crate::tools::ctx_provider::is_snapshot_request(args_map);
             let handler_started = std::time::Instant::now();
-            let output = self.run_tool_handler(name, tool, args_map, ctx).await?;
+            // Pair each handler's origin with its own output, including nested calls.
+            let (output, observed_origin) = crate::core::archive::authority::capture(
+                self.run_tool_handler(name, tool, args_map, ctx),
+            )
+            .await;
+            let output = output?;
+            // The tool's tokenizer measurement of its sources, for the receipt.
+            if let Some(admissions) = crate::core::context_admission::capture::current() {
+                admissions.set_original_tokens(output.original_tokens as u64);
+            }
+            let file_output = name == "ctx_execute"
+                && args_map.get("action").and_then(Value::as_str) == Some("file")
+                && matches!(output.shell_outcome, Some(ShellOutcome::Exit(0)));
+            let output_origin = observed_origin.filter(|_| file_output);
+            if let Some(origin) = &output_origin {
+                // Preserve the outer archive pipeline's existing observed origin.
+                origin.clone().publish();
+            }
             let handler_ms = handler_started.elapsed().as_millis() as u64;
 
             // Image/binary content blocks bypass all text processing.
@@ -390,7 +357,7 @@ impl LeanCtxServer {
 
             let headers_only =
                 crate::core::config::ResponseVerbosity::effective().is_headers_only();
-            let header_line = if headers_only {
+            let header_line = if headers_only && !provider_snapshot {
                 Some(output.to_header_line(name))
             } else {
                 None
@@ -461,25 +428,31 @@ impl LeanCtxServer {
 
             let saved = output.saved_tokens;
             let raw_text = header_line.unwrap_or(output.text);
-            let final_text = sanitized_tool_text(name, raw_text);
+            let final_text = if provider_snapshot {
+                raw_text
+            } else {
+                sanitized_tool_text(name, raw_text)
+            };
 
             // Context immune system: scan for prompt-injection patterns in tool output.
             let injection_signals = crate::core::output_sanitizer::detect_injection(&final_text);
-            if !injection_signals.is_empty() {
+            // Sources the gateway already flagged are counted by their receipt.
+            let gateway_flagged = crate::core::context_admission::capture::current()
+                .is_some_and(|admissions| admissions.flagged_injection());
+            if !injection_signals.is_empty() && !gateway_flagged {
                 tracing::warn!(
                     tool = name,
                     signals = injection_signals.len(),
                     "prompt-injection patterns detected in tool output"
                 );
-                crate::core::audit_trail::record(crate::core::audit_trail::AuditEntryData {
-                    agent_id: agent_id.clone(),
-                    tool: name.to_string(),
-                    action: None,
-                    input_hash: String::new(),
-                    output_tokens: 0,
-                    role: role.clone(),
-                    event_type: crate::core::audit_trail::AuditEventType::SecurityViolation,
-                });
+                // Flagged, not neutralized: the output still reaches the agent.
+                let mut flagged = crate::core::security_events::SecurityCounts::default();
+                flagged.add(
+                    crate::core::security_events::SecurityKind::InjectionFlagged,
+                    injection_signals.len() as u64,
+                );
+                crate::core::security_events::record(name, &agent_id, &flagged);
+                self.publish_value_snapshot().await;
             }
 
             let reference_enabled = std::env::var("LEAN_CTX_REFERENCE_RESULTS").map_or_else(
@@ -493,19 +466,28 @@ impl LeanCtxServer {
             // same rule via `is_protected_read` (otherwise enabling reference_results
             // silently turns `ctx_read` into an un-editable "Output stored …" preview).
             if reference_enabled
+                && !provider_snapshot
                 && !crate::core::firewall::is_protected_read(name)
                 && !output.shell_outcome.as_ref().is_some_and(
                     crate::server::tool_trait::ShellOutcome::is_terminal_background_status,
                 )
                 && final_text.len() > REFERENCE_THRESHOLD
+                && let Some(ref_id) = super::reference_store::store_with_authority(
+                    &final_text,
+                    output_origin.as_ref(),
+                )
             {
-                let ref_id = super::reference_store::store(final_text.clone());
                 let mut preview_end = final_text.len().min(200);
                 while preview_end > 0 && !final_text.is_char_boundary(preview_end) {
                     preview_end -= 1;
                 }
+                let resolve = if output_origin.is_some() {
+                    format!("ctx_expand(id=\"{ref_id}\")")
+                } else {
+                    format!("/v1/references/{ref_id}")
+                };
                 let summary = format!(
-                    "[Reference: {ref_id}] Output stored ({} chars, ~{} tokens). Resolve: /v1/references/{ref_id}\nPreview: {}...",
+                    "[Reference: {ref_id}] Output stored ({} chars, ~{} tokens). Resolve: {resolve}\nPreview: {}...",
                     final_text.len(),
                     final_text.len() / 4,
                     &final_text[..preview_end]
@@ -552,7 +534,58 @@ impl LeanCtxServer {
         ctx: ToolContext,
     ) -> Result<ToolOutput, ErrorData> {
         let args_owned = args_map.clone();
-        let join = tokio::task::spawn_blocking(move || tool.handle(&args_owned, &ctx));
+        let tool_name = name.to_string();
+        let agent_id = self
+            .agent_id
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        // Tokio task locals do not propagate into spawn_blocking. Capture the
+        // immutable handoff, then scope only the synchronous handler invocation.
+        let handoff = crate::core::context_kernel::bridge::runtime::current_handoff();
+        let task = crate::core::task_spine::TaskSpine::current();
+        let receipt_capture = crate::server::native_receipts::current_capture();
+        let archive_capture = crate::core::archive::authority::current_capture();
+        let admissions = crate::core::context_admission::capture::current();
+        let policy_project = crate::core::policy::runtime::REQUEST_PROJECT
+            .try_with(|slot| slot.borrow().clone())
+            .ok()
+            .flatten()
+            .or_else(|| {
+                (!ctx.project_root.is_empty()).then(|| std::path::PathBuf::from(&ctx.project_root))
+            });
+        let join = tokio::task::spawn_blocking(move || {
+            let handle = || {
+                crate::core::archive::authority::CAPTURE.sync_scope(archive_capture, || {
+                    crate::core::task_spine::TaskSpine::sync_scope(task, || {
+                        crate::server::native_receipts::NATIVE_RECEIPT_CAPTURE.sync_scope(
+                            receipt_capture,
+                            || {
+                                crate::core::policy::runtime::REQUEST_PROJECT.sync_scope(
+                                    std::cell::RefCell::new(policy_project),
+                                    || {
+                                        crate::core::context_kernel::bridge::runtime::KERNEL_PLANNING_HANDOFF
+                                            .sync_scope(handoff, || {
+                                                crate::core::context_admission::capture::ADMISSIONS
+                                                    .sync_scope(admissions, || {
+                                                        tool.handle(&args_owned, &ctx)
+                                                    })
+                                            })
+                                    },
+                                )
+                            },
+                        )
+                    })
+                })
+            };
+            // Security events are counted once per tool result: the collector
+            // sees exactly this handler, and the tally is recorded (audit trail +
+            // session counters) before `record_call` publishes the value snapshot.
+            let (result, tally) = crate::core::security_events::collect(handle);
+            crate::core::security_events::record(&tool_name, &agent_id, &tally);
+            result
+        });
         Self::watchdog_join(name, join, Self::handler_watchdog(name)).await
     }
 
@@ -671,29 +704,150 @@ const REFERENCE_THRESHOLD: usize = 4000;
 /// clean error instead of a dropped request.
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 
-const PATH_LIKE_KEYS: &[&str] = &[
-    "path",
-    "project_root",
-    "root",
-    "file",
-    "directory",
-    "dir",
-    "target",
-    "source",
-    "destination",
-    "old_path",
-    "new_path",
-    "file_path",
-    "from",
-    "to",
-    "base_path",
-    "config_path",
-    "output",
+use super::tool_trait::PATH_LIKE_KEYS;
+
+/// Spellings agents carry over from other tool sets (Claude Code's
+/// `file_path`, shell tools' `cmd`) for a parameter a tool calls differently.
+const ARG_ALIASES: &[(&str, &[&str])] = &[
+    ("path", &["file_path", "filePath", "file", "filename"]),
+    ("command", &["cmd"]),
 ];
+
+/// Renames an alias to the canonical parameter when the tool declares the
+/// canonical name but not the alias, and the caller sent only the alias. A
+/// tool that declares the alias itself keeps its own meaning for it, and an
+/// explicit canonical value always wins. `None` when nothing changed, so the
+/// common call borrows the original map.
+pub(crate) fn canonicalize_arg_aliases(
+    tool: &dyn McpTool,
+    args: &serde_json::Map<String, Value>,
+) -> Option<serde_json::Map<String, Value>> {
+    let pending: Vec<(&str, &str)> = ARG_ALIASES
+        .iter()
+        .filter(|(canonical, _)| !args.contains_key(*canonical))
+        .filter_map(|(canonical, aliases)| {
+            aliases
+                .iter()
+                .find(|alias| args.get(**alias).is_some_and(Value::is_string))
+                .map(|alias| (*canonical, *alias))
+        })
+        .collect();
+    if pending.is_empty() {
+        return None;
+    }
+    let def = tool.tool_def();
+    let declared = def
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)?;
+    let mut out = args.clone();
+    let mut changed = false;
+    for (canonical, alias) in pending {
+        if declared.contains_key(canonical)
+            && !declared.contains_key(alias)
+            && let Some(value) = out.remove(alias)
+        {
+            out.insert(canonical.to_string(), value);
+            changed = true;
+        }
+    }
+    changed.then_some(out)
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    fn tool(name: &str) -> Arc<dyn McpTool> {
+        crate::server::registry::build_registry()
+            .get_arc(name)
+            .unwrap_or_else(|| panic!("{name} registered"))
+    }
+
+    fn map(v: Value) -> serde_json::Map<String, Value> {
+        match v {
+            Value::Object(m) => m,
+            other => panic!("expected an object, got {other}"),
+        }
+    }
+
+    #[test]
+    fn file_path_becomes_path_for_ctx_read() {
+        let out = canonicalize_arg_aliases(
+            tool("ctx_read").as_ref(),
+            &map(serde_json::json!({"file_path": "src/main.rs", "mode": "map"})),
+        )
+        .expect("alias renamed");
+        assert_eq!(out.get("path").and_then(Value::as_str), Some("src/main.rs"));
+        assert!(!out.contains_key("file_path"));
+    }
+
+    #[test]
+    fn cmd_becomes_command_for_ctx_shell() {
+        let out = canonicalize_arg_aliases(
+            tool("ctx_shell").as_ref(),
+            &map(serde_json::json!({"cmd": "git status"})),
+        )
+        .expect("alias renamed");
+        assert_eq!(
+            out.get("command").and_then(Value::as_str),
+            Some("git status")
+        );
+    }
+
+    #[test]
+    fn declared_alias_and_explicit_canonical_are_untouched() {
+        // ctx_search declares `file_path` itself (#846).
+        assert!(
+            canonicalize_arg_aliases(
+                tool("ctx_search").as_ref(),
+                &map(serde_json::json!({"pattern": "x", "file_path": "a.rs"})),
+            )
+            .is_none()
+        );
+        assert!(
+            canonicalize_arg_aliases(
+                tool("ctx_read").as_ref(),
+                &map(serde_json::json!({"path": "a.rs", "file_path": "b.rs"})),
+            )
+            .is_none()
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_snapshot_uses_normal_pipeline_and_token_accounting() {
+        let server = crate::tools::create_server();
+        let args = serde_json::json!({
+            "action": "query", "mode": "snapshot", "provider": "gitlab",
+            "resource": "merge_requests", "limit": 0
+        });
+        let (text, saved, _, blocks) = server
+            .dispatch_inner("ctx_provider", args.as_object(), false)
+            .await
+            .expect("bounded input error is a snapshot envelope");
+        assert!(
+            blocks.is_none(),
+            "snapshot must not bypass policy/budget/IR processing"
+        );
+        assert_eq!(saved, 0);
+        let parsed: Value = serde_json::from_str(&text).expect("unmodified JSON");
+        assert_eq!(parsed["schema_version"], 1);
+        assert!(parsed.get("error").is_some());
+        let calls = server.tool_calls.read().await;
+        let record = calls.last().expect("snapshot call recorded");
+        assert_eq!(record.mode.as_deref(), Some("snapshot"));
+        assert_eq!(
+            record.original_tokens,
+            crate::core::tokens::count_tokens(&text)
+        );
+        assert!(record.original_tokens > 0);
+        assert_eq!(record.saved_tokens, 0);
+    }
 
     #[test]
     fn protected_reads_bypass_the_degenerate_output_sanitizer() {

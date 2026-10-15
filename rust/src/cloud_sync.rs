@@ -7,8 +7,12 @@ pub enum AutoSyncOutcome {
     Synced,
     /// The server gated sync behind Pro (HTTP 402) — stop for today.
     Gated,
-    /// Every push failed without a 402 (offline / server down) — try again
-    /// at the next opportunity, do not consume today's slot.
+    /// The server rejected our credential (HTTP 401) — the key this machine
+    /// holds is gone. Retrying cannot fix it, so this is the one outcome that
+    /// must be *said out loud*: the user has to log in again.
+    Unauthenticated,
+    /// Every push failed without a 402 or 401 (offline / server down) — try
+    /// again at the next opportunity, do not consume today's slot.
     NetworkFailure,
 }
 
@@ -38,11 +42,27 @@ pub fn should_auto_push_index(
     auto_index && logged_in && local_index_exists && last_push_for_project != Some(today)
 }
 
-/// Classify per-surface push results into one [`AutoSyncOutcome`]. A 402
-/// anywhere wins (the account is gated); otherwise total failure means the
-/// network is down; anything else counts as synced.
+/// Whether an outcome should consume today's auto-sync slot. Only a network
+/// failure leaves it open — a Pro gate or a dead credential will not resolve
+/// by retrying in ten minutes, and each is announced once per process.
+#[must_use]
+pub fn consumes_daily_slot(outcome: AutoSyncOutcome) -> bool {
+    outcome != AutoSyncOutcome::NetworkFailure
+}
+
+/// Classify per-surface push results into one [`AutoSyncOutcome`]. A 401
+/// anywhere wins — a revoked credential makes every other signal moot and is
+/// the only failure the user must act on. Then a 402 (the account is gated);
+/// otherwise total failure means the network is down; anything else counts as
+/// synced.
 #[must_use]
 pub fn classify_outcomes(results: &[Result<(), String>]) -> AutoSyncOutcome {
+    if results
+        .iter()
+        .any(|r| r.as_ref().is_err_and(|e| e.contains("401")))
+    {
+        return AutoSyncOutcome::Unauthenticated;
+    }
     if results
         .iter()
         .any(|r| r.as_ref().is_err_and(|e| e.contains("402")))
@@ -55,17 +75,187 @@ pub fn classify_outcomes(results: &[Result<(), String>]) -> AutoSyncOutcome {
     AutoSyncOutcome::Synced
 }
 
+/// The only state `cloud_background_tasks` persists: the per-surface "last
+/// done" stamps produced during this run.
+///
+/// Collected while the network work happens **outside** any lock, then applied
+/// to a freshly loaded config inside one short locked closure. Keeping this a
+/// delta instead of a mutated full `Config` is what stops the background task
+/// from writing back a snapshot taken before the network I/O and thereby
+/// reverting a telemetry preference the user changed in the meantime
+/// (LR-TEL-01).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CloudBackgroundDelta {
+    pub(crate) last_heartbeat: Option<String>,
+    pub(crate) last_sync: Option<String>,
+    pub(crate) last_gain_sync: Option<String>,
+    pub(crate) last_model_pull: Option<String>,
+    pub(crate) last_auto_sync: Option<String>,
+    pub(crate) last_index_push: Vec<(String, String)>,
+}
+
+impl CloudBackgroundDelta {
+    /// Nothing was produced this run, so skip the write — and the lock — entirely.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.last_heartbeat.is_none()
+            && self.last_sync.is_none()
+            && self.last_gain_sync.is_none()
+            && self.last_model_pull.is_none()
+            && self.last_auto_sync.is_none()
+            && self.last_index_push.is_empty()
+    }
+
+    /// Applies only the stamps this run produced. Every other field of `config`
+    /// — notably the whole `telemetry` preference triple — is left exactly as it
+    /// was loaded from disk, so a concurrent opt-out survives.
+    pub(crate) fn apply(&self, config: &mut Config) {
+        // Pure field assignment: this runs while the config write lock is held.
+        if let Some(bucket) = &self.last_heartbeat {
+            config.telemetry.last_heartbeat = Some(bucket.clone());
+        }
+        if let Some(day) = &self.last_sync {
+            config.cloud.last_sync = Some(day.clone());
+        }
+        if let Some(day) = &self.last_gain_sync {
+            config.cloud.last_gain_sync = Some(day.clone());
+        }
+        if let Some(day) = &self.last_model_pull {
+            config.cloud.last_model_pull = Some(day.clone());
+        }
+        if let Some(day) = &self.last_auto_sync {
+            config.cloud.last_auto_sync = Some(day.clone());
+        }
+        for (project_hash, day) in &self.last_index_push {
+            config
+                .cloud
+                .last_index_push
+                .insert(project_hash.clone(), day.clone());
+        }
+    }
+}
+
+/// Network budget for the send that runs as the MCP server exits.
+pub const EXIT_TELEMETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const BACKGROUND_TELEMETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether this process may collect and send telemetry right now. Fails closed:
+/// an unreadable config never counts as consent.
+fn telemetry_send_eligible() -> bool {
+    let Ok(config) = Config::try_load_global() else {
+        return false;
+    };
+    let do_not_track = crate::core::host_env::var("DO_NOT_TRACK");
+    let telemetry_override = crate::core::host_env::var("LEAN_CTX_TELEMETRY");
+    config
+        .telemetry
+        .send_eligible(do_not_track.as_deref(), telemetry_override.as_deref())
+}
+
+/// Send the cumulative telemetry totals if the aggregate admits a send now.
+/// Returns the acknowledged bucket. Admission (daily cap, spacing, "nothing
+/// new") is decided under the aggregate lock, so callers may call freely.
+pub fn send_telemetry(trigger: crate::core::telemetry_aggregate::SendTrigger) -> Option<String> {
+    if !telemetry_send_eligible() {
+        return None;
+    }
+    // Persist first so the counters survive even when no send is admitted.
+    if let Err(error) = crate::core::telemetry_aggregate::persist_process_counters() {
+        tracing::debug!("telemetry counters not persisted: {error}");
+    }
+    let lease = match crate::core::telemetry_aggregate::begin_send(trigger) {
+        Ok(lease) => lease,
+        Err(reason) => {
+            tracing::debug!("telemetry send skipped: {reason}");
+            return None;
+        }
+    };
+    let batch = lease.batch().clone();
+    let timeout = match trigger {
+        crate::core::telemetry_aggregate::SendTrigger::Exit => EXIT_TELEMETRY_TIMEOUT,
+        crate::core::telemetry_aggregate::SendTrigger::Periodic => BACKGROUND_TELEMETRY_TIMEOUT,
+    };
+    if let Err(error) = crate::cloud_client::telemetry_v2_batch_with_timeout(&batch, timeout) {
+        tracing::debug!("telemetry send failed, batch kept for retry: {error}");
+        return None;
+    }
+    let installation_id = batch.events.first()?.installation_id.clone();
+    let payload = serde_json::to_vec(&batch).ok()?;
+    use sha2::Digest;
+    let record = crate::core::telemetry_ledger::HeartbeatRecord {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        installation_id,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        schema_version: batch.schema_version,
+        event_names: batch
+            .events
+            .iter()
+            .map(|event| event.event.name().to_string())
+            .collect(),
+        payload_hash: hex::encode(sha2::Sha256::digest(payload)),
+        endpoint: telemetry_ledger_endpoint(),
+        status: "success".to_string(),
+    };
+    // Without a ledger entry the send stays pending and is retried with the
+    // same bytes; the server replaces per-day rows, so that is harmless.
+    if let Err(error) = crate::core::telemetry_ledger::append(&record) {
+        tracing::debug!("telemetry ledger append failed: {error}");
+        return None;
+    }
+    if let Err(error) = lease.commit() {
+        tracing::debug!("telemetry acknowledgement failed: {error}");
+        return None;
+    }
+    batch
+        .events
+        .first()
+        .map(|event| event.timestamp_bucket.clone())
+}
+
+/// How often the daemon offers the day's totals. The aggregate's admission
+/// (daily cap, growing spacing, "nothing new") decides whether a send happens.
+const DAEMON_TELEMETRY_INTERVAL: std::time::Duration = std::time::Duration::from_hours(1);
+/// Delay before the daemon's first offer so its startup stays light.
+const DAEMON_TELEMETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// Spawn the daemon's telemetry loop (must run inside a Tokio runtime).
+///
+/// Without it, sends happen only inside an MCP server (tool-call ticks and
+/// exit), so installs that use lean-ctx through hooks, the CLI or the proxy
+/// were never counted. The daemon is the one long-lived process setup starts;
+/// it also forwards the counters other processes persisted. Eligibility is
+/// re-checked on every tick, so an opt-out takes effect without a restart.
+pub(crate) fn spawn_daemon_telemetry() {
+    tokio::spawn(async {
+        tokio::time::sleep(DAEMON_TELEMETRY_INITIAL_DELAY).await;
+        loop {
+            let _ = tokio::task::spawn_blocking(daemon_telemetry_tick).await;
+            tokio::time::sleep(DAEMON_TELEMETRY_INTERVAL).await;
+        }
+    });
+}
+
+fn daemon_telemetry_tick() {
+    if !telemetry_send_eligible() {
+        return;
+    }
+    if let Err(error) = crate::core::telemetry_aggregate::record_current_version() {
+        tracing::debug!("telemetry version aggregate unavailable: {error}");
+    }
+    send_telemetry(crate::core::telemetry_aggregate::SendTrigger::Periodic);
+}
+
 pub fn cloud_background_tasks() {
-    // Persist path: read global-only so the daily background save never leaks a
-    // project-local override into the global config (#443).
-    let mut config = Config::load_global();
+    // Decision snapshot only. Read global-only so the daily background save
+    // never leaks a project-local override into the global config (#443), and
+    // never written back: the persist below re-loads under the lock and applies
+    // `delta` instead (LR-TEL-01). This also keeps edits made while the pass is
+    // busy on the network (#1934).
+    let config = Config::load_global();
+    let mut delta = CloudBackgroundDelta::default();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    let already_heartbeated = config
-        .telemetry
-        .last_heartbeat
-        .as_deref()
-        .is_some_and(|d| d == today);
     let already_synced = config
         .cloud
         .last_sync
@@ -82,28 +272,17 @@ pub fn cloud_background_tasks() {
         .as_deref()
         .is_some_and(|d| d == today);
 
-    // Unified anonymous telemetry: heartbeat + contribute entries in one request.
-    if config.telemetry.enabled && !already_heartbeated {
-        if let Ok(id) = crate::core::installation_id::get_or_create() {
-            let contribute = collect_contribute_entries();
-            let payload = serde_json::json!({
-                "installation_id": id,
-                "version": env!("CARGO_PKG_VERSION"),
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
-                "contribute_entries": contribute,
-            });
-            if crate::cloud_client::heartbeat(&payload).is_ok() {
-                config.telemetry.last_heartbeat = Some(today.clone());
-                let record = crate::core::telemetry_ledger::HeartbeatRecord {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    installation_id: id.clone(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    os: std::env::consts::OS.to_string(),
-                    arch: std::env::consts::ARCH.to_string(),
-                };
-                let _ = crate::core::telemetry_ledger::append(&record);
-            }
+    // Anonymous usage telemetry: cumulative daily totals, resent as they grow.
+    // The acknowledged bucket goes into `delta`, never into this snapshot, so
+    // a concurrent opt-out is not reverted by the persist below (LR-TEL-01).
+    if telemetry_send_eligible() {
+        if let Err(error) = crate::core::telemetry_aggregate::record_current_version() {
+            tracing::debug!("telemetry version aggregate unavailable: {error}");
+        }
+        if let Some(bucket) =
+            send_telemetry(crate::core::telemetry_aggregate::SendTrigger::Periodic)
+        {
+            delta.last_heartbeat = Some(bucket);
         }
     }
 
@@ -111,8 +290,12 @@ pub fn cloud_background_tasks() {
         if config.cloud.sync_stats_enabled && !already_synced {
             let store = crate::core::stats::load();
             let entries = build_sync_entries(&store);
-            if !entries.is_empty() && crate::cloud_client::sync_stats(&entries).is_ok() {
-                config.cloud.last_sync = Some(today.clone());
+            if !entries.is_empty() {
+                let result = crate::cloud_client::sync_stats(&entries);
+                record_sync_telemetry(&result);
+                if result.is_ok() {
+                    delta.last_sync = Some(today.clone());
+                }
             }
         }
 
@@ -137,31 +320,35 @@ pub fn cloud_background_tasks() {
                 "tool_spend_usd": summary.tool_spend_usd,
                 "model_key": summary.model.model_key,
             });
-            if crate::cloud_client::push_gain(&[entry]).is_ok() {
-                config.cloud.last_gain_sync = Some(today.clone());
+            let result = crate::cloud_client::push_gain(&[entry]);
+            record_sync_telemetry(&result);
+            if result.is_ok() {
+                delta.last_gain_sync = Some(today.clone());
             }
         }
 
-        if config.cloud.sync_models_enabled
-            && !already_pulled
-            && let Ok(data) = crate::cloud_client::pull_cloud_models()
-        {
-            let _ = crate::cloud_client::save_cloud_models(&data);
-            config.cloud.last_model_pull = Some(today.clone());
+        if config.cloud.sync_models_enabled && !already_pulled {
+            let result = crate::cloud_client::pull_cloud_models().and_then(|data| {
+                crate::cloud_client::save_cloud_models(&data).map_err(|error| error.to_string())
+            });
+            record_sync_telemetry(&result);
+            if result.is_ok() {
+                delta.last_model_pull = Some(today.clone());
+            }
         }
 
         // Opt-in Personal-Cloud auto-push (GL #384): silent, once per day,
         // offline-tolerant. A network failure leaves the slot open so the
         // next background cycle retries; a Pro gate consumes it (one quiet
-        // attempt per day on a Free account, never error spam).
+        // attempt per day on a Community account, never error spam).
         if should_auto_sync(
             config.cloud.auto_sync,
             true,
             config.cloud.last_auto_sync.as_deref(),
             &today,
-        ) && auto_sync_personal_cloud() != AutoSyncOutcome::NetworkFailure
+        ) && consumes_daily_slot(auto_sync_personal_cloud())
         {
-            config.cloud.last_auto_sync = Some(today.clone());
+            delta.last_auto_sync = Some(today.clone());
         }
 
         // Opt-in hosted-index auto-push (GL #392): once per project per day,
@@ -180,20 +367,16 @@ pub fn cloud_background_tasks() {
                     .map(String::as_str),
                 &today,
             ) {
-                match crate::cloud_client::push_index_bundle(&root) {
+                let result = crate::cloud_client::push_index_bundle(&root);
+                record_sync_telemetry(&result);
+                match result {
                     Ok((hash, bytes)) => {
                         tracing::debug!(project = %hash, bytes, "auto-index: pushed");
-                        config
-                            .cloud
-                            .last_index_push
-                            .insert(project_hash, today.clone());
+                        delta.last_index_push.push((project_hash, today.clone()));
                     }
                     Err(e) if e.contains("Pro") || e.contains("Quota") => {
                         tracing::debug!(error = %e, "auto-index: gated, retry tomorrow");
-                        config
-                            .cloud
-                            .last_index_push
-                            .insert(project_hash, today.clone());
+                        delta.last_index_push.push((project_hash, today.clone()));
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "auto-index: push failed, slot stays open");
@@ -203,9 +386,59 @@ pub fn cloud_background_tasks() {
         }
     }
 
-    if let Err(e) = config.save() {
+    if let Err(e) = persist_background_delta(&delta) {
         tracing::warn!("could not persist cloud background state: {e}");
     }
+}
+
+/// Persist step of [`cloud_background_tasks`]: resolves the global config path
+/// and delegates to [`persist_background_delta_at`].
+fn persist_background_delta(
+    delta: &CloudBackgroundDelta,
+) -> Result<(), crate::core::error::LeanCtxError> {
+    let path = Config::path().ok_or_else(|| {
+        crate::core::error::LeanCtxError::Config("cannot determine home directory".to_string())
+    })?;
+    persist_background_delta_at(&path, delta)
+}
+
+/// Path-parameterized core of the persist step — the production code path,
+/// shared with its regression test.
+///
+/// Re-loads the config from disk under the write lock and applies only the
+/// stamps this run produced, so a telemetry choice committed during the network
+/// work above is the base we mutate rather than something we overwrite. All
+/// network work has already finished; nothing here does I/O beyond the guarded
+/// config write.
+pub(crate) fn persist_background_delta_at(
+    path: &std::path::Path,
+    delta: &CloudBackgroundDelta,
+) -> Result<(), crate::core::error::LeanCtxError> {
+    if delta.is_empty() {
+        return Ok(());
+    }
+    Config::update_global_at(path, |on_disk| delta.apply(on_disk)).map(|_| ())
+}
+
+fn telemetry_ledger_endpoint() -> String {
+    let raw =
+        std::env::var("LEAN_CTX_API_URL").unwrap_or_else(|_| "https://api.leanctx.com".to_string());
+    sanitized_telemetry_endpoint(&raw)
+}
+
+fn sanitized_telemetry_endpoint(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "https://api.leanctx.com/api/telemetry/v2/batch".to_string();
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return "https://api.leanctx.com/api/telemetry/v2/batch".to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path("/api/telemetry/v2/batch");
+    url.to_string()
 }
 
 /// Push every Personal-Cloud surface silently (background variant of
@@ -214,14 +447,17 @@ fn auto_sync_personal_cloud() -> AutoSyncOutcome {
     let store = crate::core::stats::load();
     let mut results: Vec<Result<(), String>> = Vec::new();
 
-    let mut push = |label: &str, result: Result<String, String>| match result {
-        Ok(_) => {
-            tracing::debug!(surface = label, "auto-sync: pushed");
-            results.push(Ok(()));
-        }
-        Err(e) => {
-            tracing::debug!(surface = label, error = %e, "auto-sync: push failed");
-            results.push(Err(e));
+    let mut push = |label: &str, result: Result<String, String>| {
+        record_sync_telemetry(&result);
+        match result {
+            Ok(_) => {
+                tracing::debug!(surface = label, "auto-sync: pushed");
+                results.push(Ok(()));
+            }
+            Err(e) => {
+                tracing::debug!(surface = label, error = %e, "auto-sync: push failed");
+                results.push(Err(e));
+            }
         }
     };
 
@@ -264,7 +500,27 @@ fn auto_sync_personal_cloud() -> AutoSyncOutcome {
         );
     }
 
+    // A dead credential used to look exactly like being offline: silent, and
+    // retried forever. Say it once, and say what fixes it.
+    static AUTH_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if outcome == AutoSyncOutcome::Unauthenticated
+        && !AUTH_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "\n  \x1b[33m⚠\x1b[0m  Personal Cloud sync is signed out on this machine \
+             — the server rejected this device's key.\n  \
+             Your local data is safe, and nothing on the server was lost.\n  \
+             Sign in again to resume syncing: lean-ctx login\n"
+        );
+    }
+
     outcome
+}
+
+fn record_sync_telemetry<T>(result: &Result<T, String>) {
+    if let Err(error) = crate::core::telemetry_aggregate::record_sync_result(result.is_ok()) {
+        tracing::debug!("telemetry sync aggregate unavailable: {error}");
+    }
 }
 
 pub fn build_sync_entries(store: &crate::core::stats::StatsStore) -> Vec<serde_json::Value> {
@@ -609,6 +865,37 @@ pub fn collect_contribute_entries() -> Vec<serde_json::Value> {
 mod tests {
     use super::*;
 
+    /// #1934: the background pass must not revert config edits made while it
+    /// was busy on the network — it writes back only the stamps it set.
+    #[test]
+    fn background_pass_keeps_edits_made_while_it_ran() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let delta = CloudBackgroundDelta {
+            last_sync: Some("2026-09-30".into()),
+            ..CloudBackgroundDelta::default()
+        };
+
+        // Meanwhile the user turns a setting on.
+        Config::update_global(|c| c.proxy.ccr_inband = Some(true)).unwrap();
+        persist_background_delta(&delta).unwrap();
+
+        let on_disk = Config::load_global();
+        assert_eq!(on_disk.proxy.ccr_inband, Some(true), "the edit survived");
+        assert_eq!(on_disk.cloud.last_sync.as_deref(), Some("2026-09-30"));
+    }
+
+    #[test]
+    fn telemetry_ledger_endpoint_removes_credentials_query_and_fragment() {
+        assert_eq!(
+            sanitized_telemetry_endpoint("https://user:secret@example.test/base?token=x#private"),
+            "https://example.test/api/telemetry/v2/batch"
+        );
+        assert_eq!(
+            sanitized_telemetry_endpoint("file:///private/path"),
+            "https://api.leanctx.com/api/telemetry/v2/batch"
+        );
+    }
+
     #[test]
     fn auto_sync_requires_flag_login_and_unused_slot() {
         // Disabled flag blocks everything else.
@@ -655,9 +942,25 @@ mod tests {
     }
 
     #[test]
-    fn outcome_classification_is_gate_then_network_then_synced() {
+    fn outcome_classification_is_auth_then_gate_then_network_then_synced() {
         // Nothing to push counts as synced (slot consumed, no retry storm).
         assert_eq!(classify_outcomes(&[]), AutoSyncOutcome::Synced);
+        // A 401 outranks everything: the credential is gone, so the gate and
+        // the network tell us nothing useful.
+        assert_eq!(
+            classify_outcomes(&[
+                Err("Push failed: http status: 401".into()),
+                Err("HTTP 402: upgrade required".into()),
+                Err("connection refused".into()),
+            ]),
+            AutoSyncOutcome::Unauthenticated
+        );
+        // A lone 401 among successes still has to surface — one revoked
+        // machine is exactly the case that used to stay silent.
+        assert_eq!(
+            classify_outcomes(&[Ok(()), Err("Push failed: http status: 401".into())]),
+            AutoSyncOutcome::Unauthenticated
+        );
         // Any 402 means the account is gated, even with other failures.
         assert_eq!(
             classify_outcomes(&[
@@ -666,7 +969,7 @@ mod tests {
             ]),
             AutoSyncOutcome::Gated
         );
-        // All failed without a 402 → offline, keep the slot open.
+        // All failed without a 401 or 402 → offline, keep the slot open.
         assert_eq!(
             classify_outcomes(&[Err("connection refused".into()), Err("timeout".into()),]),
             AutoSyncOutcome::NetworkFailure
@@ -676,5 +979,41 @@ mod tests {
             classify_outcomes(&[Ok(()), Err("timeout".into())]),
             AutoSyncOutcome::Synced
         );
+    }
+
+    #[test]
+    fn only_a_network_failure_leaves_the_daily_slot_open() {
+        // A dead credential consumes the slot: retrying cannot fix it, and the
+        // warning is printed once per process either way. Leaving the slot
+        // open here is what turned one revoked key into a silent daily retry.
+        assert!(consumes_daily_slot(AutoSyncOutcome::Unauthenticated));
+        assert!(consumes_daily_slot(AutoSyncOutcome::Gated));
+        assert!(consumes_daily_slot(AutoSyncOutcome::Synced));
+        assert!(!consumes_daily_slot(AutoSyncOutcome::NetworkFailure));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn daemon_tick_honours_an_explicit_opt_out() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let config = Config::path().expect("config path");
+        std::fs::create_dir_all(config.parent().expect("config dir")).expect("config dir");
+        std::fs::write(&config, "[telemetry]\nenabled = false\n").expect("write opt-out");
+        daemon_telemetry_tick();
+        let state = crate::core::paths::state_dir().expect("state dir");
+        assert!(!state.join("telemetry_v2_aggregate.json").exists());
+        assert!(!state.join("telemetry_v2_one_shots.json").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn daemon_tick_attempts_a_send_for_a_default_install() {
+        // No config file: the default-on install the daemon exists to cover.
+        // The test guard sends to a discard port, so the batch stays pending,
+        // which proves the tick reached the send path.
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        daemon_telemetry_tick();
+        let state = crate::core::paths::state_dir().expect("state dir");
+        assert!(state.join("telemetry_v2_aggregate.json").exists());
     }
 }

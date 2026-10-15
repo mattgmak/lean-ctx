@@ -1,13 +1,18 @@
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod shared_sessions;
 pub use shared_sessions::{SharedSessionKey, SharedSessionStore};
 
 mod context_bus;
+pub mod observation;
 pub use context_bus::{
     ConsistencyLevel, ContextBus, ContextEventKindV1, ContextEventV1, FilteredSubscription,
     TopicFilter,
+};
+pub use observation::{
+    LocalObservationPayload, LocalObservationSource, LocalObservationV1,
+    ObservationPersistenceError,
 };
 
 pub mod redaction;
@@ -47,24 +52,30 @@ pub struct ContextOsRuntime {
 
 impl Default for ContextOsRuntime {
     fn default() -> Self {
-        #[cfg(test)]
-        let bus = ContextBus::open_at(
-            crate::core::data_dir::test_sandbox_dir()
-                .join("context-os")
-                .join("context-os.db"),
-        );
-        #[cfg(not(test))]
-        let bus = ContextBus::new();
-
-        Self {
-            shared_sessions: Arc::new(SharedSessionStore::new()),
-            bus: Arc::new(bus),
-            metrics: Arc::new(ContextOsMetrics::default()),
-        }
+        Self::try_new().expect("open context-os runtime")
     }
 }
 
 impl ContextOsRuntime {
+    fn try_new() -> Result<Self, ObservationPersistenceError> {
+        #[cfg(test)]
+        let path = crate::core::data_dir::test_sandbox_dir()
+            .join("context-os")
+            .join("context-os.db");
+        #[cfg(not(test))]
+        let path = crate::core::data_dir::lean_ctx_data_dir()
+            .map_err(std::io::Error::other)?
+            .join("context-os")
+            .join("context-os.db");
+        let bus = ContextBus::try_open_at(path)?;
+
+        Ok(Self {
+            shared_sessions: Arc::new(SharedSessionStore::new()),
+            bus: Arc::new(bus),
+            metrics: Arc::new(ContextOsMetrics::default()),
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -75,11 +86,32 @@ impl ContextOsRuntime {
 }
 
 static RUNTIME: OnceLock<Arc<ContextOsRuntime>> = OnceLock::new();
+static RUNTIME_INIT: Mutex<()> = Mutex::new(());
 
 pub fn runtime() -> Arc<ContextOsRuntime> {
-    RUNTIME
-        .get_or_init(|| Arc::new(ContextOsRuntime::new()))
-        .clone()
+    try_runtime().expect("open context-os runtime")
+}
+
+/// Fallible access to the same runtime authority. Failed initialization is not
+/// cached, so restoring the configured storage permits a subsequent retry.
+pub fn try_runtime() -> Result<Arc<ContextOsRuntime>, ObservationPersistenceError> {
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(Arc::clone(runtime));
+    }
+    // Build only one SQLite-backed runtime at a time. Competing first callers
+    // used to open and migrate the same database concurrently, which can make
+    // a valid Windows startup fail with a transient sharing/lock error.
+    let _initialization = RUNTIME_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(Arc::clone(runtime));
+    }
+    let candidate = Arc::new(ContextOsRuntime::try_new()?);
+    let _ = RUNTIME.set(candidate);
+    RUNTIME.get().cloned().ok_or_else(|| {
+        ObservationPersistenceError::InvalidRow("runtime initialization did not complete".into())
+    })
 }
 
 /// Convenience: append an event to the global bus with metrics tracking.
@@ -211,7 +243,10 @@ mod tests {
     #[test]
     fn test_runtime_bus_uses_stable_process_sandbox() {
         let _isolated = crate::core::data_dir::isolated_data_dir();
-        let runtime = ContextOsRuntime::new();
+        // The shared process runtime, not a second bus: another connection to
+        // the same sandbox database makes every parallel writer wait on
+        // SQLite's file lock and trips the bounded observation lock (Windows).
+        let runtime = runtime();
         let expected = crate::core::data_dir::test_sandbox_dir()
             .join("context-os")
             .join("context-os.db");

@@ -56,7 +56,8 @@ pub fn categorize_tool(name: &str) -> ToolCategory {
         | "ctx_dedup"
         | "ctx_preload"
         | "ctx_prefetch"
-        | "ctx_compress_memory" => ToolCategory::Internal,
+        | "ctx_compress_memory"
+        | "ctx_shape" => ToolCategory::Internal,
 
         // Core: always visible. Must cover every CORE_TOOL_NAMES entry —
         // otherwise the category gate silently drops a lazy-core tool for
@@ -101,9 +102,8 @@ pub fn categorize_tool(name: &str) -> ToolCategory {
         }
 
         // Multi-agent: on-demand collaboration
-        "ctx_agent" | "ctx_share" | "ctx_task" | "ctx_handoff" | "ctx_workflow" => {
-            ToolCategory::Session
-        }
+        "ctx_agent" | "ctx_share" | "ctx_task" | "ctx_handoff" | "ctx_workflow"
+        | "ctx_work_graph" => ToolCategory::Session,
 
         _ => ToolCategory::Core,
     }
@@ -181,13 +181,35 @@ pub fn is_local_collaboration_compatibility_tool(name: &str) -> bool {
     LOCAL_COLLABORATION_COMPATIBILITY_TOOLS.contains(&name)
 }
 
+/// Host-integration hooks: called by a host extension (the Claude Code mod's
+/// `$.mcp.call`, through the listed `ctx_call` since hosts may refuse unlisted
+/// tools, #2089), never by an agent. Advertising them would only spend prompt
+/// tokens on a tool the model must not use.
+pub const INTERNAL_HOST_TOOLS: &[&str] = &["ctx_shape"];
+
+/// Whether a call — direct, or through `ctx_call`/`ctx` — targets an internal
+/// host hook. A host replaces a native tool's output with the hook's success
+/// body, so every gate refusal on such a call must read as an error: then the
+/// host keeps the original output instead of a block message (#2089).
+#[must_use]
+pub fn targets_internal_host_tool(
+    name: &str,
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    crate::tools::registered::ctx_call::resolve(name, args)
+        .is_ok_and(|(inner, _)| INTERNAL_HOST_TOOLS.contains(&inner.as_str()))
+}
+
 /// Whether a registered tool belongs on a public MCP tool surface.
 ///
-/// Compatibility aliases and local collaboration substrate remain directly
-/// callable, including through `ctx_call`; this gate only controls discovery.
+/// Compatibility aliases, local collaboration substrate and internal host
+/// hooks remain directly callable, including through `ctx_call`; this gate only
+/// controls discovery.
 #[must_use]
 pub fn is_publicly_advertised_tool(name: &str) -> bool {
-    !is_deprecated_alias(name) && !is_local_collaboration_compatibility_tool(name)
+    !is_deprecated_alias(name)
+        && !is_local_collaboration_compatibility_tool(name)
+        && !INTERNAL_HOST_TOOLS.contains(&name)
 }
 
 /// The one-line deprecation notice prepended to a deprecated alias's output.
@@ -420,6 +442,27 @@ mod tests {
         }
         assert!(!is_local_collaboration_compatibility_tool("ctx_session"));
         assert!(is_publicly_advertised_tool("ctx_session"));
+        // Host hooks are callable but must never cost agents prompt tokens.
+        assert!(!is_publicly_advertised_tool("ctx_shape"));
+    }
+
+    /// #2089: hosts reach ctx_shape through the listed ctx_call, so a call is a
+    /// host-hook call in every spelling — and only then.
+    #[test]
+    fn host_hook_calls_are_recognised_in_every_spelling() {
+        let args = |v: serde_json::Value| v.as_object().cloned();
+        let shape = args(serde_json::json!({"tool": "Bash", "output": "x"}));
+        assert!(targets_internal_host_tool("ctx_shape", shape.as_ref()));
+        let via_call =
+            args(serde_json::json!({"name": "ctx_shape", "arguments": {"tool": "Bash"}}));
+        assert!(targets_internal_host_tool("ctx_call", via_call.as_ref()));
+        let via_ctx = args(serde_json::json!({"tool": "shape", "output": "x"}));
+        assert!(targets_internal_host_tool("ctx", via_ctx.as_ref()));
+
+        let read = args(serde_json::json!({"name": "ctx_read", "arguments": {"path": "a"}}));
+        assert!(!targets_internal_host_tool("ctx_call", read.as_ref()));
+        assert!(!targets_internal_host_tool("ctx_read", None));
+        assert!(!targets_internal_host_tool("ctx_call", None));
     }
 
     #[test]

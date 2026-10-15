@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use clap::{ArgMatches, Command};
 
 use crate::core::savings_ledger::event::SavingsEvent;
-use crate::core::{ocla::OclaService, ocla_bus, savings_ledger};
+use crate::core::{ocla::OclaService, savings_ledger};
 
 // ── Status (Agent 07) ────────────────────────────────────────────────────────
 
@@ -11,7 +11,7 @@ type TraitEntry = (
     for<'a> fn(&'a crate::core::ocla::OclaRegistry) -> &'a dyn OclaService,
 );
 
-const TRAITS: [TraitEntry; 14] = [
+const TRAITS: [TraitEntry; 13] = [
     ("observation_hook", |r| r.observation_hook.as_ref()),
     ("usage_sink", |r| r.usage_sink.as_ref()),
     ("metrics_exporter", |r| r.metrics_exporter.as_ref()),
@@ -20,7 +20,6 @@ const TRAITS: [TraitEntry; 14] = [
     ("outcome_tracker", |r| r.outcome_tracker.as_ref()),
     ("compression_provider", |r| r.compression_provider.as_ref()),
     ("response_optimizer", |r| r.response_optimizer.as_ref()),
-    ("model_router", |r| r.model_router.as_ref()),
     ("efficiency_analyzer", |r| r.efficiency_analyzer.as_ref()),
     ("config_tuner", |r| r.config_tuner.as_ref()),
     ("experiment_runner", |r| r.experiment_runner.as_ref()),
@@ -109,16 +108,6 @@ fn print_status() {
         let capability = service(registry).capability();
         println!("  {name}: builtin ({:?})", capability.status);
     }
-
-    println!(
-        "OclaBus: {} (total events emitted: {})",
-        if ocla_bus::is_enabled() {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        ocla_bus::total_emitted()
-    );
 
     let path = savings_ledger::store::default_path();
     let summary = path

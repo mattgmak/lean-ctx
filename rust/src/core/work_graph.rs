@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded Work Graph for multi-agent orchestration (P11 / DIM 4).
 //!
 //! Manages parent/child agent delegation with:
@@ -6,7 +8,7 @@
 //! - Stop conditions (stale, over-budget, redundant)
 //! - Provenance tracking for attribution
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::core::a2a::budget_cascade::{
     BudgetAllocation, CascadeError, cascade_budget, validate_cascade,
@@ -17,6 +19,109 @@ pub const WORK_GRAPH_SCHEMA_VERSION: u16 = 1;
 const MAX_GRAPH_NODES: usize = 256;
 const MAX_FAN_OUT: usize = 16;
 const MAX_DEPTH: u16 = 8;
+const MAX_LOCAL_CONCURRENCY: usize = 32;
+const MAX_IDENTIFIER_BYTES: usize = 128;
+const MAX_RESULT_CLAIMS: usize = 64;
+const MAX_PATH_CLAIMS: usize = 64;
+
+fn default_local_concurrency() -> usize {
+    MAX_FAN_OUT
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildOutcome {
+    Accepted,
+    Rejected,
+    Partial,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResultClaim {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChildExecutionReceipt {
+    pub receipt_id: String,
+    pub node_id: String,
+    pub outcome_ref: String,
+    pub outcome: ChildOutcome,
+    pub tokens_consumed: u64,
+    pub cost_micros_consumed: u64,
+    /// Opaque claim fence returned when queued work becomes active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_fence: Option<String>,
+    #[serde(default)]
+    pub claims: Vec<ResultClaim>,
+}
+
+/// Canonically verified provider spend that exceeded its authorization.
+///
+/// This is deliberately separate from [`WorkNodeBudget`]: authorization stays
+/// bounded while attribution preserves the provider-reported fact in full.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MeasuredExecutionSpend {
+    pub spend_id: String,
+    pub node_id: String,
+    pub outcome_refs: Vec<String>,
+    pub tokens_consumed: u64,
+    pub cost_micros_consumed: u64,
+    pub execution_fence: String,
+}
+
+impl MeasuredExecutionSpend {
+    pub fn new(
+        node_id: String,
+        outcome_refs: Vec<String>,
+        tokens_consumed: u64,
+        cost_micros_consumed: u64,
+        execution_fence: String,
+    ) -> Self {
+        let spend_id = measured_spend_id(&outcome_refs);
+        Self {
+            spend_id,
+            node_id,
+            outcome_refs,
+            tokens_consumed,
+            cost_micros_consumed,
+            execution_fence,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResultConflict {
+    pub key: String,
+    pub values: Vec<String>,
+    pub node_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FusedResults {
+    pub accepted: BTreeMap<String, String>,
+    pub conflicts: Vec<ResultConflict>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkAttribution {
+    pub accepted_tokens: u64,
+    pub accepted_cost_micros: u64,
+    pub waste_tokens: u64,
+    pub waste_cost_micros: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TeamValueReport {
+    pub accepted_tokens: u64,
+    pub total_tokens: u64,
+    pub accepted_cost_micros: u64,
+    pub total_cost_micros: u64,
+    pub waste_tokens: u64,
+    pub waste_cost_micros: u64,
+    pub accepted_cost_basis_points: u16,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +143,11 @@ pub enum StopReason {
     ManualStop,
     DepthExceeded,
     FanOutExceeded,
+    PolicyDenied,
+    LeaseLost,
+    Duplicate,
+    LowValue,
+    ExecutionFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -70,6 +180,17 @@ pub struct ChainBudget {
     pub root_budget_tokens: u64,
     pub total_consumed_tokens: u64,
     pub total_allocated_tokens: u64,
+    #[serde(default)]
+    pub root_budget_cost_micros: u64,
+    #[serde(default)]
+    pub total_consumed_cost_micros: u64,
+    #[serde(default)]
+    pub total_allocated_cost_micros: u64,
+    /// Verified provider spend above node authorization; never reusable.
+    #[serde(default)]
+    pub unauthorized_tokens: u64,
+    #[serde(default)]
+    pub unauthorized_cost_micros: u64,
     pub depth: u16,
 }
 
@@ -77,6 +198,7 @@ impl ChainBudget {
     pub fn remaining(&self) -> u64 {
         self.root_budget_tokens
             .saturating_sub(self.total_consumed_tokens)
+            .saturating_sub(self.unauthorized_tokens)
     }
 
     pub fn utilization_pct(&self) -> f64 {
@@ -84,7 +206,11 @@ impl ChainBudget {
             return 0.0;
         }
 
-        (self.total_consumed_tokens as f64 / self.root_budget_tokens as f64) * 100.0
+        (self
+            .total_consumed_tokens
+            .saturating_add(self.unauthorized_tokens) as f64
+            / self.root_budget_tokens as f64)
+            * 100.0
     }
 }
 
@@ -99,17 +225,52 @@ pub struct WorkNode {
     pub depth: u16,
     pub stop_reason: Option<StopReason>,
     pub outcome_ref: Option<String>,
+    #[serde(default)]
+    pub claim_attempt: u32,
+    /// Current connector attempt within this execution fence, persisted before launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_attempt: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_fence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_epoch_ms: Option<u64>,
+    #[serde(default)]
+    pub path_claims: Vec<String>,
+    #[serde(default)]
+    pub task_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_ref: Option<String>,
+    #[serde(default)]
+    pub policy_ref: String,
+    #[serde(default)]
+    pub expected_outcome_ref: String,
+    #[serde(default)]
+    pub execution_started: bool,
 }
 
 /// Bounded, acyclic work graph with enforced fan-out and budget constraints.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BoundedWorkGraph {
+    #[serde(default)]
+    graph_id: String,
     nodes: BTreeMap<String, WorkNode>,
     children: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     chain_budgets: BTreeMap<String, ChainBudget>,
     #[serde(default)]
     pending_child_budgets: BTreeMap<String, WorkNodeBudget>,
+    #[serde(default)]
+    pending_child_parents: BTreeMap<String, String>,
+    #[serde(default)]
+    receipts: BTreeMap<String, ChildExecutionReceipt>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    failed_spend: BTreeMap<String, MeasuredExecutionSpend>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    reaped_executions: BTreeMap<String, String>,
+    #[serde(default)]
+    accepted_path: BTreeSet<String>,
+    #[serde(default = "default_local_concurrency")]
+    max_local_concurrency: usize,
     max_fan_out: usize,
     max_depth: u16,
 }
@@ -120,418 +281,136 @@ impl Default for BoundedWorkGraph {
     }
 }
 
-impl BoundedWorkGraph {
-    #[must_use]
-    pub fn new(max_fan_out: usize, max_depth: u16) -> Self {
-        Self {
-            nodes: BTreeMap::new(),
-            children: BTreeMap::new(),
-            chain_budgets: BTreeMap::new(),
-            pending_child_budgets: BTreeMap::new(),
-            max_fan_out: max_fan_out.clamp(1, MAX_FAN_OUT),
-            max_depth: max_depth.clamp(1, MAX_DEPTH),
+#[path = "work_graph/control_ops.rs"]
+mod control_ops;
+#[path = "work_graph/graph_ops.rs"]
+mod graph_ops;
+
+fn execution_fence(graph_id: &str, node: &WorkNode) -> String {
+    let material = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        graph_id, node.node_id, node.agent_id, node.capsule_ref, node.claim_attempt
+    );
+    format!("fence:{}", blake3::hash(material.as_bytes()).to_hex())
+}
+
+pub(crate) fn path_claims_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn validate_identifier(value: &str, field: &'static str) -> Result<(), WorkGraphError> {
+    if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.chars().any(char::is_control)
+    {
+        return Err(WorkGraphError::InvalidIdentifier(field));
+    }
+    Ok(())
+}
+
+fn validate_budget(budget: &WorkNodeBudget) -> Result<(), WorkGraphError> {
+    if budget.tokens_consumed > budget.tokens_allocated
+        || budget.cost_micros_consumed > budget.cost_micros_allocated
+    {
+        return Err(WorkGraphError::InvalidBudget);
+    }
+    Ok(())
+}
+
+fn validate_receipt(receipt: &ChildExecutionReceipt) -> Result<(), WorkGraphError> {
+    validate_identifier(&receipt.receipt_id, "receipt_id")?;
+    validate_identifier(&receipt.node_id, "node_id")?;
+    validate_identifier(&receipt.outcome_ref, "outcome_ref")?;
+    if let Some(fence) = receipt.execution_fence.as_deref()
+        && (fence.len() != 70
+            || !fence.starts_with("fence:")
+            || !fence[6..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(WorkGraphError::InvalidIdentifier("execution_fence"));
+    }
+    if receipt.claims.len() > MAX_RESULT_CLAIMS {
+        return Err(WorkGraphError::TooManyClaims);
+    }
+    let mut keys = BTreeSet::new();
+    for claim in &receipt.claims {
+        validate_identifier(&claim.key, "claim_key")?;
+        validate_identifier(&claim.value, "claim_value")?;
+        if !keys.insert(&claim.key) {
+            return Err(WorkGraphError::DuplicateClaim(claim.key.clone()));
         }
     }
+    Ok(())
+}
 
-    /// Add a root node (no parent).
-    pub fn add_root(
-        &mut self,
-        node_id: String,
-        agent_id: String,
-        capsule_ref: String,
-        budget: WorkNodeBudget,
-    ) -> Result<&WorkNode, WorkGraphError> {
-        if self.nodes.len() >= MAX_GRAPH_NODES {
-            return Err(WorkGraphError::CapacityExceeded);
-        }
-        if self.nodes.contains_key(&node_id) {
-            return Err(WorkGraphError::DuplicateNode(node_id));
-        }
-        let node = WorkNode {
-            node_id: node_id.clone(),
-            agent_id,
-            parent_node_id: None,
-            capsule_ref,
-            status: NodeStatus::Active,
-            budget,
-            depth: 0,
-            stop_reason: None,
-            outcome_ref: None,
-        };
-        self.nodes.insert(node_id.clone(), node);
-        self.chain_budgets.insert(
-            node_id.clone(),
-            ChainBudget {
-                chain_id: node_id.clone(),
-                root_budget_tokens: self.nodes[&node_id].budget.tokens_allocated,
-                total_consumed_tokens: 0,
-                total_allocated_tokens: self.nodes[&node_id].budget.tokens_allocated,
-                depth: 0,
-            },
-        );
-        Ok(self.nodes.get(&node_id).expect("root node inserted above"))
+fn validate_measured_spend(spend: &MeasuredExecutionSpend) -> Result<(), WorkGraphError> {
+    validate_identifier(&spend.spend_id, "spend_id")?;
+    validate_identifier(&spend.node_id, "node_id")?;
+    if spend.outcome_refs.is_empty() || spend.outcome_refs.len() > 2 {
+        return Err(WorkGraphError::InvalidGraph(
+            "failed spend must reference one or two receipts".into(),
+        ));
     }
-
-    /// Delegate work to a child node. Validates budget inheritance and fan-out.
-    pub fn delegate(
-        &mut self,
-        parent_node_id: &str,
-        child_node_id: String,
-        child_agent_id: String,
-        capsule_ref: String,
-        child_budget: WorkNodeBudget,
-    ) -> Result<&WorkNode, WorkGraphError> {
-        if self.nodes.len() >= MAX_GRAPH_NODES {
-            return Err(WorkGraphError::CapacityExceeded);
-        }
-        if self.nodes.contains_key(&child_node_id) {
-            return Err(WorkGraphError::DuplicateNode(child_node_id));
-        }
-        let parent = self
-            .nodes
-            .get(parent_node_id)
-            .ok_or_else(|| WorkGraphError::NodeNotFound(parent_node_id.to_string()))?;
-        if parent.status != NodeStatus::Active {
-            return Err(WorkGraphError::ParentNotActive(parent_node_id.to_string()));
-        }
-        let new_depth = parent.depth + 1;
-        if new_depth > self.max_depth {
-            return Err(WorkGraphError::DepthExceeded(self.max_depth));
-        }
-        if child_budget.tokens_allocated > parent.budget.tokens_remaining() {
-            return Err(WorkGraphError::BudgetExceedsParent {
-                child_requested: child_budget.tokens_allocated,
-                parent_remaining: parent.budget.tokens_remaining(),
-            });
-        }
-        if child_budget.cost_micros_allocated > parent.budget.cost_remaining() {
-            return Err(WorkGraphError::BudgetExceedsParent {
-                child_requested: child_budget.cost_micros_allocated,
-                parent_remaining: parent.budget.cost_remaining(),
-            });
-        }
-        let current_children = self.children.get(parent_node_id).map_or(0, Vec::len);
-        if current_children >= self.max_fan_out {
-            return Err(WorkGraphError::FanOutExceeded(self.max_fan_out));
-        }
-        let child_tokens_allocated = child_budget.tokens_allocated;
-        let node = WorkNode {
-            node_id: child_node_id.clone(),
-            agent_id: child_agent_id,
-            parent_node_id: Some(parent_node_id.to_string()),
-            capsule_ref,
-            status: NodeStatus::Active,
-            budget: child_budget,
-            depth: new_depth,
-            stop_reason: None,
-            outcome_ref: None,
-        };
-        self.nodes.insert(child_node_id.clone(), node);
-        self.children
-            .entry(parent_node_id.to_string())
-            .or_default()
-            .push(child_node_id.clone());
-        let chain_id = self
-            .chain_id_for_node(&child_node_id)
-            .expect("delegated child always has a root node");
-        let pending_tokens = self
-            .pending_child_budgets
-            .remove(&child_node_id)
-            .map_or(0, |budget| budget.tokens_allocated);
-        self.record_chain_allocation(&chain_id, pending_tokens, child_tokens_allocated, new_depth);
-        Ok(self
-            .nodes
-            .get(&child_node_id)
-            .expect("child node inserted above"))
-    }
-
-    /// Allocates budget for a child node using cascade rules.
-    ///
-    /// The returned budget is reserved for `child_id` until it is passed to
-    /// [`Self::delegate`], so chain allocation is not counted twice.
-    pub fn allocate_child_budget(
-        &mut self,
-        parent_id: &str,
-        child_id: &str,
-        fraction: f64,
-    ) -> Result<WorkNodeBudget, WorkGraphError> {
-        let (parent_budget_tokens, parent_used_tokens, parent_cost_remaining, parent_depth) = {
-            let parent = self
-                .nodes
-                .get(parent_id)
-                .ok_or_else(|| WorkGraphError::NodeNotFound(parent_id.to_string()))?;
-            if parent.status != NodeStatus::Active {
-                return Err(WorkGraphError::ParentNotActive(parent_id.to_string()));
-            }
-            (
-                parent.budget.tokens_allocated,
-                parent.budget.tokens_consumed,
-                parent.budget.cost_remaining(),
-                parent.depth,
-            )
-        };
-
-        let parent_remaining = parent_budget_tokens.saturating_sub(parent_used_tokens);
-        if parent_remaining == 0 {
-            return Err(WorkGraphError::BudgetExceedsParent {
-                child_requested: 1,
-                parent_remaining,
-            });
-        }
-
-        let allocation = BudgetAllocation {
-            parent_budget_tokens,
-            parent_used_tokens,
-            child_fraction: fraction,
-            minimum_budget: 0,
-            maximum_budget: parent_remaining,
-        };
-        let mut cascaded = cascade_budget(&allocation);
-        cascaded.depth = u32::from(parent_depth) + 1;
-        cascaded.lineage = self.node_lineage(parent_id);
-        cascaded.lineage.push(child_id.to_string());
-        validate_cascade(&cascaded)?;
-        if cascaded.allocated_tokens > parent_remaining {
-            return Err(WorkGraphError::BudgetExceedsParent {
-                child_requested: cascaded.allocated_tokens,
-                parent_remaining,
-            });
-        }
-
-        let cost_micros_allocated = if parent_cost_remaining == 0 {
-            0
-        } else {
-            ((parent_cost_remaining as f64 * fraction) as u64)
-                .max(1)
-                .min(parent_cost_remaining)
-        };
-        let child_budget = WorkNodeBudget {
-            tokens_allocated: cascaded.allocated_tokens,
-            tokens_consumed: 0,
-            cost_micros_allocated,
-            cost_micros_consumed: 0,
-        };
-        let chain_id = self
-            .chain_id_for_node(parent_id)
-            .expect("parent node always has a root node");
-        self.pending_child_budgets
-            .insert(child_id.to_string(), child_budget.clone());
-        self.record_chain_allocation(
-            &chain_id,
-            0,
-            child_budget.tokens_allocated,
-            parent_depth + 1,
-        );
-
-        Ok(child_budget)
-    }
-
-    /// Mark a node as completed with an outcome reference.
-    pub fn complete(&mut self, node_id: &str, outcome_ref: String) -> Result<(), WorkGraphError> {
-        let node = self
-            .nodes
-            .get_mut(node_id)
-            .ok_or_else(|| WorkGraphError::NodeNotFound(node_id.to_string()))?;
-        if node.status != NodeStatus::Active {
-            return Err(WorkGraphError::InvalidTransition(node_id.to_string()));
-        }
-        node.status = NodeStatus::Completed;
-        node.outcome_ref = Some(outcome_ref);
-        Ok(())
-    }
-
-    /// Stop a node and all its descendants (cascade).
-    pub fn stop(
-        &mut self,
-        node_id: &str,
-        reason: StopReason,
-    ) -> Result<Vec<String>, WorkGraphError> {
-        if !self.nodes.contains_key(node_id) {
-            return Err(WorkGraphError::NodeNotFound(node_id.to_string()));
-        }
-        let mut stopped = Vec::new();
-        self.stop_recursive(node_id, reason, &mut stopped);
-        Ok(stopped)
-    }
-
-    /// Record token consumption on a node.
-    pub fn consume_budget(
-        &mut self,
-        node_id: &str,
-        tokens: u64,
-        cost_micros: u64,
-    ) -> Result<bool, WorkGraphError> {
-        let exhausted = {
-            let node = self
-                .nodes
-                .get_mut(node_id)
-                .ok_or_else(|| WorkGraphError::NodeNotFound(node_id.to_string()))?;
-            if node.status != NodeStatus::Active {
-                return Err(WorkGraphError::InvalidTransition(node_id.to_string()));
-            }
-            node.budget.tokens_consumed = node.budget.tokens_consumed.saturating_add(tokens);
-            node.budget.cost_micros_consumed =
-                node.budget.cost_micros_consumed.saturating_add(cost_micros);
-            node.budget.is_exhausted()
-        };
-        let chain_id = self
-            .chain_id_for_node(node_id)
-            .expect("node always has a root node");
-        self.ensure_chain_budget(&chain_id);
-        let chain_exhausted = {
-            let chain = self
-                .chain_budgets
-                .get_mut(&chain_id)
-                .expect("chain budget initialized");
-            chain.total_consumed_tokens = chain.total_consumed_tokens.saturating_add(tokens);
-            chain.total_consumed_tokens >= chain.root_budget_tokens
-        };
-
-        if chain_exhausted {
-            self.stop_recursive(&chain_id, StopReason::BudgetExhausted, &mut Vec::new());
-            return Ok(true);
-        }
-        if exhausted {
-            let node = self.nodes.get_mut(node_id).expect("node checked above");
-            node.status = NodeStatus::Stopped;
-            node.stop_reason = Some(StopReason::BudgetExhausted);
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    /// Records token consumption for a node and updates its chain budget.
-    pub fn consume_tokens(&mut self, node_id: &str, tokens: u64) -> Result<(), WorkGraphError> {
-        self.consume_budget(node_id, tokens, 0)?;
-        Ok(())
-    }
-
-    /// Returns the chain budget for a given node's chain.
-    pub fn chain_budget_for(&self, node_id: &str) -> Option<&ChainBudget> {
-        let chain_id = self.chain_id_for_node(node_id)?;
-        self.chain_budgets.get(&chain_id)
-    }
-
-    /// Returns all chains at or above their utilization threshold.
-    pub fn over_budget_chains(&self, threshold_pct: f64) -> Vec<&ChainBudget> {
-        self.chain_budgets
-            .values()
-            .filter(|budget| budget.utilization_pct() >= threshold_pct)
-            .collect()
-    }
-
-    /// Check all nodes for stop conditions and cascade.
-    pub fn enforce_stop_conditions(&mut self) -> Vec<(String, StopReason)> {
-        let exhausted: Vec<String> = self
-            .nodes
-            .iter()
-            .filter(|(_, n)| n.status == NodeStatus::Active && n.budget.is_exhausted())
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut stopped = Vec::new();
-        for node_id in exhausted {
-            let mut cascade = Vec::new();
-            self.stop_recursive(&node_id, StopReason::BudgetExhausted, &mut cascade);
-            for id in cascade {
-                stopped.push((id, StopReason::BudgetExhausted));
-            }
-        }
-        stopped
-    }
-
-    pub fn get_node(&self, node_id: &str) -> Option<&WorkNode> {
-        self.nodes.get(node_id)
-    }
-
-    pub fn children_of(&self, node_id: &str) -> &[String] {
-        self.children.get(node_id).map_or(&[], Vec::as_slice)
-    }
-
-    pub fn active_count(&self) -> usize {
-        self.nodes
-            .values()
-            .filter(|n| n.status == NodeStatus::Active)
-            .count()
-    }
-
-    pub fn total_count(&self) -> usize {
-        self.nodes.len()
-    }
-
-    #[allow(clippy::collapsible_if)]
-    fn stop_recursive(&mut self, node_id: &str, reason: StopReason, stopped: &mut Vec<String>) {
-        if let Some(node) = self.nodes.get_mut(node_id) {
-            if matches!(node.status, NodeStatus::Active | NodeStatus::Pending) {
-                node.status = NodeStatus::Stopped;
-                node.stop_reason = Some(reason);
-                stopped.push(node_id.to_string());
-            }
-        }
-        let children: Vec<String> = self.children.get(node_id).cloned().unwrap_or_default();
-        for child_id in children {
-            self.stop_recursive(&child_id, StopReason::ParentStopped, stopped);
+    let mut outcome_refs = BTreeSet::new();
+    for outcome_ref in &spend.outcome_refs {
+        validate_identifier(outcome_ref, "outcome_ref")?;
+        let digest = outcome_ref
+            .strip_prefix("id:sha256:")
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or(WorkGraphError::InvalidIdentifier("outcome_ref"))?;
+        if !outcome_refs.insert(digest) {
+            return Err(WorkGraphError::InvalidGraph(
+                "duplicate failed spend receipt".into(),
+            ));
         }
     }
-
-    fn chain_id_for_node(&self, node_id: &str) -> Option<String> {
-        let mut current_id = node_id;
-        let mut current = self.nodes.get(current_id)?;
-        while let Some(parent_id) = current.parent_node_id.as_deref() {
-            current_id = parent_id;
-            current = self.nodes.get(current_id)?;
-        }
-        Some(current_id.to_string())
+    if spend.spend_id != measured_spend_id(&spend.outcome_refs) {
+        return Err(WorkGraphError::InvalidIdentifier("spend_id"));
     }
-
-    fn node_lineage(&self, node_id: &str) -> Vec<String> {
-        let mut lineage = Vec::new();
-        let mut current_id = Some(node_id);
-        while let Some(id) = current_id {
-            let Some(node) = self.nodes.get(id) else {
-                break;
-            };
-            lineage.push(id.to_string());
-            current_id = node.parent_node_id.as_deref();
-        }
-        lineage.reverse();
-        lineage
+    if spend.execution_fence.len() != 70
+        || !spend.execution_fence.starts_with("fence:")
+        || !spend.execution_fence[6..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(WorkGraphError::InvalidIdentifier("execution_fence"));
     }
+    Ok(())
+}
 
-    fn ensure_chain_budget(&mut self, chain_id: &str) {
-        let root_budget_tokens = self
-            .nodes
-            .get(chain_id)
-            .map_or(0, |node| node.budget.tokens_allocated);
-        self.chain_budgets
-            .entry(chain_id.to_string())
-            .or_insert(ChainBudget {
-                chain_id: chain_id.to_string(),
-                root_budget_tokens,
-                total_consumed_tokens: 0,
-                total_allocated_tokens: root_budget_tokens,
-                depth: 0,
-            });
-    }
+fn measured_spend_id(outcome_refs: &[String]) -> String {
+    format!(
+        "spend:{}",
+        blake3::hash(outcome_refs.join("\0").as_bytes()).to_hex()
+    )
+}
 
-    fn record_chain_allocation(
-        &mut self,
-        chain_id: &str,
-        previous_tokens: u64,
-        tokens_allocated: u64,
-        depth: u16,
-    ) {
-        self.ensure_chain_budget(chain_id);
-        let chain = self
-            .chain_budgets
-            .get_mut(chain_id)
-            .expect("chain budget initialized");
-        chain.total_allocated_tokens = chain
-            .total_allocated_tokens
-            .saturating_sub(previous_tokens)
-            .saturating_add(tokens_allocated);
-        chain.depth = chain.depth.max(depth);
+fn validate_path_claim(value: &str) -> Result<(), WorkGraphError> {
+    let relative = value
+        .strip_prefix("path:")
+        .ok_or(WorkGraphError::InvalidPathClaim)?;
+    if relative.is_empty()
+        || relative.len() > 1_024
+        || relative.starts_with('/')
+        || relative.starts_with('\\')
+        || relative
+            .split(['/', '\\'])
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || relative.chars().any(char::is_control)
+    {
+        return Err(WorkGraphError::InvalidPathClaim);
     }
+    Ok(())
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -557,6 +436,34 @@ pub enum WorkGraphError {
     },
     #[error("invalid status transition for node: {0}")]
     InvalidTransition(String),
+    #[error("local concurrency exceeds max {0}")]
+    LocalConcurrencyExceeded(usize),
+    #[error("invalid or oversized {0}")]
+    InvalidIdentifier(&'static str),
+    #[error("consumed budget exceeds allocation")]
+    InvalidBudget,
+    #[error("duplicate execution receipt: {0}")]
+    DuplicateReceipt(String),
+    #[error("execution receipt exceeds node or chain budget: {0}")]
+    ReceiptExceedsBudget(String),
+    #[error("missing execution receipt for accepted node: {0}")]
+    MissingReceipt(String),
+    #[error("unaccepted node cannot establish an accepted path: {0}")]
+    RejectedAcceptedPath(String),
+    #[error("execution receipt has too many result claims")]
+    TooManyClaims,
+    #[error("node has too many path claims")]
+    TooManyPathClaims,
+    #[error("invalid project-relative path claim")]
+    InvalidPathClaim,
+    #[error("duplicate result claim key: {0}")]
+    DuplicateClaim(String),
+    #[error("work graph accounting overflow")]
+    Overflow,
+    #[error("stale or missing execution fence for node: {0}")]
+    StaleExecutionFence(String),
+    #[error("invalid work graph: {0}")]
+    InvalidGraph(String),
     #[error("budget cascade error: {0}")]
     Cascade(#[from] CascadeError),
 }
@@ -564,301 +471,5 @@ pub enum WorkGraphError {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-pub mod tests {
-    use crate::core::work_graph::{
-        BoundedWorkGraph, MAX_DEPTH, MAX_FAN_OUT, NodeStatus, StopReason, WorkGraphError,
-        WorkNodeBudget,
-    };
-
-    fn budget(tokens: u64, cost: u64) -> WorkNodeBudget {
-        WorkNodeBudget {
-            tokens_allocated: tokens,
-            tokens_consumed: 0,
-            cost_micros_allocated: cost,
-            cost_micros_consumed: 0,
-        }
-    }
-
-    #[test]
-    fn basic_delegation_and_budget_inheritance() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "parent-agent".into(),
-            "capsule:abc".into(),
-            budget(1000, 500),
-        )
-        .unwrap();
-        g.delegate(
-            "root",
-            "child-1".into(),
-            "child-agent".into(),
-            "capsule:def".into(),
-            budget(400, 200),
-        )
-        .unwrap();
-        assert_eq!(g.active_count(), 2);
-        assert_eq!(g.children_of("root"), &["child-1"]);
-    }
-
-    #[test]
-    fn child_cannot_exceed_parent_budget() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:x".into(),
-            budget(100, 50),
-        )
-        .unwrap();
-        assert!(matches!(
-            g.delegate(
-                "root",
-                "c".into(),
-                "b".into(),
-                "capsule:y".into(),
-                budget(200, 30)
-            ),
-            Err(WorkGraphError::BudgetExceedsParent { .. })
-        ));
-    }
-
-    #[test]
-    fn fan_out_limit_enforced() {
-        let mut g = BoundedWorkGraph::new(2, MAX_DEPTH);
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:x".into(),
-            budget(1000, 1000),
-        )
-        .unwrap();
-        g.delegate(
-            "root",
-            "c1".into(),
-            "b".into(),
-            "capsule:1".into(),
-            budget(100, 100),
-        )
-        .unwrap();
-        g.delegate(
-            "root",
-            "c2".into(),
-            "b".into(),
-            "capsule:2".into(),
-            budget(100, 100),
-        )
-        .unwrap();
-        assert!(matches!(
-            g.delegate(
-                "root",
-                "c3".into(),
-                "b".into(),
-                "capsule:3".into(),
-                budget(100, 100)
-            ),
-            Err(WorkGraphError::FanOutExceeded(2))
-        ));
-    }
-
-    #[test]
-    fn depth_limit_enforced() {
-        let mut g = BoundedWorkGraph::new(MAX_FAN_OUT, 2);
-        g.add_root(
-            "n0".into(),
-            "a".into(),
-            "capsule:0".into(),
-            budget(1000, 1000),
-        )
-        .unwrap();
-        g.delegate(
-            "n0",
-            "n1".into(),
-            "b".into(),
-            "capsule:1".into(),
-            budget(500, 500),
-        )
-        .unwrap();
-        g.delegate(
-            "n1",
-            "n2".into(),
-            "c".into(),
-            "capsule:2".into(),
-            budget(200, 200),
-        )
-        .unwrap();
-        assert!(matches!(
-            g.delegate(
-                "n2",
-                "n3".into(),
-                "d".into(),
-                "capsule:3".into(),
-                budget(100, 100)
-            ),
-            Err(WorkGraphError::DepthExceeded(2))
-        ));
-    }
-
-    #[test]
-    fn stop_cascades_to_children() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:r".into(),
-            budget(1000, 1000),
-        )
-        .unwrap();
-        g.delegate(
-            "root",
-            "c1".into(),
-            "b".into(),
-            "capsule:1".into(),
-            budget(300, 300),
-        )
-        .unwrap();
-        g.delegate(
-            "c1",
-            "gc1".into(),
-            "c".into(),
-            "capsule:gc".into(),
-            budget(100, 100),
-        )
-        .unwrap();
-        let stopped = g.stop("c1", StopReason::Stale).unwrap();
-        assert_eq!(stopped, vec!["c1", "gc1"]);
-        assert_eq!(g.get_node("c1").unwrap().status, NodeStatus::Stopped);
-        assert_eq!(
-            g.get_node("gc1").unwrap().stop_reason,
-            Some(StopReason::ParentStopped)
-        );
-    }
-
-    #[test]
-    fn budget_exhaustion_auto_stops() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:r".into(),
-            budget(100, 100),
-        )
-        .unwrap();
-        let exhausted = g.consume_budget("root", 100, 50).unwrap();
-        assert!(exhausted);
-        assert_eq!(g.get_node("root").unwrap().status, NodeStatus::Stopped);
-    }
-
-    #[test]
-    fn allocate_child_budget_uses_requested_fraction() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:r".into(),
-            budget(10_000, 5_000),
-        )
-        .unwrap();
-
-        let child_budget = g.allocate_child_budget("root", "child", 0.5).unwrap();
-
-        assert_eq!(child_budget, budget(5_000, 2_500));
-        let chain = g.chain_budget_for("root").unwrap();
-        assert_eq!(chain.total_allocated_tokens, 15_000);
-        assert_eq!(chain.depth, 1);
-    }
-
-    #[test]
-    fn allocate_child_budget_rejects_exhausted_parent() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:r".into(),
-            budget(100, 100),
-        )
-        .unwrap();
-        g.consume_tokens("root", 100).unwrap();
-
-        assert!(g.allocate_child_budget("root", "child", 0.5).is_err());
-    }
-
-    #[test]
-    fn consume_tokens_updates_node_and_chain() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:r".into(),
-            budget(1_000, 1_000),
-        )
-        .unwrap();
-
-        g.consume_tokens("root", 250).unwrap();
-
-        assert_eq!(g.get_node("root").unwrap().budget.tokens_consumed, 250);
-        assert_eq!(
-            g.chain_budget_for("root").unwrap().total_consumed_tokens,
-            250
-        );
-    }
-
-    #[test]
-    fn consume_tokens_stops_exhausted_node() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:r".into(),
-            budget(100, 100),
-        )
-        .unwrap();
-
-        g.consume_tokens("root", 100).unwrap();
-
-        let node = g.get_node("root").unwrap();
-        assert_eq!(node.status, NodeStatus::Stopped);
-        assert_eq!(node.stop_reason, Some(StopReason::BudgetExhausted));
-    }
-
-    #[test]
-    fn over_budget_chains_returns_chains_above_threshold() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "first".into(),
-            "a".into(),
-            "capsule:first".into(),
-            budget(1_000, 1_000),
-        )
-        .unwrap();
-        g.add_root(
-            "second".into(),
-            "b".into(),
-            "capsule:second".into(),
-            budget(1_000, 1_000),
-        )
-        .unwrap();
-        g.consume_tokens("first", 750).unwrap();
-
-        let over_budget = g.over_budget_chains(70.0);
-
-        assert_eq!(over_budget.len(), 1);
-        assert_eq!(over_budget[0].chain_id, "first");
-    }
-
-    #[test]
-    fn complete_sets_outcome() {
-        let mut g = BoundedWorkGraph::default();
-        g.add_root(
-            "root".into(),
-            "a".into(),
-            "capsule:r".into(),
-            budget(1000, 1000),
-        )
-        .unwrap();
-        g.complete("root", "outcome:success".into()).unwrap();
-        let node = g.get_node("root").unwrap();
-        assert_eq!(node.status, NodeStatus::Completed);
-        assert_eq!(node.outcome_ref.as_deref(), Some("outcome:success"));
-    }
-}
+#[path = "work_graph/tests.rs"]
+pub mod tests;

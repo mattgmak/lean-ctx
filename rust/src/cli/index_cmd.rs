@@ -40,10 +40,7 @@ pub(crate) fn cmd_index(args: &[String]) {
                 true
             }));
             crate::core::index_orchestrator::ensure_all_background(&project_root);
-
-            if !wait_graph_bm25_progress(&project_root, Duration::from_mins(5)) {
-                return;
-            }
+            wait_graph_bm25_progress(&project_root);
 
             // Surface the BM25 build outcome so the operator knows the index
             // state (issue #249).
@@ -84,10 +81,7 @@ pub(crate) fn cmd_index(args: &[String]) {
                 let _ = std::fs::remove_file(&embedding_json);
             }
             crate::core::index_orchestrator::ensure_all_background(&project_root);
-
-            if !wait_graph_bm25_progress(&project_root, Duration::from_mins(5)) {
-                return;
-            }
+            wait_graph_bm25_progress(&project_root);
 
             // Surface the BM25 build outcome (chunk count + persisted size, or the
             // "too large to persist" remedy) so the operator is never left guessing.
@@ -161,9 +155,7 @@ pub(crate) fn cmd_index(args: &[String]) {
             if !disk.bm25_index.exists {
                 eprintln!("BM25 index not found — building graph + BM25 first ...");
                 crate::core::index_orchestrator::ensure_all_background(&project_root);
-                if !wait_graph_bm25_progress(&project_root, Duration::from_mins(5)) {
-                    return;
-                }
+                wait_graph_bm25_progress(&project_root);
             }
 
             wait_semantic_progress(&project_root);
@@ -171,7 +163,7 @@ pub(crate) fn cmd_index(args: &[String]) {
             match sem.state {
                 "ready" => eprintln!("semantic index ready"),
                 "failed" => eprintln!(
-                    "semantic index failed: {}",
+                    "semantic index failed: {}\n  finished files are kept — re-run `lean-ctx index build-semantic` to resume",
                     sem.last_error.unwrap_or_else(|| String::from("unknown"))
                 ),
                 _ => {
@@ -183,9 +175,27 @@ pub(crate) fn cmd_index(args: &[String]) {
             }
         }
         Some("watch") => run_watcher(root),
+        Some("why") => {
+            let Some(file) = positional_after(args, "why") else {
+                eprintln!("Usage: lean-ctx index why <file> [--json] [--root <path>]");
+                std::process::exit(2);
+            };
+            let coverage = crate::core::bm25_index::coverage::explain(root, file);
+            if args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&coverage).unwrap_or_default()
+                );
+            } else {
+                print!("{}", crate::core::bm25_index::coverage::render(&coverage));
+            }
+            if coverage.exclusion.is_some() {
+                std::process::exit(1);
+            }
+        }
         _ => {
-            eprintln!(
-                "Usage: lean-ctx index <status|build|build-full|build-graph|build-semantic|watch> [--root <path>]\n\
+            println!(
+                "Usage: lean-ctx index <status|build|build-full|build-graph|build-semantic|watch|why <file>> [--root <path>]\n\
                  Filter flags (#735, apply to this run; persist via [index] config):\n\
                    --exclude <glob>       drop matching files from the corpus (repeatable)\n\
                    --include <glob>       corpus = matching files only (repeatable)\n\
@@ -199,60 +209,73 @@ pub(crate) fn cmd_index(args: &[String]) {
                    lean-ctx index build-semantic --include \"**/*.{{java,kt,ts}}\"\n\
                    lean-ctx index build-graph        (SQLite property graph for impact analysis)\n\
                    lean-ctx index build-semantic     (dense embedding index, builds BM25 first if needed)\n\
-                   lean-ctx index watch"
+                   lean-ctx index watch\n\
+                   lean-ctx index why src/Legacy.cs  (is this file indexed? if not, which rule dropped it)"
             );
         }
     }
 }
 
+/// The first positional argument after the subcommand `sub`, skipping flags
+/// and the values of value-taking flags (see [`find_subcommand`]).
+fn positional_after<'a>(args: &'a [String], sub: &str) -> Option<&'a str> {
+    let mut seen_sub = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if INDEX_VALUE_FLAGS.contains(&a.as_str()) {
+            let _ = it.next();
+            continue;
+        }
+        if a.starts_with("--") {
+            continue;
+        }
+        if seen_sub {
+            return Some(a.as_str());
+        }
+        seen_sub = a == sub;
+    }
+    None
+}
+
 /// Wait for graph + BM25 with a shared progress indicator.
 ///
-/// Uses [`progress_view`] (typed) — no JSON scrape. Returns `false` on timeout
-/// (background work continues).
-fn wait_graph_bm25_progress(project_root: &str, timeout: Duration) -> bool {
+/// Uses [`progress_view`] (typed) — no JSON scrape. No deadline: the build runs
+/// on a thread of this process, so returning early would exit and kill it
+/// before the index is persisted.
+fn wait_graph_bm25_progress(project_root: &str) {
     let mut progress = ProgressIndicator::new("indexes");
-    let start = Instant::now();
     loop {
         let view = crate::core::index_orchestrator::progress_view(project_root);
         if !view.graph_bm25_active() {
             progress.finish("indexes (graph + BM25) done (search may still be warming)");
-            return true;
+            return;
         }
         apply_graph_bm25_progress(&mut progress, &view);
         progress.tick();
-        if start.elapsed() > timeout {
-            progress.finish("indexes still building (timeout — check `lean-ctx index status`)");
-            return false;
-        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 /// Build semantic on a worker thread while showing progress.
 ///
-/// Returns `false` on timeout (worker keeps running).
-fn wait_semantic_progress(project_root: &str) -> bool {
+/// Waits for the worker without a deadline: the build runs in this process,
+/// so returning early would exit and kill it. A CPU-only build of a large
+/// corpus can take hours; Ctrl-C stops it and the checkpointed files are kept.
+fn wait_semantic_progress(project_root: &str) {
     let root = project_root.to_string();
     let handle = std::thread::spawn(move || {
         crate::core::index_orchestrator::build_semantic(&root);
     });
     let mut progress = ProgressIndicator::new("semantic");
-    let start = Instant::now();
-    let timeout = Duration::from_mins(10);
     loop {
         if handle.is_finished() {
             let _ = handle.join();
             progress.finish("semantic done");
-            return true;
+            return;
         }
         let view = crate::core::index_orchestrator::progress_view(project_root);
         apply_semantic_progress(&mut progress, &view);
         progress.tick();
-        if start.elapsed() > timeout {
-            progress.finish("semantic still building (timeout — check `lean-ctx index status`)");
-            // JoinHandle drop detaches — leave worker running.
-            return false;
-        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -289,11 +312,13 @@ fn apply_semantic_progress(
 /// First non-flag token, skipping the values of value-taking flags — so
 /// `index build --exclude "**/*.csv"` resolves the subcommand `build`, not the
 /// glob (#735).
+/// Flags of `lean-ctx index` that consume the next argument.
+const INDEX_VALUE_FLAGS: [&str; 4] = ["--exclude", "--include", "--root", "--project-root"];
+
 fn find_subcommand(args: &[String]) -> Option<&str> {
-    const VALUE_FLAGS: [&str; 4] = ["--exclude", "--include", "--root", "--project-root"];
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if VALUE_FLAGS.contains(&a.as_str()) {
+        if INDEX_VALUE_FLAGS.contains(&a.as_str()) {
             let _ = it.next();
             continue;
         }
@@ -473,7 +498,20 @@ fn print_human_status(project_root: &str) {
     // #1437: surface the daemon session root when it differs from the CLI root
     // so users can diagnose the "status says ready but queries fail" mismatch.
     if let Some(daemon_root) = daemon_session_project_root() {
-        if daemon_root != project_root {
+        // Compare forms, not spellings: `G:/x` and `\\?\G:\x` are one root (#2049).
+        let same_root = |a: &str, b: &str| {
+            let form = |p: &str| {
+                let p = crate::core::pathutil::strip_verbatim_str(p).unwrap_or_else(|| p.into());
+                crate::core::pathutil::normalize_tool_path(&p)
+            };
+            let (a, b) = (form(a), form(b));
+            if cfg!(windows) {
+                a.eq_ignore_ascii_case(&b)
+            } else {
+                a == b
+            }
+        };
+        if !same_root(&daemon_root, project_root) {
             println!(
                 "  ⚠ Daemon root:  {daemon_root} (differs from CLI — dense queries use this root)"
             );
@@ -507,7 +545,20 @@ fn format_disk_line(ds: &crate::core::index_orchestrator::DiskStatus, count_labe
     if !ds.exists {
         return "not built".to_string();
     }
-    let mut parts = vec!["ready".to_string()];
+    if let Some(total) = ds.partial_of {
+        return format!(
+            "(partial, {}/{total} {count_label} — resume: lean-ctx index build-semantic)",
+            ds.file_count.unwrap_or(0)
+        );
+    }
+    // #1914: a persisted index that holds nothing is not "ready" — searches
+    // against it return nothing, and the user must be able to tell.
+    let state = if ds.file_count == Some(0) {
+        "empty"
+    } else {
+        "ready"
+    };
+    let mut parts = vec![state.to_string()];
     if let Some(count) = ds.file_count {
         parts.push(format!("{count} {count_label}"));
     }
@@ -541,6 +592,47 @@ mod tests {
     }
 
     #[test]
+    fn empty_index_is_not_reported_ready() {
+        use crate::core::index_orchestrator::DiskStatus;
+        let empty = DiskStatus {
+            exists: true,
+            size_bytes: Some(26),
+            file_count: Some(0),
+            modified_at: None,
+            partial_of: None,
+        };
+        assert_eq!(
+            format_disk_line(&empty, "chunks"),
+            "(empty, 0 chunks, 26 B)"
+        );
+        let built = DiskStatus {
+            file_count: Some(1200),
+            size_bytes: Some(9_437_184),
+            ..empty
+        };
+        assert_eq!(
+            format_disk_line(&built, "chunks"),
+            "(ready, 1200 chunks, 9.0 MB)"
+        );
+    }
+
+    #[test]
+    fn interrupted_semantic_build_is_reported_partial_with_resume_hint() {
+        use crate::core::index_orchestrator::DiskStatus;
+        let partial = DiskStatus {
+            exists: true,
+            size_bytes: Some(4096),
+            file_count: Some(1200),
+            modified_at: None,
+            partial_of: Some(5000),
+        };
+        assert_eq!(
+            format_disk_line(&partial, "vectors"),
+            "(partial, 1200/5000 vectors — resume: lean-ctx index build-semantic)"
+        );
+    }
+
+    #[test]
     fn subcommand_found_before_flags() {
         assert_eq!(
             find_subcommand(&args(&["build", "--root", "/x"])),
@@ -564,6 +656,20 @@ mod tests {
             find_subcommand(&args(&["--root", "/x", "--no-gitignore", "watch"])),
             Some("watch")
         );
+    }
+
+    #[test]
+    fn why_takes_the_file_after_the_subcommand() {
+        assert_eq!(
+            positional_after(&args(&["why", "src/a.cs"]), "why"),
+            Some("src/a.cs")
+        );
+        assert_eq!(
+            positional_after(&args(&["--root", "/x", "why", "--json", "b.rs"]), "why"),
+            Some("b.rs")
+        );
+        assert_eq!(positional_after(&args(&["why", "--json"]), "why"), None);
+        assert_eq!(find_subcommand(&args(&["why", "b.rs"])), Some("why"));
     }
 
     #[test]
@@ -600,8 +706,8 @@ mod tests {
     #[test]
     fn no_filter_flags_yields_empty_overlay_inputs() {
         let (include, exclude, gitignore) = parse_filter_flags(&args(&["build", "--root", "/x"]));
-        assert!(include.is_empty());
-        assert!(exclude.is_empty());
+        assert!(include.is_empty(), "{include:?}");
+        assert!(exclude.is_empty(), "{exclude:?}");
         assert_eq!(gitignore, None);
     }
 }

@@ -353,11 +353,8 @@ mod tests {
         let _lock = crate::core::data_dir::test_env_lock();
         let old_lean_ctx_model = std::env::var("LEAN_CTX_MODEL").ok();
         let old_lctx_model = std::env::var("LCTX_MODEL").ok();
-        // SAFETY: test holds exclusive env lock via test_env_lock()
-        unsafe {
-            std::env::set_var("LEAN_CTX_MODEL", "claude-opus-4.5");
-            std::env::remove_var("LCTX_MODEL");
-        }
+        crate::test_env::set_var("LEAN_CTX_MODEL", "claude-opus-4.5");
+        crate::test_env::remove_var("LCTX_MODEL");
 
         let model = CostModel::default();
 
@@ -366,16 +363,13 @@ mod tests {
         assert_eq!(model.input_price_per_m, 5.0);
         assert_eq!(model.output_price_per_m, 25.0);
 
-        // SAFETY: test holds exclusive env lock via test_env_lock()
-        unsafe {
-            match old_lean_ctx_model {
-                Some(value) => std::env::set_var("LEAN_CTX_MODEL", value),
-                None => std::env::remove_var("LEAN_CTX_MODEL"),
-            }
-            match old_lctx_model {
-                Some(value) => std::env::set_var("LCTX_MODEL", value),
-                None => std::env::remove_var("LCTX_MODEL"),
-            }
+        match old_lean_ctx_model {
+            Some(value) => crate::test_env::set_var("LEAN_CTX_MODEL", value),
+            None => crate::test_env::remove_var("LEAN_CTX_MODEL"),
+        }
+        match old_lctx_model {
+            Some(value) => crate::test_env::set_var("LCTX_MODEL", value),
+            None => crate::test_env::remove_var("LCTX_MODEL"),
         }
     }
 

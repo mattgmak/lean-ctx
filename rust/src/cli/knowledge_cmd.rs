@@ -106,6 +106,7 @@ pub(crate) fn cmd_knowledge(args: &[String]) {
             );
             println!("{out}");
         }
+        Some("help" | "-h") => print_help(),
         _ => {
             print_help();
             if action.is_some() {
@@ -564,7 +565,11 @@ fn recall_json(project_root: &str, category: Option<&str>, query: Option<&str>) 
 fn cmd_consolidate(args: &[String], project_root: &str) {
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let opts = {
-        let base = crate::core::consolidation_engine::ConsolidateOptions::manual();
+        let base = if args.iter().any(|a| a == "--adaptive") {
+            crate::core::consolidation_engine::ConsolidateOptions::scheduled(Default::default())
+        } else {
+            crate::core::consolidation_engine::ConsolidateOptions::manual()
+        };
         if dry_run { base.into_dry_run() } else { base }
     };
 
@@ -721,7 +726,7 @@ fn positional_after(args: &[String], subcommand: &str) -> Option<String> {
 }
 
 fn print_help() {
-    eprintln!(
+    println!(
         "\
 lean-ctx knowledge — Project knowledge base
 
@@ -732,7 +737,8 @@ Usage:
   lean-ctx knowledge export [--format json|jsonl|simple|okf] [--output <path|dir>]
   lean-ctx knowledge import <path|dir> [--merge replace|append|skip-existing] [--dry-run]
   lean-ctx knowledge remove --category <cat> --key <key>
-  lean-ctx knowledge consolidate [--all] [--dry-run]
+  lean-ctx knowledge consolidate [--all] [--dry-run] [--adaptive]
+    --adaptive uses scheduled budgets and optional Pro memory selection.
   lean-ctx knowledge restore [--store facts|history|procedures|patterns] [--query <text>] [--limit N]
   lean-ctx knowledge status
   lean-ctx knowledge health

@@ -176,6 +176,9 @@ mod tests {
 
     #[test]
     fn handle_search_missing_query() {
+        // Search answers "withheld" while any content policy is active, and
+        // policy tests pin one process-wide; pin "none" for this one.
+        let _policy = crate::core::policy::runtime::TestPolicyOverride::set(None);
         let (output, _) = handle("search", None, None, None, None, 10, None);
         assert!(output.contains("query is required"));
     }
@@ -185,6 +188,6 @@ mod tests {
         // This test depends on global state but should work on clean init
         let (output, _) = handle_list_roots();
         // Either shows roots or says none configured
-        assert!(!output.is_empty());
+        assert!(!output.is_empty(), "`output` is empty");
     }
 }

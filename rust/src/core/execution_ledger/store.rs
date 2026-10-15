@@ -270,7 +270,7 @@ impl ExecutionLedgerStore {
     pub(crate) fn append_if_new(&self, event: ExecutionEvent) -> Result<bool> {
         #[cfg(not(unix))]
         {
-            return portable::append_if_new(self, event);
+            portable::append_if_new(self, event)
         }
         #[cfg(unix)]
         {
@@ -377,7 +377,7 @@ impl ExecutionLedgerStore {
     pub fn verify_chain(&self) -> Result<bool> {
         #[cfg(not(unix))]
         {
-            return portable::verify_chain(self);
+            portable::verify_chain(self)
         }
         #[cfg(unix)]
         {
@@ -413,7 +413,7 @@ impl ExecutionLedgerStore {
     pub fn load(&self) -> Result<Vec<ExecutionEvent>> {
         #[cfg(not(unix))]
         {
-            return portable::load(self, false);
+            portable::load(self, false)
         }
         #[cfg(unix)]
         {
@@ -447,7 +447,7 @@ impl ExecutionLedgerStore {
     pub fn load_verified(&self) -> Result<Vec<ExecutionEvent>> {
         #[cfg(not(unix))]
         {
-            return portable::load(self, true);
+            portable::load(self, true)
         }
         #[cfg(unix)]
         {

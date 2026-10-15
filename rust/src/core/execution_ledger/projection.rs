@@ -1,9 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Read-only projections over execution-ledger events.
 
 use lean_ctx_protocol::{
-    EvidenceKind, EvidenceRefV1, ExecutionReceiptV1, ReceiptId, SignatureStatus, TaskId,
+    EvidenceKind, EvidenceRefV1, ExecutionReceiptV1, ReceiptId, ReceiptValueClassificationV1,
+    SignatureStatus, TaskId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{Result, event::ExecutionEvent, store::ExecutionLedgerStore};
 
@@ -14,10 +17,29 @@ pub struct TaskCostSummary {
     pub total_tokens: u64,
     pub total_tokens_in: u64,
     pub total_tokens_out: u64,
+    /// Sum of per-invocation model price-table estimates, never a measured invoice.
     pub cost_micros: u64,
     pub total_cost_micros: u64,
     pub model_calls: u32,
     pub total_latency_ms: u64,
+}
+
+impl TaskCostSummary {
+    /// Classifies the cost as an estimate whenever model usage was observed.
+    #[must_use]
+    pub const fn cost_classification(&self) -> ReceiptValueClassificationV1 {
+        if self.model_calls == 0 {
+            ReceiptValueClassificationV1::Unavailable
+        } else {
+            ReceiptValueClassificationV1::Estimated
+        }
+    }
+
+    /// No independently modeled or observed legacy baseline exists.
+    #[must_use]
+    pub const fn baseline_cost_classification(&self) -> ReceiptValueClassificationV1 {
+        ReceiptValueClassificationV1::Unavailable
+    }
 }
 
 /// Verified ledger link to a canonical receipt artifact.
@@ -37,6 +59,10 @@ pub struct CanonicalReceiptProjectionV1 {
 }
 
 /// Non-authoritative compatibility projection derived from legacy `ReceiptSigned`.
+///
+/// Its numeric cost fields are model price-table estimates. The legacy baseline
+/// repeats that estimate for wire compatibility and is not an independently
+/// observed or modeled baseline.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct LegacyReceiptProjectionV1 {
@@ -69,6 +95,22 @@ impl LegacyReceiptProjectionV1 {
     #[must_use]
     pub const fn legacy_receipt(&self) -> &ExecutionReceiptV1 {
         &self.receipt
+    }
+
+    /// Classifies the legacy cost from whether model usage was observed.
+    #[must_use]
+    pub const fn cost_classification(&self) -> ReceiptValueClassificationV1 {
+        if self.receipt.model_calls == 0 {
+            ReceiptValueClassificationV1::Unavailable
+        } else {
+            ReceiptValueClassificationV1::Estimated
+        }
+    }
+
+    /// The compatibility baseline is not independently modeled or observed.
+    #[must_use]
+    pub const fn baseline_cost_classification(&self) -> ReceiptValueClassificationV1 {
+        ReceiptValueClassificationV1::Unavailable
     }
 
     /// Consumes this wrapper for explicitly legacy interoperability.
@@ -276,6 +318,7 @@ pub fn legacy_receipt_for_task_from_store(
     let mut total_input = 0_u64;
     let mut total_output = 0_u64;
     let mut total_latency = 0_u64;
+    let mut estimated_cost_micros = 0_u64;
     let mut first_model = None;
     let mut last_model = None;
     let mut provider = None;
@@ -304,6 +347,8 @@ pub fn legacy_receipt_for_task_from_store(
                 total_input = total_input.saturating_add(tokens_in);
                 total_output = total_output.saturating_add(tokens_out);
                 total_latency = total_latency.saturating_add(latency_ms);
+                estimated_cost_micros = estimated_cost_micros
+                    .saturating_add(estimate_cost_micros(&model, tokens_in, tokens_out));
                 if first_model.is_none() {
                     first_model = Some(model.clone());
                 }
@@ -340,16 +385,19 @@ pub fn legacy_receipt_for_task_from_store(
         return None;
     }
 
-    let actual_cost_micros = estimate_cost_micros(&selected_model, total_input, total_output);
+    let actual_cost_micros = estimated_cost_micros;
     let evidence_refs = vec![EvidenceRefV1 {
+        schema_version: Some(1),
         kind: EvidenceKind::ProviderReceipt,
         uri: format!("receipt:{receipt_hash}"),
-        digest: receipt_hash,
+        digest: evidence_digest(&receipt_hash),
         signature_status: if signature.is_empty() {
             SignatureStatus::NotSigned
         } else {
             SignatureStatus::Unverified
         },
+        media_type: Some("application/json".to_owned()),
+        extensions: Default::default(),
     }];
 
     let receipt = ExecutionReceiptV1 {
@@ -379,9 +427,40 @@ pub fn legacy_receipt_for_task_from_store(
         decision_refs,
         evidence_refs,
         signature,
+        executor_agent_id: None,
+        attempt_id: None,
+        context_plan_id: None,
+        context_receipt_ref: None,
+        capability_bindings: Vec::new(),
+        observations: lean_ctx_protocol::ExecutionObservationsV1 {
+            model_calls: Some(model_calls),
+            retries: Some(0),
+            latency_ms: Some(total_latency),
+            actual_cost_micros: Some(actual_cost_micros),
+        },
+        extensions: Default::default(),
     };
     receipt.validate().ok()?;
     Some(LegacyReceiptProjectionV1 { receipt })
+}
+
+fn evidence_digest(value: &str) -> String {
+    let digest = value
+        .strip_prefix("sha256:")
+        .or_else(|| value.strip_prefix("blake3:"))
+        .unwrap_or(value);
+    if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return value.to_owned();
+    }
+    let digest = Sha256::digest(value.as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut output, byte| {
+            use std::fmt::Write;
+            write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
+            output
+        },
+    );
+    format!("sha256:{digest}")
 }
 
 fn estimate_cost_micros(model: &str, tokens_in: u64, tokens_out: u64) -> u64 {

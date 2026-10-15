@@ -8,12 +8,18 @@
 #[cfg(test)]
 mod tests {
     use std::hint::black_box;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::Instant;
 
     use crate::core::ocla::OclaRegistry;
     use crate::core::ocla::builtin::compression_provider::BuiltinCompressionProvider;
-    use crate::core::ocla::traits::CompressionProvider;
-    use crate::core::ocla::types::{CompressionRequest, OclaRequestContext};
+    use crate::core::ocla::content_port::CompressionContentPort;
+    use crate::core::ocla::traits::{CompressionProvider, OclaService};
+    use crate::core::ocla::types::{
+        CompressionRequest, CompressionResult, OclaCapability, OclaCapabilityKind,
+        OclaRequestContext, OclaResult,
+    };
     use crate::core::tokens;
 
     const ITERATIONS: usize = 1000;
@@ -23,6 +29,44 @@ mod tests {
     /// tolerating CI noise. Fine-grained perf tracking: dedicated Benchmarks job.
     const MAX_REGRESSION_PCT: f64 = 200.0;
     const SOURCE_REF: &str = "file:rust/src/core/ocla/regression_gate.rs";
+
+    struct ScopedCompressionProvider {
+        provider: BuiltinCompressionProvider,
+        port: CompressionContentPort,
+    }
+
+    impl ScopedCompressionProvider {
+        fn new(project_root: &Path) -> Self {
+            Self {
+                provider: BuiltinCompressionProvider::new(),
+                port: CompressionContentPort::new(project_root.to_path_buf())
+                    .expect("Engine repository root must be a real directory"),
+            }
+        }
+    }
+
+    impl OclaService for ScopedCompressionProvider {
+        fn capability(&self) -> OclaCapability {
+            OclaCapability::available(OclaCapabilityKind::CompressionProvider)
+        }
+
+        fn manifest(&self) -> OclaResult<lean_ctx_protocol::CapabilityManifestV1> {
+            self.provider.manifest()
+        }
+    }
+
+    impl CompressionProvider for ScopedCompressionProvider {
+        fn compress(&self, request: CompressionRequest) -> OclaResult<CompressionResult> {
+            self.provider.compress_with_port(request, &self.port)
+        }
+    }
+
+    fn project_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("Engine crate must be inside its repository")
+            .to_path_buf()
+    }
 
     fn make_context() -> OclaRequestContext {
         OclaRequestContext::new(
@@ -62,15 +106,19 @@ mod tests {
 
     #[test]
     fn compression_dyn_dispatch_regression_gate() {
-        let source = std::fs::read_to_string(
-            SOURCE_REF
-                .strip_prefix("file:rust/")
-                .expect("source ref must point inside the rust crate"),
-        )
-        .expect("regression-gate source must be readable");
+        // Compression resolves process-global policy/runtime paths. Exclude
+        // environment edits from both timing samples and admission.
+        let _lock = crate::core::data_dir::test_env_lock();
+        let project_root = project_root();
+        let source_path = SOURCE_REF
+            .strip_prefix("file:")
+            .expect("source ref must use the file scheme");
+        let source = std::fs::read_to_string(project_root.join(source_path))
+            .expect("regression-gate source must be readable");
         let source_tokens = tokens::count_tokens(&source) as u64;
-        let direct_provider = BuiltinCompressionProvider::new();
-        let registry = OclaRegistry::global();
+        let direct_provider = ScopedCompressionProvider::new(&project_root);
+        let mut registry = OclaRegistry::with_builtins();
+        registry.compression_provider = Arc::new(ScopedCompressionProvider::new(&project_root));
 
         for _ in 0..10 {
             black_box(

@@ -148,6 +148,11 @@ struct Frame {
     /// earlier physical line (e.g. after heredoc-body stripping collapses the
     /// body between them) is misread as its own bare command segment.
     brace_depth: u32,
+    /// #1793: `[[ … ]]` is a bash conditional *construct*, not a command, and
+    /// the `&&`/`||` inside it join predicates rather than commands. Without
+    /// shielding, `[[ -x a && -x b ]]` was split mid-condition into fragments
+    /// like `[[ -x a` and `-x b ]]`, none of which resolve to a real command.
+    bracket_depth: u32,
     kind: FrameKind,
 }
 
@@ -169,14 +174,54 @@ impl Frame {
             in_double_quote: false,
             paren_depth: 0,
             brace_depth: 0,
+            bracket_depth: 0,
             kind,
         }
     }
 
     /// Inside quotes, or inside a group whose closing delimiter is still open.
     const fn shields_operators(&self) -> bool {
-        self.in_single_quote || self.in_double_quote || self.paren_depth > 0 || self.brace_depth > 0
+        self.in_single_quote
+            || self.in_double_quote
+            || self.paren_depth > 0
+            || self.brace_depth > 0
+            || self.bracket_depth > 0
     }
+}
+
+/// True when the two bytes at `i` form a standalone `[[` token — the opener of
+/// a bash conditional (#1793).
+///
+/// Bash requires `[[` to be its own word, and so does this: a word boundary
+/// before and whitespace after. That distinction is what keeps a glob character
+/// class (`ls a[[:alpha:]]`) or a nested array subscript (`${arr[[i]]}`) from
+/// opening a depth that would never close and swallow the rest of the line.
+fn opens_double_bracket(bytes: &[u8], i: usize) -> bool {
+    if bytes.get(i) != Some(&b'[') || bytes.get(i + 1) != Some(&b'[') {
+        return false;
+    }
+    let boundary_before = i == 0
+        || matches!(
+            bytes[i - 1],
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'('
+        );
+    let space_after = matches!(bytes.get(i + 2), Some(b' ' | b'\t' | b'\n' | b'\r'));
+    boundary_before && space_after
+}
+
+/// True when the two bytes at `i` form a standalone `]]` token closing a
+/// conditional opened by [`opens_double_bracket`]. Mirrors its word-boundary
+/// rule: whitespace before, and a separator or end of input after.
+fn closes_double_bracket(bytes: &[u8], i: usize) -> bool {
+    if bytes.get(i) != Some(&b']') || bytes.get(i + 1) != Some(&b']') {
+        return false;
+    }
+    let space_before = i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+    let separator_after = matches!(
+        bytes.get(i + 2),
+        None | Some(b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b')')
+    );
+    space_before && separator_after
 }
 
 /// Split command string on shell operators: ;, &&, ||, |
@@ -186,6 +231,43 @@ impl Frame {
 /// split there and blocked the pattern fragment as an unknown command; same
 /// for `find … -exec rm {} \;`.
 pub(super) fn split_on_operators(command: &str) -> Vec<&str> {
+    split_with_separators(command)
+        .into_iter()
+        .map(|(segment, _)| segment)
+        .collect()
+}
+
+/// The operator that ends a command segment.
+///
+/// Where a segment runs can depend on it (#1850): a `cd` followed by `&&`
+/// moves the next command, one followed by `||` only runs the next command if
+/// it failed, and one in a pipeline or in the background moves nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Separator {
+    /// `;`, a newline or a carriage return.
+    Sequence,
+    /// `&&`
+    And,
+    /// `||`
+    Or,
+    /// `|`
+    Pipe,
+    /// A single `&`.
+    Background,
+}
+
+/// Every segment together with the separator that ends it; the last segment
+/// has none. Same scanner as `split_on_operators`, so the two never disagree
+/// about where a command ends.
+pub fn segments_with_separators(command: &str) -> Vec<(String, Option<Separator>)> {
+    split_with_separators(command)
+        .into_iter()
+        .map(|(segment, sep)| (segment.trim().to_string(), sep))
+        .filter(|(segment, _)| !segment.is_empty())
+        .collect()
+}
+
+fn split_with_separators(command: &str) -> Vec<(&str, Option<Separator>)> {
     let mut segments = Vec::new();
     let mut start = 0;
     let bytes = command.as_bytes();
@@ -253,6 +335,22 @@ pub(super) fn split_on_operators(command: &str) -> Vec<&str> {
         let at_top = stack.len() == 1;
         let unshielded = at_top && !frame.shields_operators();
 
+        // #1793: enter/leave a `[[ … ]]` conditional so its internal `&&`/`||`
+        // stay part of the condition. Both delimiters must be standalone words
+        // (see the helpers), so a glob class (`ls a[[:alpha:]]`) or an array
+        // subscript never opens a depth that would swallow the rest of the line.
+        if ch == b'[' && opens_double_bracket(bytes, i) {
+            stack.last_mut().expect("frame").bracket_depth += 1;
+            i += 2;
+            continue;
+        }
+        if ch == b']' && frame.bracket_depth > 0 && closes_double_bracket(bytes, i) {
+            let top = stack.last_mut().expect("frame");
+            top.bracket_depth = top.bracket_depth.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
         match ch {
             b'\\' => {
                 // Escaped char is data (bash semantics outside quotes) — never
@@ -292,14 +390,14 @@ pub(super) fn split_on_operators(command: &str) -> Vec<&str> {
                 i += 1;
             }
             b'\n' | b'\r' | b';' if unshielded => {
-                segments.push(&command[start..i]);
+                segments.push((&command[start..i], Some(Separator::Sequence)));
                 i += 1;
                 start = i;
             }
             b'&' if unshielded => {
                 if i + 1 < len && bytes[i + 1] == b'&' {
                     // &&
-                    segments.push(&command[start..i]);
+                    segments.push((&command[start..i], Some(Separator::And)));
                     i += 2;
                     start = i;
                 } else if (i > 0 && bytes[i - 1] == b'>') || (i + 1 < len && bytes[i + 1] == b'>') {
@@ -310,7 +408,7 @@ pub(super) fn split_on_operators(command: &str) -> Vec<&str> {
                     i += 1;
                 } else {
                     // single & (background operator) — still a command separator
-                    segments.push(&command[start..i]);
+                    segments.push((&command[start..i], Some(Separator::Background)));
                     i += 1;
                     start = i;
                 }
@@ -318,7 +416,7 @@ pub(super) fn split_on_operators(command: &str) -> Vec<&str> {
             b'|' if unshielded => {
                 if i + 1 < len && bytes[i + 1] == b'|' {
                     // ||
-                    segments.push(&command[start..i]);
+                    segments.push((&command[start..i], Some(Separator::Or)));
                     i += 2;
                     start = i;
                 } else if i > 0 && bytes[i - 1] == b'>' {
@@ -330,7 +428,7 @@ pub(super) fn split_on_operators(command: &str) -> Vec<&str> {
                     i += 1;
                 } else {
                     // pipe
-                    segments.push(&command[start..i]);
+                    segments.push((&command[start..i], Some(Separator::Pipe)));
                     i += 1;
                     start = i;
                 }
@@ -342,25 +440,32 @@ pub(super) fn split_on_operators(command: &str) -> Vec<&str> {
     }
 
     if start < len {
-        segments.push(&command[start..]);
+        segments.push((&command[start..], None));
     }
 
     segments
 }
 
-/// Extract the base command name from a single segment (no operators).
-pub(super) fn extract_base_from_segment(segment: &str) -> String {
+/// Extract normalized command tokens from a single segment (no operators):
+/// skip env assignments, skip a PowerShell assignment, return empty for a
+/// PowerShell value expression, skip a leading `{` brace-group token (#939 —
+/// lean-ctx's own agent wrapper emits this form), and take the basename of
+/// the first token. Shared by `extract_base_from_segment` (which returns just
+/// the first token) and the subcommand-scoped allowlist matcher (which needs
+/// the rest of the tokens too), so the two normalizations cannot drift
+/// (GH #1419 follow-up).
+pub(super) fn extract_command_tokens_from_segment(segment: &str) -> Vec<String> {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return Vec::new();
     }
 
     let cmd_part = skip_powershell_assignment(skip_env_assignments(trimmed));
     if cmd_part.is_empty() {
-        return String::new();
+        return Vec::new();
     }
     if is_powershell_value_expression(cmd_part) {
-        return String::new();
+        return Vec::new();
     }
 
     let tokens = shell_tokenize(cmd_part);
@@ -368,17 +473,29 @@ pub(super) fn extract_base_from_segment(segment: &str) -> String {
     // `agent_wrapper::rebuild`'s `{ <real command>\n} && pwd ...` wrapping)
     // is not itself a command — skip it so the base extracted is the real
     // command inside the group, not the brace.
-    let mut token_iter = tokens.iter();
-    let first_token = match token_iter.next().map(String::as_str) {
-        Some("{") => token_iter.next().map_or("", String::as_str),
-        other => other.unwrap_or(""),
+    let mut token_iter = tokens.into_iter();
+    let first_token = match token_iter.next() {
+        Some(t) if t == "{" => token_iter.next(),
+        other => other,
     };
-
-    first_token
+    let Some(first_token) = first_token else {
+        return Vec::new();
+    };
+    let basename = first_token
         .rsplit('/')
         .next()
-        .unwrap_or(first_token)
-        .to_string()
+        .unwrap_or(&first_token)
+        .to_string();
+
+    std::iter::once(basename).chain(token_iter).collect()
+}
+
+/// Extract the base command name from a single segment (no operators).
+pub(super) fn extract_base_from_segment(segment: &str) -> String {
+    extract_command_tokens_from_segment(segment)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 /// Skip a local PowerShell assignment (`$result = Get-Content …`) so the
@@ -466,24 +583,16 @@ pub(super) fn detect_function_def(segment: &str) -> Option<String> {
     None
 }
 
-/// #1488: extract the body commands from a function definition segment.
-/// Given `greet() { echo hi; echo bye; }`, returns `["echo hi", "echo bye"]`.
-pub(super) fn extract_function_body_commands(segment: &str) -> Vec<String> {
+/// #1488: the text between the outer `{` and `}` of a function definition
+/// segment — `greet() { echo hi; echo bye; }` gives ` echo hi; echo bye; `.
+/// The allowlist expands it like a top-level command line, so control flow in
+/// a body (`for … do … done`, `if … then … fi`) is not mistaken for commands
+/// (GH #2002).
+pub(super) fn function_body(segment: &str) -> Option<&str> {
     let trimmed = segment.trim();
-    // Find the opening `{` and closing `}`
-    let Some(open) = trimmed.find('{') else {
-        return vec![];
-    };
-    let Some(close) = trimmed.rfind('}').filter(|&i| i > open) else {
-        return vec![];
-    };
-    let body = &trimmed[open + 1..close];
-    // Split the body on `;` (simple split — nested braces are rare in
-    // single-line function defs, and the allowlist already handles segments).
-    body.split(';')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    let open = trimmed.find('{')?;
+    let close = trimmed.rfind('}').filter(|&i| i > open)?;
+    Some(&trimmed[open + 1..close])
 }
 
 /// Shell builtins that legitimately export or mutate environment variables.

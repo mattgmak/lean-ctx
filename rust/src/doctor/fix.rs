@@ -95,7 +95,7 @@ fn build_and_persist_fix_report(
         warnings: Vec::new(),
         errors: Vec::new(),
     };
-    let binary = crate::core::portable_binary::resolve_portable_binary();
+    let binary = crate::core::portable_binary::resolve_agent_binary();
     // #281: doctor --fix must not (re)register the MCP server when the user opted
     // out via `auto_update_mcp = false`. Hooks/rules/scope repair still runs.
     let update_mcp = crate::core::config::Config::load()
@@ -261,6 +261,35 @@ fn build_and_persist_fix_report(
         }
     }
 
+    // GH #1419 follow-up (§4): comment out invalid-`*`-placement shell
+    // allowlist entries in the global config.toml. Same guarantees as
+    // rules_dedup above: format-preserving edit, original text kept as a
+    // comment (not deleted), naturally idempotent.
+    {
+        let mut allow_fix_step = SetupStepReport {
+            name: "shell_allowlist_fix".to_string(),
+            ok: true,
+            items: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+        for line in crate::cli::allow_fix::auto_apply() {
+            let failed = line.starts_with("FAILED");
+            if failed {
+                allow_fix_step.warnings.push(line.clone());
+            }
+            allow_fix_step.items.push(SetupItem {
+                name: "disable_invalid_entry".to_string(),
+                status: if failed { "failed" } else { "applied" }.to_string(),
+                path: None,
+                note: Some(line),
+            });
+        }
+        if !allow_fix_step.items.is_empty() {
+            steps.push(allow_fix_step);
+        }
+    }
+
     let mut hooks_step = SetupStepReport {
         name: "agent_hooks".to_string(),
         ok: true,
@@ -335,6 +364,36 @@ fn build_and_persist_fix_report(
         )),
     });
     steps.push(bm25_step);
+
+    // A project pinned into a user-global agent MCP config binds every session
+    // of that agent to one repo; earlier builds wrote these pins themselves.
+    let (healed, manual) = crate::hooks::project_pins::heal_global_project_pins(&home);
+    let pin_items = healed
+        .iter()
+        .map(|p| SetupItem {
+            name: "project_pin".to_string(),
+            status: "removed — restart the agent once".to_string(),
+            path: Some(p.display().to_string()),
+            note: None,
+        })
+        .collect();
+    let pin_warnings = manual
+        .iter()
+        .map(|p| {
+            format!(
+                "{}: remove LEAN_CTX_PROJECT_ROOT / LEAN_CTX_EXTRA_ROOTS from the lean-ctx entry by hand \
+                 (file has comments or does not parse)",
+                p.display()
+            )
+        })
+        .collect();
+    steps.push(SetupStepReport {
+        name: "project_pins".to_string(),
+        ok: true,
+        items: pin_items,
+        warnings: pin_warnings,
+        errors: Vec::new(),
+    });
 
     let mut proxy_env_step = SetupStepReport {
         name: "proxy_env".to_string(),

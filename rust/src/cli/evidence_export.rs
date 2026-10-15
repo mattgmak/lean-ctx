@@ -54,7 +54,8 @@ fn export(args: &[String]) -> io::Result<(PathBuf, String)> {
         "tasks_proven": proof.tasks.len(), "accepted_rate": proof.accepted_rate,
         "total_cost_micros": proof.total_cost_micros, "aggregate_cpao_micros": proof.aggregate_cpao_micros,
         "tasks": proof.tasks.iter().map(|task| json!({"task_id":task.task_id,
-        "intent":task.profile_intent,"accepted":task.outcome_accepted})).collect::<Vec<_>>()});
+        "intent":task.profile_intent,"acceptance_state":task.acceptance_state,
+        "accepted":task.outcome_accepted})).collect::<Vec<_>>()});
     let gold_json = json!({"total":gold.total,"correct":gold.correct,"accuracy":gold.accuracy,
         "intent_distribution":gold.per_intent});
     let benchmark_json = serde_json::to_value(&benchmark).unwrap_or(Value::Null);
@@ -98,7 +99,7 @@ fn export(args: &[String]) -> io::Result<(PathBuf, String)> {
     fs::write(
         dir.join("evidence_summary.md"),
         format!(
-            "# LeanCTX Evidence Package\n\nVersion: lean-ctx {}\n\n## Token Reduction\n- Average Reduction: {:.2}% ({} task benchmark)\n- Peak Reduction: {:.2}% (tree operations)\n\n## Value Gate\n- Total Tasks Tracked: {}\n- Accepted Rate: {:.2}%\n- Average CPAO: {}\n- Total Cost Saved: {}\n\n## Decision Loop Proof\n- Evidence Chain: {}\n- Tasks Proven: {}/5\n- All intents classified correctly: {}\n\n## Shadow Analysis\n- Baseline Cost: {}\n- Treatment Cost: {}\n- Savings: {} ({}%)\n- Quality Maintained: {}\n\n## Model Readiness\n- Gold Validation Set: {} tasks\n- Rules Baseline Accuracy: {:.2}%\n- Semantic Model: READY FOR TRAINING\n",
+            "# LeanCTX Evidence Package\n\nVersion: lean-ctx {}\n\n## Token Reduction\n- Average Reduction: {:.2}% ({} task benchmark)\n- Peak Reduction: {:.2}% (tree operations)\n\n## Value Gate\n- Total Tasks Tracked: {}\n- Accepted Rate: {:.2}%\n- Average CPAO: {}\n- Total Cost Saved: {}\n\n## Decision Loop Proof\n- Evidence Chain: {}\n- Tasks Proven: {}/5\n- All intents classified correctly: {}\n\n## Shadow Analysis\n- Baseline Cost: {}\n- Treatment Cost: {}\n- Savings: {} ({}%)\n- Outcome Acceptance Not Below Simulated Baseline: {}\n\n## Model Readiness\n- Gold Validation Set: {} tasks\n- Rules Baseline Accuracy: {:.2}%\n- Semantic Model: READY FOR TRAINING\n",
             env!("CARGO_PKG_VERSION"),
             average,
             tasks,

@@ -20,7 +20,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [javascript-typescript, actions]
+        # python: the Hermes plugin (integrations/hermes-lean-ctx) ships to
+        # users, and the security/delivery gates are Python. It was scanned
+        # only by the retired default setup, whose last run was April 2026.
+        language: [javascript-typescript, actions, python]
     steps:
       - uses: actions/checkout@v4 # v4
         with:
@@ -43,23 +46,24 @@ jobs:
 
   analyze-rust:
     name: Analyze (rust)
+    # Hosted, not pounce: the CodeQL JVM sizes itself to the machine (22 GB
+    # RSS on the runner VM) and got the test jobs OOM-killed. It does not gate
+    # merges, and build-mode none already removed its 14-minute build.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4 # v4
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
+      # CodeQL extracts Rust from source (build-mode none); the former
+      # `cargo build --release` here took 14 of the job's 33 minutes and fed
+      # the analysis nothing.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3
         with:
           languages: rust
+          build-mode: none
           config-file: ./.github/codeql-config.yml
-
-      - name: Build Rust
-        working-directory: rust
-        run: cargo build --release
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3

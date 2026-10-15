@@ -41,7 +41,10 @@ mod context_ir_hotpath {
         assert_eq!(item.output_tokens, 200);
         assert!(item.duration_us > 0);
         assert!(item.compression_ratio < 1.0);
-        assert!(!item.content_excerpt.is_empty());
+        assert!(
+            !item.content_excerpt.is_empty(),
+            "`item.content_excerpt` is empty"
+        );
     }
 
     #[test]
@@ -464,12 +467,14 @@ mod contracts_integrity {
         let content = include_str!("../../../ARCHITECTURE.md");
 
         assert!(
-            content.contains("docs/internal/vision/PRODUCT-ARCHITECTURE.md"),
-            "ARCHITECTURE.md should point to the canonical product architecture"
+            content.contains("docs/POSITIONING_CANONICAL.md"),
+            "ARCHITECTURE.md should point to the public canonical product authority"
         );
         assert!(
-            content.contains("implementation-orientation stub"),
-            "ARCHITECTURE.md should retain its non-product boundary"
+            content.contains(
+                "Implementation modules and generated inventories are not availability claims."
+            ),
+            "ARCHITECTURE.md should retain the implementation/availability boundary"
         );
         assert!(
             !content.contains("pipeline_stages.rs"),

@@ -58,6 +58,11 @@ impl SearchAction {
     }
 }
 
+/// Share action aliases/inference with pre-dispatch planning and response caching.
+pub(crate) fn uses_kernel_context(args: &Map<String, Value>) -> bool {
+    SearchAction::resolve(args) == SearchAction::Semantic
+}
+
 impl McpTool for CtxSearchTool {
     fn name(&self) -> &'static str {
         "ctx_search"
@@ -273,7 +278,8 @@ fn handle_regex(args: &Map<String, Value>, ctx: &ToolContext) -> Result<ToolOutp
             anchored,
             exclude.as_deref(),
             exclude_pattern.as_deref(),
-        );
+        )
+        .map(|output| resolved.annotate(output));
     }
 
     let _mode_guard = crate::core::savings_footer::ModeGuard::new("search");
@@ -386,6 +392,19 @@ fn prime_bm25_cache(ctx: &ToolContext) {
 
 /// `action=semantic` — meaning-based search, routed to the shared core fn.
 fn handle_semantic(args: &Map<String, Value>, ctx: &ToolContext) -> Result<ToolOutput, ErrorData> {
+    let path = resolve_path_or_root(ctx)?;
+    crate::core::policy::runtime::with_project_source_view(&path, || {
+        handle_semantic_in_view(args, ctx)
+    })
+    .map_err(|_| {
+        ErrorData::internal_error("Search source authority changed or is unavailable", None)
+    })?
+}
+
+fn handle_semantic_in_view(
+    args: &Map<String, Value>,
+    ctx: &ToolContext,
+) -> Result<ToolOutput, ErrorData> {
     let query = get_str(args, "query")
         .ok_or_else(|| ErrorData::invalid_params("query is required for action=semantic", None))?;
     let path = resolve_path_or_root(ctx)?;
@@ -397,6 +416,7 @@ fn handle_semantic(args: &Map<String, Value>, ctx: &ToolContext) -> Result<ToolO
     let artifacts = get_bool(args, "artifacts").unwrap_or(false);
     prime_bm25_cache(ctx);
 
+    let search_phase = crate::core::phase_timing::enter("ctx_search semantic: search");
     let mut result = tokio::task::block_in_place(|| {
         crate::tools::ctx_semantic_search::handle(
             &query,
@@ -411,8 +431,12 @@ fn handle_semantic(args: &Map<String, Value>, ctx: &ToolContext) -> Result<ToolO
         )
     });
 
-    // Context Kernel: enrich semantic search with cross-store context
-    {
+    drop(search_phase);
+
+    // Legacy cross-store blocks have no current original-source provenance.
+    // Keep them out of protected results, including explicit mode refusals.
+    if !crate::core::policy::runtime::is_active() && !result.starts_with("ERR:") {
+        let _phase = crate::core::phase_timing::enter("ctx_search semantic: kernel enrichment");
         let kernel_budget = 100;
         if let Some(enrichment) =
             crate::core::context_kernel::bridge::kernel_enrich(&query, &path, kernel_budget)
@@ -471,9 +495,14 @@ fn handle_symbol(args: &Map<String, Value>, ctx: &ToolContext) -> Result<ToolOut
         });
     }
 
-    let name = get_str(args, "name").ok_or_else(|| {
-        ErrorData::invalid_params("name or handle is required for action=symbol", None)
-    })?;
+    // Agents that pick action=symbol often name the symbol in the field they
+    // used for the other actions; take it instead of failing the call.
+    let name = ["name", "symbol", "query", "pattern"]
+        .iter()
+        .find_map(|key| get_str(args, key).filter(|value| !value.trim().is_empty()))
+        .ok_or_else(|| {
+            ErrorData::invalid_params("name or handle is required for action=symbol", None)
+        })?;
     let file = get_str(args, "file");
     let kind = get_str(args, "kind");
 
@@ -585,9 +614,12 @@ fn cached_or_search(
         allow_secret_paths,
         anchored,
     );
-    let key = builder.cache_key();
-    if let Some(entry) =
-        crate::core::ocla::cache_delivery::check(&key, &builder.validator(), "ctx_search")
+    if let Some(builder) = &builder
+        && let Some(entry) = crate::core::ocla::cache_delivery::check(
+            &builder.cache_key(),
+            &builder.validator(),
+            "ctx_search",
+        )
     {
         let text = crate::core::ocla::cache_delivery::stub(&entry, "regex search");
         return crate::tools::ctx_search::SearchOutcome {
@@ -609,9 +641,11 @@ fn cached_or_search(
         exclude,
         exclude_pattern,
     );
-    if !outcome.text.starts_with("ERROR:") {
+    if !outcome.text.starts_with("ERROR:")
+        && let Some(builder) = builder
+    {
         crate::core::ocla::cache_delivery::record(
-            key,
+            builder.cache_key(),
             crate::core::ocla::cache_types::DeliveryKind::SearchQuery,
             builder.validator(),
             Some(builder.path),
@@ -633,9 +667,20 @@ fn regex_cache_builder(
     respect_gitignore: bool,
     allow_secret_paths: bool,
     anchored: bool,
-) -> SearchQueryKey {
+) -> Option<SearchQueryKey> {
+    if crate::core::policy::runtime::active().is_some() {
+        return None;
+    }
     let canonical = crate::core::pathutil::safe_canonicalize_or_self(std::path::Path::new(path));
-    SearchQueryKey {
+    // Directory mtime does not change when an existing source is rewritten.
+    // Reuse the index's bounded metadata walk; an uncheckable corpus is never
+    // eligible for a legacy delivery stub, including after policy removal.
+    let revision = crate::core::search_index::corpus_signature(
+        &canonical.to_string_lossy(),
+        respect_gitignore,
+        allow_secret_paths,
+    )?;
+    Some(SearchQueryKey {
         pattern: pattern.into(),
         include: format!(
             "{}\\x1fmax:{max}\\x1fgitignore:{respect_gitignore}\\x1fsecret:{allow_secret_paths}\\x1fanchored:{anchored}",
@@ -647,22 +692,8 @@ fn regex_cache_builder(
             exclude_pattern.unwrap_or_default()
         ),
         path: canonical.to_string_lossy().into_owned(),
-        // Regex searches do not rely on embedding state. The root mtime gives
-        // their immutable query key a cheap revision when the file universe changes.
-        index_rev: directory_mtime_ns(&canonical)
-            .unwrap_or_default()
-            .to_string(),
-    }
-}
-
-fn directory_mtime_ns(path: &std::path::Path) -> Option<u128> {
-    std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_nanos())
+        index_rev: revision.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -671,6 +702,7 @@ mod cache_delivery_tests {
 
     #[test]
     fn regex_adapter_records_then_serves_a_cross_agent_reference() {
+        let _policy = crate::core::policy::runtime::TestPolicyOverride::set(None);
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("cached.rs"),
@@ -711,6 +743,27 @@ mod cache_delivery_tests {
             "{}",
             second.text
         );
+        // Same path, changed contents: the directory mtime alone misses this.
+        std::fs::write(
+            directory.path().join("cached.rs"),
+            "fn cache_delivery_probe_updated() {}\n",
+        )
+        .unwrap();
+        let updated = search_single(
+            "cache_delivery_probe",
+            &path,
+            Some("*.rs"),
+            20,
+            crate::tools::CrpMode::Off,
+            true,
+            true,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(updated.text.contains("cache_delivery_probe_updated"));
+        assert!(!updated.text.contains("[cross-agent cache"));
     }
 }
 
@@ -800,9 +853,16 @@ fn search_single(
 /// Keys a `queries[]` entry may carry. `items` used to be an untyped object,
 /// so a misspelled or unsupported key was dropped without a word — #1625 lost
 /// half an audit's results to exactly that.
+/// `regex`/`query` and `glob` are the spellings other search tools use for
+/// `pattern` and `include`; they mean exactly that here.
 const QUERY_KEYS: &[&str] = &[
     "pattern",
+    "regex",
+    "query",
+    "path",
+    "file_path",
     "include",
+    "glob",
     "ext",
     "exclude",
     "exclude_pattern",
@@ -889,7 +949,10 @@ fn handle_batch_queries(
             ));
             continue;
         };
-        let Some(pattern) = get_str(obj, "pattern") else {
+        let Some(pattern) = get_str(obj, "pattern")
+            .or_else(|| get_str(obj, "regex"))
+            .or_else(|| get_str(obj, "query"))
+        else {
             combined.push_str(&format!(
                 "── query {} ──\nERROR: pattern required\n\n",
                 idx + 1
@@ -900,18 +963,35 @@ fn handle_batch_queries(
         // key vanished without a word — the reporter lost half their results to
         // exactly that. Name the offending key and the accepted set instead.
         validate_query_keys(obj, idx).map_err(|e| ErrorData::invalid_params(e, None))?;
-        let include =
-            get_str(obj, "include").or_else(|| get_str(obj, "ext").map(|e| ext_to_include(&e)));
+        let include = get_str(obj, "include")
+            .or_else(|| get_str(obj, "glob"))
+            .or_else(|| get_str(obj, "ext").map(|e| ext_to_include(&e)));
         let exclude = get_str(obj, "exclude");
         let exclude_pattern = get_str(obj, "exclude_pattern");
         let per_query_max = resolve_query_cap(obj, default_share, idx)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
+        // A per-query `path` scopes that query only; the top-level path (or
+        // the project) stays the default for the others.
+        let query_root = match get_str(obj, "path").or_else(|| get_str(obj, "file_path")) {
+            Some(raw) => match ctx.resolve_path_sync(&raw) {
+                Ok(p) => p,
+                Err(e) => {
+                    combined.push_str(&format!(
+                        "── query {}: '{}' ──\nERROR: {e}\n\n",
+                        idx + 1,
+                        truncate_query(&pattern, 40)
+                    ));
+                    continue;
+                }
+            },
+            None => root.clone(),
+        };
 
         let search_result = tokio::task::block_in_place(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 cached_or_search(
                     &pattern,
-                    root,
+                    &query_root,
                     include.as_deref(),
                     per_query_max,
                     crp,
@@ -964,7 +1044,7 @@ fn handle_batch_queries(
     // R30: Search evidence for batch queries.
     crate::tools::search_hook::on_search("batch_query", "regex", total_observed, total_sent);
 
-    Ok(ToolOutput {
+    Ok(resolved.annotate(ToolOutput {
         text: final_out,
         original_tokens: total_observed,
         saved_tokens: saved,
@@ -973,7 +1053,7 @@ fn handle_batch_queries(
         changed: false,
         shell_outcome: None,
         content_blocks: None,
-    })
+    }))
 }
 
 /// Truncate a query string for display (used in batch labels).
@@ -995,7 +1075,10 @@ fn ext_to_include(ext: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchAction, ext_to_include, resolve_query_cap, validate_query_keys};
+    use super::{
+        SearchAction, ToolContext, ext_to_include, handle_symbol, resolve_query_cap,
+        validate_query_keys,
+    };
     use serde_json::{Map, Value, json};
 
     fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -1153,6 +1236,30 @@ mod tests {
     }
 
     #[test]
+    fn symbol_action_takes_the_name_from_symbol_query_or_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn load_config() {}\n").unwrap();
+        let ctx = ToolContext {
+            project_root: dir.path().to_string_lossy().into_owned(),
+            ..ToolContext::default()
+        };
+        for key in ["symbol", "query", "pattern"] {
+            let call = args(&[("action", json!("symbol")), (key, json!("load_config"))]);
+            if let Err(error) = handle_symbol(&call, &ctx) {
+                assert!(
+                    !error.message.contains("name or handle is required"),
+                    "`{key}` must name the symbol: {}",
+                    error.message
+                );
+            }
+        }
+        let Err(error) = handle_symbol(&args(&[("action", json!("symbol"))]), &ctx) else {
+            panic!("no name at all must still be rejected");
+        };
+        assert!(error.message.contains("name or handle is required"));
+    }
+
+    #[test]
     fn ext_alias_bare_extension_becomes_glob() {
         assert_eq!(ext_to_include("rs"), "*.rs");
         assert_eq!(ext_to_include("ts"), "*.ts");
@@ -1273,6 +1380,23 @@ mod tests {
         );
     }
 
+    /// Other search tools spell the pattern `regex`/`query` and the file
+    /// filter `glob`; a query entry written that way means the same thing.
+    #[test]
+    fn query_entries_accept_other_tools_spellings() {
+        for (key, value) in [
+            ("regex", json!("x")),
+            ("query", json!("x")),
+            ("glob", json!("*.rs")),
+        ] {
+            assert_eq!(
+                validate_query_keys(&args(&[("pattern", json!("x")), (key, value)]), 0),
+                Ok(()),
+                "{key} must be accepted"
+            );
+        }
+    }
+
     /// The published schema must describe the shared-budget semantics the
     /// reporter had to reverse-engineer from the results — and must do it
     /// without paying for a fully expanded `queries.items` object.
@@ -1305,3 +1429,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ctx_search_mcp_tests.rs"]
+mod mcp_tests;

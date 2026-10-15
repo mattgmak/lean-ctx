@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use super::{
     CtxShellTool, collect_extra_env, detect_heredoc_reroute, format_background_state,
     is_timeout_notice_only, resolve_effective_cwd, shell_access_denial, should_auto_background,
@@ -86,7 +87,7 @@ fn cancel_is_acknowledged_and_never_reports_a_failure() {
     assert!(!outcome.is_error);
     assert_eq!(outcome.state, BackgroundJobState::Cancelled);
     assert_eq!(outcome.exit_code, None);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "{text:?}");
     assert!(
         outcome
             .display
@@ -99,7 +100,7 @@ fn cancel_is_acknowledged_and_never_reports_a_failure() {
     let outcome = background(outcome);
     assert!(!outcome.is_error);
     assert_eq!(outcome.state, BackgroundJobState::Running);
-    assert!(text.is_empty());
+    assert!(text.is_empty(), "{text:?}");
     assert!(
         outcome
             .display

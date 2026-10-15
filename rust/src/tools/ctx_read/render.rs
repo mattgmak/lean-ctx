@@ -8,29 +8,12 @@ use super::{
 };
 use crate::core::aggressiveness::AggressivenessProfile;
 
+#[cfg(test)]
+pub(crate) use super::fallback_banner::NO_COMPRESSION_BANNER_MIN_TOKENS;
+pub(crate) use super::fallback_banner::{AutoRequestGuard, no_compression_banner};
+
 fn monotonic_check(original: usize, compressed: usize) -> bool {
     compressed < original
-}
-
-/// Below this many raw tokens a silent full-content fallback is not worth a
-/// banner: the file is small enough that the framing itself was the expensive
-/// part (which is exactly what the #361 cap exists to strip), and a banner
-/// would push the read back above the raw file it just protected. Above it, the
-/// caller is being handed a whole file they did not order and must be told.
-pub(crate) const NO_COMPRESSION_BANNER_MIN_TOKENS: usize = 400;
-
-/// One-line notice that a compression path gave up and returned the untouched
-/// file. Without it the caller pays full-file tokens believing a summary was
-/// delivered — the failure is invisible in the output and surfaces only on the
-/// bill. `None` for files below [`NO_COMPRESSION_BANNER_MIN_TOKENS`], where the
-/// fallback is the cap working as designed rather than a degradation.
-pub(crate) fn no_compression_banner(requested_mode: &str, raw_tokens: usize) -> Option<String> {
-    (raw_tokens >= NO_COMPRESSION_BANNER_MIN_TOKENS).then(|| {
-        format!(
-            "[lean-ctx] no compression applied (mode={requested_mode}): \
-             output was not smaller than the file — returning full content ({raw_tokens} tok)"
-        )
-    })
 }
 
 fn raw_fallback(
@@ -389,7 +372,7 @@ pub(crate) fn process_mode_tuned(
                 .aggressiveness
                 .map(|a| AggressivenessProfile::from_level(a).density_target);
             let target: f64 = mode[8..].parse().ok().or(aggr_target).unwrap_or(0.5);
-            let result = entropy::entropy_compress_to_density(content, target);
+            let result = entropy::entropy_compress_to_density_for(content, target, ext);
             // #798: Quality gate — reject density output that breaks AST/symbols.
             // #940: use density-specific guard that only checks AST/identifiers,
             // not line count — density mode *intentionally* reduces lines.
@@ -413,15 +396,7 @@ pub(crate) fn process_mode_tuned(
                 )
             };
             let output = format!("{header}\n{guarded_output}");
-            let sent = count_tokens(&output);
-            if !monotonic_check(original_tokens, sent) {
-                return raw_fallback(file_path, content, original_tokens, sent);
-            }
-            let savings = protocol::format_savings(original_tokens, sent);
-            (
-                append_compressed_hint(&format!("{output}\n{savings}"), file_path),
-                sent,
-            )
+            finish_lossy_view(&output, content, original_tokens, file_path)
         }
         // `diff` is a delta view rendered against the session cache by
         // `core_logic::handle_diff`, not a whole-file render — there is no
@@ -709,19 +684,6 @@ mod render_tests {
         for mode in crate::core::mcp_manifest::READ_MODES {
             assert!(out.contains(mode), "warning must list `{mode}`: {out}");
         }
-    }
-
-    /// #1587: a compression request that degrades to the whole file says so.
-    /// Below the threshold it stays silent, so the #361 cap still guarantees a
-    /// read never costs more than the raw file.
-    #[test]
-    fn no_compression_banner_only_above_threshold() {
-        assert!(super::no_compression_banner("signatures", 10).is_none());
-        let banner =
-            super::no_compression_banner("signatures", super::NO_COMPRESSION_BANNER_MIN_TOKENS)
-                .expect("a whole file handed back instead of a summary must be announced");
-        assert!(banner.contains("no compression applied"), "{banner}");
-        assert!(banner.contains("mode=signatures"), "{banner}");
     }
 }
 
@@ -1256,7 +1218,7 @@ fn render_entropy(content: &str, ctx: RenderCtx<'_>, tuning: &ReadTuning<'_>) ->
         })
         .unwrap_or_default();
     let result = match (task_kws.is_empty(), tuning.aggressiveness) {
-        // Aggressiveness overrides the learned BPE-entropy threshold for
+        // Aggressiveness overrides the file-adaptive BPE-entropy threshold for
         // the plain (no task keywords) path; task-conditioned entropy
         // keeps its own relevance-aware thresholds.
         (true, Some(a)) => entropy::entropy_compress_with_threshold(
@@ -1280,11 +1242,7 @@ fn render_entropy(content: &str, ctx: RenderCtx<'_>, tuning: &ReadTuning<'_>) ->
         techniques_tag(&result.techniques),
         result.output
     );
-    let sent = count_tokens(&output);
-    if !monotonic_check(original_tokens, sent) {
-        return raw_fallback(file_path, content, original_tokens, sent);
-    }
-    let savings = protocol::format_savings(original_tokens, sent);
+    let (delivered, sent) = finish_lossy_view(&output, content, original_tokens, file_path);
     let compression_ratio = if original_tokens > 0 {
         1.0 - (sent as f64 / original_tokens as f64)
     } else {
@@ -1294,10 +1252,29 @@ fn render_entropy(content: &str, ctx: RenderCtx<'_>, tuning: &ReadTuning<'_>) ->
         file_path,
         compression_ratio > 0.15,
     );
-    (
-        append_compressed_hint(&format!("{output}\n{savings}"), file_path),
-        sent,
-    )
+    (delivered, sent)
+}
+
+/// Appends the savings line and recovery hint to a lossy view, and keeps the
+/// view only when what is *delivered* still beats the raw file (#361). The
+/// footer counts: an entropy view a few tokens under raw on a CRLF checkout
+/// went over it once the footer was added, with no "no compression" notice.
+fn finish_lossy_view(
+    output: &str,
+    content: &str,
+    original_tokens: usize,
+    file_path: &str,
+) -> (String, usize) {
+    let sent = count_tokens(output);
+    if !monotonic_check(original_tokens, sent) {
+        return raw_fallback(file_path, content, original_tokens, sent);
+    }
+    let savings = protocol::format_savings(original_tokens, sent);
+    let delivered = append_compressed_hint(&format!("{output}\n{savings}"), file_path);
+    if !monotonic_check(original_tokens, count_tokens(&delivered)) {
+        return raw_fallback(file_path, content, original_tokens, sent);
+    }
+    (delivered, sent)
 }
 
 /// Renders a task-mode selection as numbered lines with explicit gap markers.

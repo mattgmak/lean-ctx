@@ -4,8 +4,9 @@
 > integration promise.** Codex, Claude Code, and Cursor are the current
 > first-class local setup paths. This guide covers the Pi extension's local
 > wiring; verify compatibility and observability against the installed version
-> before making a performance claim. Product scope is governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> before making a performance claim. See the
+> [canonical positioning](../POSITIONING_CANONICAL.md) for current product
+> scope and claim boundaries.
 
 Complete guide to setting up and optimally using lean-ctx with [Pi Coding Agent](https://github.com/badlogic/pi-mono).
 
@@ -55,7 +56,7 @@ export LEAN_CTX_PI_MODE=replace
 | Tool | Replaces | What it does |
 |------|----------|-------------|
 | `ctx_read` | `read` | Smart mode selection (full/map/signatures) based on file type and size |
-| `ctx_shell` | `bash` | All shell commands compressed via lean-ctx's 95+ patterns |
+| `ctx_shell` | `bash` | All shell commands compressed via lean-ctx's 85+ patterns |
 | `ctx_grep` | `grep` | Results grouped and compressed via ripgrep + lean-ctx |
 | `ctx_find` | `find` | File listings compressed and .gitignore-aware |
 | `ctx_ls` | `ls` | Directory output compressed |
@@ -285,19 +286,19 @@ If using lean-ctx's API proxy:
 ```bash
 lean-ctx proxy enable
 # Sets ANTHROPIC_BASE_URL, OPENAI_BASE_URL, GEMINI_API_BASE_URL
-# All three providers are configured (not just Gemini)
+# Configures provider URLs supported by this proxy profile
 ```
 
-## Performance
+## Context measurement
 
-Typical token savings with pi-lean-ctx:
+Use structural views, focused search, and supported shell summaries when they
+fit the task; the emitted context depends on the file, mode, command, Pi
+extension, and recovery behavior.
 
-| Operation | Without lean-ctx | With lean-ctx | Savings |
-|-----------|-----------------|---------------|---------|
-| Read large file (1000 LOC) | ~4000 tokens | ~400 tokens | 90% |
-| `git status` | ~200 tokens | ~50 tokens | 75% |
-| `cargo test` output | ~2000 tokens | ~100 tokens | 95% |
-| `grep` results (50 matches) | ~1500 tokens | ~300 tokens | 80% |
+`lean-ctx gain --live` and `lean-ctx benchmark report .` show local token and
+cost estimates for activity they observe. Provider-reported usage is available
+only for supported routed paths that record it; local estimates do not
+establish invoice savings or answer quality.
 
 ## Further Reading
 

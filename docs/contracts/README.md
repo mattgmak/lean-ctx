@@ -1,15 +1,8 @@
 # OCLA Contract Portal
 
-> **Status: local implementation-contract index — not a product catalogue.** A
-> contract marked “Current” describes a checked-in wire or implementation
-> artifact, not general availability or a public service. LeanCTX is **The
-> Context SDK for AI Agents**. Cloud, organization, marketplace, hosted-index,
-> public-ranking, agent-building, and broader OCLA capability surfaces remain
-> Research or unavailable unless the canonical status map explicitly promotes
-> them. See [`docs/internal/README.md`](../internal/README.md).
-
-> Single entry point for all OCLA wire contracts, schemas, and specifications.  
-> Version: aligned with lean-ctx v3.9.20
+> **Status: local implementation-contract index — not a product catalogue.** LeanCTX is the **Context Gateway for AI Systems**. Engine and SDK have distinct implementation contracts. A contract marked “Current” describes a checked-in artifact, not general availability or a public service; availability depends on edition, supported interface and release. Cloud, organization, marketplace, hosted-index, public-ranking, agent-building and broader OCLA surfaces remain Research or unavailable unless the canonical status map promotes them.
+>
+> Single entry point for the checked-in OCLA wire contracts, schemas and specifications. See [current positioning](../POSITIONING_CANONICAL.md) and [`docs/internal/README.md`](../internal/README.md).
 
 This portal is the navigable index for the contracts in this directory. The
 Rust OCLA types, JSON Schema, and Protobuf definitions remain the authoritative
@@ -28,8 +21,24 @@ wire definitions; documents here describe their use and surrounding systems.
 
 ## Categories
 
+This index links to public artifacts present in this repository. Organization,
+identity, billing, and commercial-service contracts moved outside this Engine
+distribution. Use the [Enterprise overview](https://leanctx.com/enterprise/)
+and the documentation supplied for your licensed release.
+
+Frozen v1 source-boundary records preserve older repository and packaging
+descriptions. See [current scope and historical-contract notes](../../CONTRACTS.md#current-product-and-historical-contract-scope)
+before interpreting them as a current product or licensing statement.
+
 ### Wire Contracts (Data Plane)
 
+- [task-envelope-v1.schema.json](task-envelope-v1.schema.json) — Canonical task identity and trace lineage.
+- [context-plan-v1.schema.json](context-plan-v1.schema.json) — Deterministic projection of the kernel-owned semantic context plan.
+- [execution-plan-v1.schema.json](execution-plan-v1.schema.json) — Version-pinned execution, capability, and budget choices.
+- [execution-receipt-v1.schema.json](execution-receipt-v1.schema.json) — Execution observations, lineage, cost, and evidence.
+- [accepted-outcome-v1.schema.json](accepted-outcome-v1.schema.json) — Tri-state outcome; success signals alone never imply acceptance.
+- [decision-record-v1.schema.json](decision-record-v1.schema.json) — Admission-through-outcome decision audit records.
+- [capability-manifest-v1.schema.json](capability-manifest-v1.schema.json) — Canonical capability schema; the OCLA path is an exact tested mirror.
 - [agent-gateway-v1.schema.json](agent-gateway-v1.schema.json) — Agent gateway wire schema.
 - [ocla-agent-envelope-v1.schema.json](ocla-agent-envelope-v1.schema.json) — OCLA agent envelope.
 - [ocla-bus-event-v1.schema.json](ocla-bus-event-v1.schema.json) — OclaBus events.
@@ -44,9 +53,9 @@ wire definitions; documents here describe their use and surrounding systems.
 - [autonomy-drivers-v1.md](autonomy-drivers-v1.md) — Autonomy drivers.
 - [context-candidate-admission-v1.md](context-candidate-admission-v1.md) — Context candidate admission.
 - [context-policy-packs-v1.md](context-policy-packs-v1.md) — Policy packs.
+- [context-quality-v1.md](context-quality-v1.md) — Evidence tiers, eval verdicts, retention probes, quality receipt.
 - [degradation-policy-v1.md](degradation-policy-v1.md) — Degradation policy.
 - [knowledge-policy-contract-v1.md](knowledge-policy-contract-v1.md) — Knowledge policy.
-- [org-policy-v1.md](org-policy-v1.md) — Organization policy.
 - [persona-spec-v1.md](persona-spec-v1.md) — Persona specification.
 - [quality-loop-v1.md](quality-loop-v1.md) — Quality-loop policy.
 - [support-lifecycle-v1.json](support-lifecycle-v1.json) — Support lifecycle data.
@@ -54,6 +63,7 @@ wire definitions; documents here describe their use and surrounding systems.
 ### Evidence & Billing
 
 - [billing-plane-v1-catalog.json](billing-plane-v1-catalog.json) — Billing-plane v1 catalog.
+- [billing-plane-v2-catalog.json](billing-plane-v2-catalog.json) — Canonical v4 Community/Pro/Team/Enterprise catalog; v1 remains frozen for compatibility.
 - [billing-plane-v1.md](billing-plane-v1.md) — Billing-plane v1.
 - [billing-plane-v2.md](billing-plane-v2.md) — Billing-plane v2.
 - [billing-plane-v3.md](billing-plane-v3.md) — Billing-plane v3.
@@ -62,6 +72,7 @@ wire definitions; documents here describe their use and surrounding systems.
 - [edit-metering-v1.md](edit-metering-v1.md) — Edit metering.
 - [evidence-bundle-v1.md](evidence-bundle-v1.md) — Evidence bundle.
 - [settlement-evidence-v2.md](settlement-evidence-v2.md) — Settlement evidence.
+- [team-seat-value-v1/](team-seat-value-v1/) — Frozen Team seat-entitlement, allocation, usage, and value-evidence contract family.
 - [test-deployment-evidence-v1.md](test-deployment-evidence-v1.md) — Test-deployment evidence process.
 - [workflow-evidence-ledger-v1.md](workflow-evidence-ledger-v1.md) — Workflow evidence ledger.
 
@@ -77,8 +88,6 @@ wire definitions; documents here describe their use and surrounding systems.
 - [extractors-v1.md](extractors-v1.md) — Extractor integration.
 - [http-mcp-contract-v1.md](http-mcp-contract-v1.md) — HTTP MCP integration.
 - [provider-framework-contract-v1.md](provider-framework-contract-v1.md) — Provider framework.
-- [team-server-contract-v1.md](team-server-contract-v1.md) — Team server v1 integration.
-- [team-server-contract-v2.md](team-server-contract-v2.md) — Team server v2 integration.
 - [wasm-abi-v1.md](wasm-abi-v1.md) — WASM ABI.
 
 ### Security & Trust
@@ -86,7 +95,6 @@ wire definitions; documents here describe their use and surrounding systems.
 - [extension-trust-v1.md](extension-trust-v1.md) — Extension trust.
 - [frozen-hashes.json](frozen-hashes.json) — Frozen content hashes.
 - [ocla-contract-pack-v1.json](ocla-contract-pack-v1.json) — Signed contract-pack content digests.
-- [org-sso-oidc-v1.md](org-sso-oidc-v1.md) — Organization SSO/OIDC.
 - [oss-plane-separation-v1.md](oss-plane-separation-v1.md) — OSS-plane separation.
 - [personal-cloud-encryption-v1.md](personal-cloud-encryption-v1.md) — Personal-cloud encryption.
 - [release-key-rotation-v1.md](release-key-rotation-v1.md) — Release-key rotation.
@@ -94,22 +102,17 @@ wire definitions; documents here describe their use and surrounding systems.
 ### Context, Runtime & Operations
 
 - [attention-layout-driver-v1.md](attention-layout-driver-v1.md) — Attention layout driver.
-- [ccp-session-bundle-v1.md](ccp-session-bundle-v1.md) — CCP session bundle.
 - [compliance-report-v1.md](compliance-report-v1.md) — Compliance reporting.
 - [context-ir-v1.md](context-ir-v1.md) — Context intermediate representation.
 - [context-snapshot-v1.md](context-snapshot-v1.md) — Context snapshot.
 - [deployment-rehearsal-v1.md](deployment-rehearsal-v1.md) — Deployment rehearsal.
-- [device-overview-v1.md](device-overview-v1.md) — Device overview.
-- [email-digest-v1.md](email-digest-v1.md) — Email digest.
 - [graph-reproducibility-contract-v1.md](graph-reproducibility-contract-v1.md) — Graph reproducibility.
-- [hosted-personal-index-v1.md](hosted-personal-index-v1.md) — Hosted personal index.
 - [local-free-invariant-v1.md](local-free-invariant-v1.md) — Local-free invariant.
 - [logical-session-presence-v1.md](logical-session-presence-v1.md) — Logical session presence.
 - [memory-boundary-contract-v1.md](memory-boundary-contract-v1.md) — Memory boundary.
 - [multi-agent-efficiency-benchmark-v1.md](multi-agent-efficiency-benchmark-v1.md) — Multi-agent efficiency benchmark.
 - [ocla-config-tuning-v2.md](ocla-config-tuning-v2.md) — OCLA configuration tuning.
 - [ocla-verifier-conformance-v1.md](ocla-verifier-conformance-v1.md) — OCLA verifier conformance.
-- [org-audit-log-v1.md](org-audit-log-v1.md) — Organization audit log.
 - [pillar-boundaries-v1.md](pillar-boundaries-v1.md) — Pillar boundaries.
 - [runtime-reality-inventory-v1.json](runtime-reality-inventory-v1.json) — Runtime reality inventory.
 - [tokenizer-calibration-v1.md](tokenizer-calibration-v1.md) — Tokenizer calibration.
@@ -138,6 +141,6 @@ json-schema-validator docs/contracts/ocla-wire-v1.schema.json < envelope.json
 
 ## Versioning Policy
 
-- Major version (v1 → v2): breaking changes, new schema file, 6-month migration window.
+- Major version (v1 → v2): breaking changes, new schema file, minimum 12-month migration window.
 - Minor additions: backward-compatible, same schema file, default values.
 - See [DEPRECATION.md](DEPRECATION.md) for the full process.

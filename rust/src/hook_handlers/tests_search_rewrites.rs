@@ -11,26 +11,42 @@ fn grep_simple_pattern_rewrites() {
 }
 
 #[test]
-fn grep_pattern_with_pipe_is_quoted() {
+fn grep_pattern_with_pipe_falls_through_to_native_grep() {
+    // In BRE a bare `|` is a literal, but `lean-ctx grep` would read it as
+    // alternation and report lines native grep never matches (#1827). The
+    // quoting this test used to check now happens inside the `-c` wrap.
     assert_eq!(
         rewrite_candidate("grep -r \"TODO|FIXME\" .", "lean-ctx"),
-        Some("lean-ctx grep \"TODO|FIXME\" .".to_string())
+        Some(expect_wrapped("grep -r \"TODO|FIXME\" .", "lean-ctx"))
     );
 }
 
 #[test]
-fn grep_pattern_with_dollar_is_quoted() {
+fn egrep_pattern_with_pipe_still_rewrites() {
+    // The same text under ERE really is alternation, and the Rust `regex`
+    // crate agrees — so `egrep` keeps the direct rewrite.
+    assert_eq!(
+        rewrite_candidate("egrep -r \"TODO|FIXME\" .", "lean-ctx"),
+        Some("lean-ctx grep 'TODO|FIXME' .".to_string())
+    );
+}
+
+#[test]
+fn grep_pattern_with_dollar_keeps_its_quoting_in_the_wrap() {
+    // `"$HOME"` must still expand, so the command is not re-tokenized (#1862).
     assert_eq!(
         rewrite_candidate("grep -rn \"$HOME\" src/", "lean-ctx"),
-        Some("lean-ctx grep \"$HOME\" src/".to_string())
+        Some("lean-ctx -c 'grep -rn \"$HOME\" src/'".to_string())
     );
 }
 
 #[test]
-fn grep_pattern_with_parens_is_quoted() {
+fn grep_pattern_with_parens_falls_through_to_native_grep() {
+    // BRE reads `(` and `)` as literals; `lean-ctx grep` reads them as a
+    // group, so `func()` would match the text `func` (#1827).
     assert_eq!(
         rewrite_candidate("grep -n \"func()\" file.rs", "lean-ctx"),
-        Some("lean-ctx grep \"func()\" file.rs".to_string())
+        Some(expect_wrapped("grep -n \"func()\" file.rs", "lean-ctx"))
     );
 }
 
@@ -38,7 +54,7 @@ fn grep_pattern_with_parens_is_quoted() {
 fn grep_pattern_with_star_is_quoted() {
     assert_eq!(
         rewrite_candidate("grep \"func.*Handler\" src/", "lean-ctx"),
-        Some("lean-ctx grep \"func.*Handler\" src/".to_string())
+        Some("lean-ctx grep 'func.*Handler' src/".to_string())
     );
 }
 
@@ -78,7 +94,7 @@ fn grep_no_path_rewrites() {
 fn egrep_rewrites_with_quoted_pattern() {
     assert_eq!(
         rewrite_candidate("egrep \"func|struct|impl\" src/", "lean-ctx"),
-        Some("lean-ctx grep \"func|struct|impl\" src/".to_string())
+        Some("lean-ctx grep 'func|struct|impl' src/".to_string())
     );
 }
 

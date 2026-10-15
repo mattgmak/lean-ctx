@@ -15,6 +15,141 @@ fn wrap_with_quotes() {
     );
 }
 
+/// #1862: the wrap is single-quoted for the Bash tool on every platform, so the
+/// calling shell expands nothing — not the detected shell's quoting, which on
+/// Windows can be cmd.exe's double quotes.
+#[test]
+fn wrap_is_posix_single_quoted_whatever_shell_is_detected() {
+    assert_eq!(
+        wrap_single_command(r#"git log --format="$HOME $(id) `id`" -1"#, "lean-ctx"),
+        r#"lean-ctx -c 'git log --format="$HOME $(id) `id`" -1'"#
+    );
+    assert_eq!(
+        wrap_single_command("git log --grep 'it''s'", "lean-ctx"),
+        r"lean-ctx -c 'git log --grep '\''it'\'''\''s'\'''"
+    );
+}
+
+/// #1862: the tokenizer behind the direct rewrites drops the quotes, so it
+/// cannot tell `'$HOME'` (literal) from `"$HOME"` (expand). A command with `$`
+/// or `` ` `` keeps its own quoting — inside the `-c` wrap, or untouched where
+/// the command is never wrapped (`cat`). Every other word is re-quoted in
+/// single quotes so the calling shell leaves it alone.
+#[test]
+fn expansion_chars_keep_the_agents_own_quoting() {
+    for cmd in [
+        "grep -n '$HOME' README.md",
+        r#"grep -n "$HOME" README.md"#,
+        "rg 'foo`id`$(id)' src",
+    ] {
+        assert_eq!(
+            rewrite_candidate(cmd, "lean-ctx"),
+            Some(expect_wrapped(cmd, "lean-ctx")),
+            "{cmd}"
+        );
+    }
+    assert_eq!(rewrite_candidate("cat 'a$b.txt'", "lean-ctx"), None);
+    assert_eq!(
+        rewrite_candidate("cat a.md && cat 'b$c.md'", "lean-ctx"),
+        Some("lean-ctx read a.md && cat 'b$c.md'".to_owned())
+    );
+    assert_eq!(
+        rewrite_candidate(r#"cat "it's here.txt""#, "lean-ctx"),
+        Some(r"lean-ctx read 'it'\''s here.txt'".to_owned())
+    );
+}
+
+/// #1918: the direct rewrites re-quote every path, so an unquoted glob the
+/// calling shell would have expanded reached `lean-ctx read`/`grep` as a
+/// literal, missing path ("file not found"). Such commands must keep the
+/// agent's own text — native, or inside the `-c` wrap — never a direct rewrite.
+/// Quoted metacharacters are literal to the shell too and keep the rewrite.
+#[test]
+fn unquoted_globs_never_take_a_direct_rewrite() {
+    for cmd in [
+        "tail -5 handover/*-alpha/FILE.md",
+        "cat handover/*-alpha/FILE.md",
+        "head -3 handover/*-alpha/FILE.md",
+        "tail -3 handover/2026-09-29-?lpha/FILE.md",
+        "cat src/[id].tsx",
+        "cat docs/{a,b}.md",
+        "grep -n NEEDLE_MARKER u*.txt",
+        "rg -n foo src/*.rs",
+    ] {
+        let r = rewrite_candidate(cmd, "lean-ctx");
+        assert!(
+            r.is_none() || r == Some(expect_wrapped(cmd, "lean-ctx")),
+            "{cmd} → {r:?}"
+        );
+    }
+    assert_eq!(
+        rewrite_candidate("grep -n NEEDLE_MARKER u*.txt", "lean-ctx"),
+        Some(expect_wrapped("grep -n NEEDLE_MARKER u*.txt", "lean-ctx")),
+        "grep keeps the glob inside the -c wrap"
+    );
+    // Escaped or quoted metacharacters are literal: the direct rewrite stays.
+    assert_eq!(
+        rewrite_candidate("grep -n 'foo.*bar' src/main.rs", "lean-ctx"),
+        Some("lean-ctx grep 'foo.*bar' src/main.rs".to_owned())
+    );
+    assert_eq!(
+        rewrite_candidate(r#"cat "weird[1].md""#, "lean-ctx"),
+        Some("lean-ctx read 'weird[1].md'".to_owned())
+    );
+    // Chains: only the glob-free segment is rewritten.
+    assert_eq!(
+        rewrite_candidate("cat a.md && cat b/*.md", "lean-ctx"),
+        Some("lean-ctx read a.md && cat b/*.md".to_owned())
+    );
+}
+
+/// #1865: a lean-ctx binary under a path with a space (Windows: `C:\Program
+/// Files\...`) must be quoted in the direct rewrites too, or the calling shell
+/// splits it and fails with exit 127.
+#[test]
+fn direct_rewrite_quotes_binary_path_with_space() {
+    let bin = "/opt/Program Files/lean-ctx";
+    assert_eq!(
+        rewrite_candidate("cat notes.md", bin),
+        Some("'/opt/Program Files/lean-ctx' read notes.md".to_owned())
+    );
+    assert_eq!(
+        rewrite_candidate("cat a.md && cat b.md", bin),
+        Some(
+            "'/opt/Program Files/lean-ctx' read a.md && '/opt/Program Files/lean-ctx' read b.md"
+                .to_owned()
+        )
+    );
+    // The quoted form is recognised as an existing lean-ctx call (no re-wrap).
+    assert!(super::file_rewrite::is_leanctx_call(
+        "'/opt/Program Files/lean-ctx' read notes.md",
+        bin
+    ));
+    assert_eq!(
+        rewrite_candidate("'/opt/Program Files/lean-ctx' read notes.md", bin),
+        None
+    );
+}
+
+#[test]
+fn shell_quote_round_trips_through_shell_tokenize() {
+    for word in [
+        "$HOME",
+        "`id`",
+        "$(id)",
+        "it's",
+        r#"say "hi""#,
+        r"C:\Users\x",
+        "a b",
+    ] {
+        assert_eq!(
+            shell_tokenize(&shell_quote(word)),
+            vec![word.to_owned()],
+            "{word}"
+        );
+    }
+}
+
 #[test]
 fn rewrite_candidate_returns_none_for_existing_lean_ctx_command() {
     assert_eq!(
@@ -86,7 +221,7 @@ fn codex_rewrite_output_uses_native_updated_input_contract() {
 #[test]
 fn codex_allow_output_is_empty() {
     let output = codex_allow_output();
-    assert!(output.is_empty());
+    assert!(output.is_empty(), "{output:?}");
 }
 
 /// #809: codex_deny_output with heavily escaped content is valid JSON.
@@ -152,6 +287,33 @@ fn claude_allow_output_omits_deprecated_top_level_decision() {
 
     assert!(parsed.get("decision").is_none());
     assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// Claude Code 2.1.25x+ discarded the multi-dialect deny (top-level
+/// `decision: "deny"` is not `approve|block`) as a non-blocking error, losing
+/// the verdict and its guidance. Claude payloads get only hookSpecificOutput;
+/// other hosts keep the Cursor/Copilot keys.
+#[test]
+fn deny_output_is_claude_valid_for_claude_payloads_only() {
+    let claude = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "transcript_path": "/t.jsonl",
+        "tool_name": "Bash"
+    });
+    let p: serde_json::Value =
+        serde_json::from_str(&build_deny_output("use ctx_shell", &claude)).expect("valid JSON");
+    assert!(p.get("decision").is_none());
+    assert_eq!(p["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert_eq!(
+        p["hookSpecificOutput"]["permissionDecisionReason"],
+        "use ctx_shell"
+    );
+
+    let cursor = serde_json::json!({ "tool_name": "Shell", "command": "ls" });
+    let p: serde_json::Value =
+        serde_json::from_str(&build_deny_output("x", &cursor)).expect("valid JSON");
+    assert_eq!(p["permission"], "deny");
+    assert_eq!(p["permissionDecision"], "deny");
 }
 
 #[test]

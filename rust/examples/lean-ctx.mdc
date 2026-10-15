@@ -12,7 +12,7 @@ Always use lean-ctx MCP tools. Never use the standard equivalents.
 
 | Instead of | Use | Why |
 |---|-----|-----|
-| `Read` | `ctx_read` | Session caching, 6 compression modes, re-reads cost ~13 tokens |
+| `Read` | `ctx_read` | Session caching, read modes, compact references for eligible re-reads |
 | `Shell` | `ctx_shell` | Pattern-based compression for git, npm, cargo, docker, tsc |
 | `Grep` | `ctx_search` | Compact context, token-efficient results |
 | `ls`, `find` | `ctx_tree` | Compact directory maps with file counts |
@@ -26,7 +26,7 @@ Always use lean-ctx MCP tools. Never use the standard equivalents.
 - `aggressive` — syntax stripped
 - `entropy` — Shannon + Jaccard filtering
 
-Re-reads cost ~13 tokens. File refs F1, F2.. persist across the session.
+Eligible unchanged re-reads return compact references. File refs F1, F2.. persist across the session.
 
 Set `fresh=true` on ctx_read to bypass cache. Use when: spawned as a subagent, after context compaction, or if you see a [cached] response but do not have the file content in your context.
 
@@ -35,7 +35,7 @@ Set `fresh=true` on ctx_read to bypass cache. Use when: spawned as a subagent, a
 - Reading for context → `map`
 - Reading to understand API → `signatures`
 - Reading to edit → `full`
-- Re-reading → just call `full` again (cache returns ~13 tokens)
+- Re-reading → call `full` again (eligible cache hits return a compact reference)
 
 ## v2.3.0 Scientific Features (automatic)
 

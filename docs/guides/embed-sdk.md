@@ -1,35 +1,42 @@
-# Preview — embed LeanCTX in a custom host
+# Embed LeanCTX in your application
 
-> **Preview integration surface.** The current Engine is implementation
-> substrate; it is not yet the stable public Embed facade or a general
-> agent-building framework.
+**LeanCTX SDK — embed context control into your application.**
 
-## What Embed means
+Keep your model, workflow and UI. LeanCTX is the **Context Gateway for AI Systems**:
+**Control what your AI can see.** The SDK connects your code to supported
+LeanCTX Engine interfaces for **Select → Control → Prove**.
 
-Embed places LeanCTX inside a custom agent or application so the host can use
-the context lifecycle before inference:
+## Supported integration
 
-    select → shape → reuse → recover → measure
+Use the [standalone SDK](https://github.com/Thinkery-AG/leanctx-sdk) and its
+published compatibility matrix. Stable lifecycle primitives and Agent Tools are
+separate supported surfaces; Python `leanctx_sdk.preview` APIs retain their own limits.
 
-The host remains responsible for its agent loop, task logic, model selection,
-tools, retries, data governance, and user-visible behavior. LeanCTX does not
-take ownership of the application or silently send traffic or retry its calls.
+- Coding agents can use Agent Tools for reads, search, structural tools and
+  explicit permissions.
+- Applications and copilots can use supported lifecycle operations for context
+  preparation, recovery and receipts.
+- Production/OEM use and commercial redistribution require a signed written
+  Thinkery AG commercial agreement under the SDK license.
+  The Apache-2.0 Engine and the source-available SDK have different terms.
 
-## Current status
+The host owns model calls, orchestration, retries and user-visible behavior.
+A context-only receipt cannot assert that the model received an unseen later
+prompt. Record host delivery facts only through a documented integration.
 
-- The Rust Engine and related code are useful implementation substrate for
-  narrow evaluation work.
-- Python SDK v1 and its declared OpenAI Agents reference-wrapper scope are
-  **Preview**.
-- A general adapter framework, common session facade, typed lifecycle contract,
-  and common Receipt flow are still converging.
+## Preview and historical adapters
 
-Do not infer a generally supported SDK contract from an internal crate,
-example, method, or package name. Any Embed integration must declare its host
-version, visibility limits, recovery behavior, and evidence scope.
+Status: Preview — older in-tree embedding experiments and reference wrappers.
 
-## Evaluation discipline
+An internal crate or old `wrap()` example is not the standalone SDK's Stable
+contract. Workspace, checkpoint, delta and handoff interfaces explicitly in
+Python's `leanctx_sdk.preview` namespace may change. Consult the [SDK surface](../reference/sdk-surface.md)
+before choosing a package or adapter.
 
-Evaluate a custom integration against a named workload with a quality gate and
-a comparable baseline/treatment. Do not claim a general result from a local
-experiment or a context counter.
+## Evaluate your workload
+
+Compare a named baseline and treatment with a quality gate. Context-token
+reduction and calculated cost differences do not establish a universal saving
+or accepted outcome. Recovery requires an authorized retained source/archive.
+
+See [canonical positioning](../POSITIONING_CANONICAL.md).

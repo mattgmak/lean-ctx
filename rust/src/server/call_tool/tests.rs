@@ -131,6 +131,9 @@ mod triage_bypass_tests {
 
 mod shell_outcome_tests {
     use super::*;
+    // GH #2005; lives in `call_tool/tests/shell_outcome_tests/`.
+    #[cfg(not(windows))]
+    mod expand_unpolled;
     #[cfg(not(windows))]
     use crate::server::call_tool::dispatch_and_post_process;
     use crate::server::tool_trait::{McpTool, ShellOutcome, ToolContext};
@@ -223,6 +226,46 @@ mod shell_outcome_tests {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             crate::server::background_shell::remove_for_test(&self.job_id);
+        }
+    }
+
+    /// Wait until a background job has completed, and say why when it has not.
+    ///
+    /// The callers used to poll for a bare 6–10 s and then assert
+    /// `matches!(status, Some(Completed))`. On a loaded ubuntu runner three
+    /// trivial `printf | yes | head` jobs missed that window one after the
+    /// other (PR #1995), and the assertion could not tell a slow job from one
+    /// that was cancelled or pruned away. The ceiling only costs time when the
+    /// job really is stuck; the panic names the state that was observed.
+    #[cfg(not(windows))]
+    fn wait_for_completed(job_id: &str) {
+        use crate::server::background_shell::JobState;
+        const CEILING: std::time::Duration = std::time::Duration::from_mins(1);
+        let deadline = std::time::Instant::now() + CEILING;
+        loop {
+            let state = crate::server::background_shell::status(job_id);
+            match &state {
+                Some(JobState::Completed { .. }) => return,
+                Some(JobState::Cancelled { output }) => {
+                    panic!("job {job_id} was cancelled instead of completing: {output:?}")
+                }
+                _ if std::time::Instant::now() >= deadline => {
+                    let observed = match state {
+                        None => "gone from the job table (removed or pruned)".to_string(),
+                        Some(JobState::Running { output }) => {
+                            let tail: String = output.chars().rev().take(200).collect();
+                            let tail: String = tail.chars().rev().collect();
+                            format!(
+                                "still running, {} bytes captured, tail {tail:?}",
+                                output.len()
+                            )
+                        }
+                        Some(other) => format!("{other:?}"),
+                    };
+                    panic!("job {job_id} did not complete within {CEILING:?}: {observed}");
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(25)),
+            }
         }
     }
 
@@ -363,19 +406,7 @@ mod shell_outcome_tests {
         };
         let job = BackgroundJobGuard::new(job_id.clone());
         std::fs::write(release_path, b"release").expect("release auto-detached child");
-        for _ in 0..400 {
-            if matches!(
-                crate::server::background_shell::status(&job_id),
-                Some(crate::server::background_shell::JobState::Completed { .. })
-            ) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        assert!(matches!(
-            crate::server::background_shell::status(&job_id),
-            Some(crate::server::background_shell::JobState::Completed { .. })
-        ));
+        wait_for_completed(&job_id);
         (
             pipeline_background_status(&job_id, false, false, false).await,
             job,
@@ -451,22 +482,7 @@ mod shell_outcome_tests {
             Some(30_000),
         );
         let job = BackgroundJobGuard::new(job_id.clone());
-        for _ in 0..400 {
-            if matches!(
-                crate::server::background_shell::status(&job_id),
-                Some(
-                    crate::server::background_shell::JobState::Completed { .. }
-                        | crate::server::background_shell::JobState::Cancelled { .. }
-                )
-            ) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        assert!(matches!(
-            crate::server::background_shell::status(&job_id),
-            Some(crate::server::background_shell::JobState::Completed { .. })
-        ));
+        wait_for_completed(&job_id);
         (job_id, job)
     }
 
@@ -756,15 +772,7 @@ mod shell_outcome_tests {
         assert!(structured["jobId"].as_str().is_some());
         assert!(structured.get("exitCode").is_none());
 
-        for _ in 0..240 {
-            if matches!(
-                crate::server::background_shell::status(&job.job_id),
-                Some(crate::server::background_shell::JobState::Completed { .. })
-            ) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
+        wait_for_completed(&job.job_id);
         let terminal = pipeline_background_status(&job.job_id, false, false, false).await;
         let archive_id = structured_of(&terminal)["archiveId"]
             .as_str()
@@ -779,6 +787,36 @@ mod shell_outcome_tests {
             structured_of(&repeated)["archiveId"],
             serde_json::json!(archive_id)
         );
+    }
+
+    // #1980: with `[cache] shell_cache_enabled = true` (since removed), a
+    // repeated state-observing command replayed its first output after the
+    // file it reads had changed. Every call must observe the workspace as is.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(not(windows))]
+    async fn repeated_state_observing_command_sees_the_current_file() {
+        let _data_dir = crate::core::data_dir::isolated_data_dir();
+        let config = crate::core::config::Config::path().expect("isolated config path");
+        std::fs::create_dir_all(config.parent().expect("config dir")).unwrap();
+        std::fs::write(&config, "[cache]\nshell_cache_enabled = true\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("probe.txt");
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "command".to_string(),
+            serde_json::json!(format!("wc -c {}", file.display())),
+        );
+        let byte_count = |content: &str| {
+            std::fs::write(&file, content).unwrap();
+            let result = call_shell(&args, &shell_context());
+            text_of(&result)
+                .split_whitespace()
+                .next()
+                .map(str::to_owned)
+        };
+
+        assert_eq!(byte_count("a").as_deref(), Some("1"));
+        assert_eq!(byte_count("abcdef").as_deref(), Some("6"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -923,7 +961,7 @@ mod shell_outcome_tests {
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(not(windows))]
     async fn oversized_background_archive_reports_truncation_and_exact_sizes() {
-        const ARCHIVE_LIMIT: usize = 10 * 1024 * 1024;
+        const ARCHIVE_LIMIT: usize = crate::core::archive::MAX_ARCHIVE_SIZE;
         const CAPTURED: usize = ARCHIVE_LIMIT + 4096;
         let _data_dir = crate::core::data_dir::isolated_data_dir();
         let _archive = ScopedEnvVar::set("LEAN_CTX_ARCHIVE", "1");
@@ -966,19 +1004,7 @@ mod shell_outcome_tests {
             Some(10_000),
         );
         let _job = BackgroundJobGuard::new(job_id.clone());
-        for _ in 0..240 {
-            if matches!(
-                crate::server::background_shell::status(&job_id),
-                Some(crate::server::background_shell::JobState::Completed { .. })
-            ) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        assert!(matches!(
-            crate::server::background_shell::status(&job_id),
-            Some(crate::server::background_shell::JobState::Completed { .. })
-        ));
+        wait_for_completed(&job_id);
 
         // #1778: compile-time constant, not the process-global cwd (see
         // `shell_context` above).
@@ -1089,7 +1115,7 @@ mod shell_outcome_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(not(windows))]
-    async fn background_archive_is_created_after_policy_and_input_filters() {
+    async fn unbound_background_recovery_is_withheld_after_policy_and_input_filters() {
         const POLICY_PATTERN: &str = "MES1609_POLICY_PII_7F3A9C2E";
         const TEST_CARD: &str = "4111111111111111";
         let _data_dir = crate::core::data_dir::isolated_data_dir();
@@ -1104,18 +1130,22 @@ mod shell_outcome_tests {
         let result = pipeline_background_status(&job_id, false, false, false).await;
 
         let structured = structured_of(&result);
-        let archive_id = structured["archiveId"]
-            .as_str()
-            .expect("secured background output must be archived");
-        assert_eq!(crate::core::archive::list_entries(None).len(), 1);
-        assert_eq!(structured["archiveTruncated"], serde_json::json!(false));
-        let archived = crate::core::archive::retrieve(archive_id)
-            .expect("structured archiveId must remain retrievable");
-        assert!(!archived.contains(POLICY_PATTERN));
-        assert!(!archived.contains(TEST_CARD));
-        assert!(archived.contains("[REDACTED:mes1609_policy]"));
-        assert!(archived.contains("[REDACTED:card]"));
-        assert!(!text_of(&result).contains(POLICY_PATTERN));
+        assert!(structured.get("archiveId").is_none());
+        assert!(structured.get("archiveTruncated").is_none());
+        assert!(structured.get("archivedChars").is_none());
+        assert!(structured["capturedChars"].as_u64().unwrap() > 0);
+        assert!(
+            structured["summary"]
+                .as_str()
+                .unwrap()
+                .contains("archive unavailable")
+        );
+        assert!(crate::core::archive::list_entries(None).is_empty());
+        let displayed = text_of(&result);
+        assert!(!displayed.contains(POLICY_PATTERN));
+        assert!(!displayed.contains(TEST_CARD));
+        assert!(displayed.contains("[REDACTED:mes1609_policy]"));
+        assert!(displayed.contains("[REDACTED:card]"));
         assert!(
             crate::core::audit_trail::load_recent(10)
                 .iter()
@@ -1137,6 +1167,11 @@ mod shell_outcome_tests {
     #[test]
     #[cfg(not(windows))]
     fn scoped_policy_overrides_serialize_parallel_mutation() {
+        // The deliberately active global overrides below must not leak into
+        // other tests that hold isolated data/config state but use live
+        // policy. Each override now holds `test_env_lock` itself (lock order
+        // env → override), so this thread must not hold it: the override
+        // threads below would wait on it forever.
         let (first_ready_tx, first_ready_rx) = std::sync::mpsc::channel();
         let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
         let first = std::thread::spawn(move || {
@@ -1144,8 +1179,12 @@ mod shell_outcome_tests {
             first_ready_tx.send(()).expect("signal first override");
             release_first_rx.recv().expect("release first override");
         });
+        // Liveness waits, not timing assertions: an override first takes
+        // `test_env_lock`, which other tests may hold for a while on a busy
+        // many-core runner.
+        let acquire = std::time::Duration::from_mins(2);
         first_ready_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(acquire)
             .expect("first override must become active");
 
         let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
@@ -1168,7 +1207,7 @@ mod shell_outcome_tests {
         first.join().expect("first policy thread");
         if !overlapped {
             second_acquired_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
+                .recv_timeout(acquire)
                 .expect("second override must acquire after first drops");
         }
         release_second_tx.send(()).expect("release second thread");
@@ -1376,6 +1415,165 @@ mod shell_outcome_tests {
         assert_ne!(r.is_error, Some(true));
         assert!(r.structured_content.is_none());
     }
+
+    /// A real registered file-output tool must pass through the model-bound
+    /// policy redaction before its MCP result is returned.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(not(windows))]
+    async fn registered_file_output_is_policy_redacted_before_mcp_reply() {
+        let _data_dir = crate::core::data_dir::isolated_data_dir();
+        let root = tempfile::tempdir().unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // Letters, not digits: a digit run can pass the Luhn check, and the
+        // gateway's card detector would then redact it before the policy rule
+        // sees the whole marker.
+        let nonce_text = nonce
+            .to_string()
+            .chars()
+            .map(|digit| {
+                let value = digit.to_digit(10).unwrap_or(0);
+                char::from_digit(value + 10, 36).unwrap_or('x').to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("-");
+        let secret = format!("cobalt badger egress marker {nonce_text} private note");
+        std::fs::write(root.path().join("probe.txt"), &secret).unwrap();
+        let _policy = ScopedPolicy::redacting("cq06_runtime_probe", &regex::escape(&secret));
+
+        let server = crate::tools::LeanCtxServer::new_with_project_root(Some(
+            root.path().to_str().expect("temporary root is UTF-8"),
+        ));
+        *server.presence_agent_id.write().await = Some("cq06-egress-test".to_owned());
+        let args = serde_json::Map::from_iter([
+            ("path".to_owned(), serde_json::json!("probe.txt")),
+            ("mode".to_owned(), serde_json::json!("full")),
+        ]);
+        let request = rmcp::model::CallToolRequestParams::new("ctx_read").with_arguments(args);
+
+        let result = server
+            .call_tool_guarded(request)
+            .await
+            .expect("registered ctx_read call must succeed");
+        let visible = result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text())
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !visible.contains(&secret),
+            "model-visible MCP result leaked runtime secret: {visible}"
+        );
+        assert!(
+            visible.contains("[REDACTED:cq06_runtime_probe]"),
+            "policy redaction marker missing from model-visible result: {visible}"
+        );
+    }
+
+    /// Security invariant across the registry and dispatch files: every
+    /// registered McpTool is invoked only by the one generic dispatcher that
+    /// the MCP handler sends through dispatch_and_post_process. The sole
+    /// exemption is this cfg(test)-only file, whose direct calls test handlers
+    /// in isolation and never create model-visible MCP replies.
+    #[test]
+    fn registered_tool_dispatch_has_one_outbound_pipeline_entry() {
+        // Test-only fixtures that call a handler directly. `task_lineage_tests`
+        // wraps ctx_read in a rendezvous tool that is itself dispatched through
+        // the one production entry, so it adds no second outbound path.
+        const TEST_ONLY_EXEMPTIONS: &[&str] = &[
+            "call_tool/tests.rs",
+            "call_tool/guarded/task_lineage_tests.rs",
+        ];
+
+        let server_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server");
+        for exemption in TEST_ONLY_EXEMPTIONS {
+            let path = server_dir.join(exemption);
+            assert!(path.is_file(), "stale egress exemption: {exemption}");
+            let source = std::fs::read_to_string(path).expect("read test-only exemption");
+            assert!(
+                source.contains(".handle("),
+                "stale egress exemption no longer contains isolated direct handler tests: {exemption}"
+            );
+        }
+
+        let mut direct_handler_calls = Vec::new();
+        for entry in walkdir::WalkDir::new(&server_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
+        {
+            let relative = entry
+                .path()
+                .strip_prefix(&server_dir)
+                .expect("entry is under server source")
+                .to_string_lossy()
+                // Windows yields `call_tool\tests.rs`; compare in one separator.
+                .replace('\\', "/");
+            if TEST_ONLY_EXEMPTIONS.contains(&relative.as_str()) {
+                continue;
+            }
+            let source = std::fs::read_to_string(entry.path()).expect("read server source");
+            for (line, text) in source.lines().enumerate() {
+                if text.contains(".handle(") {
+                    direct_handler_calls.push((relative.clone(), line + 1, text.trim().to_owned()));
+                }
+            }
+        }
+
+        assert_eq!(
+            direct_handler_calls.len(),
+            1,
+            "registered McpTool handlers must have one production invocation site: {direct_handler_calls:?}"
+        );
+        assert_eq!(direct_handler_calls[0].0, "dispatch/mod.rs");
+        assert!(direct_handler_calls[0].2.contains("tool.handle("));
+
+        let server_handler = include_str!("../server_handler.rs");
+        let guarded = include_str!("guarded.rs");
+        let pipeline = include_str!("pipeline.rs");
+        let dispatch = include_str!("../dispatch/mod.rs");
+        let resources = include_str!("../resources.rs");
+        let file_resource = include_str!("../file_resource.rs");
+        let prompts = include_str!("../prompts.rs");
+        let cli_call = include_str!("../../cli/call_cmd.rs");
+        let cli_agent_tools = include_str!("../../cli/agent_tools_cmd.rs");
+        let embed_engine = include_str!("../../../crates/lean-ctx-embed/src/engine.rs");
+        assert!(server_handler.contains("self.call_tool_guarded(request)"));
+        // The guarded lifecycle driver runs the one pipeline in its two
+        // stages: dispatch, then reversible post-processing.
+        assert!(guarded.contains("super::pipeline::dispatch_primitive("));
+        assert!(guarded.contains("super::pipeline::reversible_post_process("));
+        // Dispatch runs under source-authority capture; content decisions go
+        // through the shared policy guard (redaction or withholding) and the
+        // sensitivity floor.
+        assert!(
+            pipeline
+                .contains("authority::capture(server.dispatch_tool(name, args, minimal)).await")
+        );
+        assert!(pipeline.contains("policy_guard::protect_result(name, &result_text)"));
+        assert!(pipeline.contains("sensitivity::enforce_text"));
+        assert!(dispatch.contains("_ => self.dispatch_inner(name, args, minimal).await"));
+        assert!(dispatch.contains("r.get_arc(name)"));
+        assert!(resources.contains("policy_guard::redact_model_text"));
+        assert!(file_resource.contains("resources::text_resource(&content, uri)"));
+        assert!(prompts.contains("policy_guard::redact_model_text"));
+        assert!(cli_call.contains("policy_guard::redact_model_text(&output.text)"));
+        assert!(cli_agent_tools.contains("policy_guard::redact_model_text(&output.text)"));
+        assert!(embed_engine.contains("policy_guard::redact_model_text(&out.text)"));
+
+        let registry = crate::server::registry::build_registry();
+        let names = registry.names();
+        assert!(!names.is_empty(), "registry must include registered tools");
+        for name in names {
+            let tool = registry.get(name).expect("every registered name resolves");
+            assert_eq!(tool.name(), name);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1445,6 +1643,10 @@ mod response_cache_tests {
 
     #[test]
     fn cache_keys_include_arguments_and_project_scope() {
+        // The key binds the active policy; pin "no policy" so a concurrent
+        // test's override cannot change the key between the calls.
+        let _env = crate::core::data_dir::test_env_lock();
+        let _policy = crate::core::policy::runtime::TestPolicyOverride::set(None);
         let base = response_cache_key("ctx_search", Some(&arguments()), "/project").unwrap();
         let other_root = response_cache_key("ctx_search", Some(&arguments()), "/other").unwrap();
         let other_args = Map::from_iter([("path".to_owned(), json!("src/main.rs"))]);

@@ -7,7 +7,7 @@ This project uses the **pi-lean-ctx** extension in **Replace mode**. Native Pi b
 
 | Use (ctx_*) | Instead of (suppressed) | Why |
 |-------------|------------------------|-----|
-| `ctx_read` | `read`, `cat`/`head`/`tail` | Cached + compressed; unchanged re-reads cost ~13 tokens |
+| `ctx_read` | `read`, `cat`/`head`/`tail` | Cached + compressed; eligible unchanged re-reads return compact references |
 | `ctx_shell` | `bash` | Shell output compressed via 95+ patterns |
 | `ctx_search` | `grep` | Compact, ranked matches |
 | `ctx_glob` | `find` | Compressed, .gitignore-aware file matching |

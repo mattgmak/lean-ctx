@@ -292,6 +292,9 @@ pub(super) fn remove_shell_hook(home: &Path, dry_run: bool) -> bool {
         }
     }
 
+    // The opt-in prompt segment (`init --prompt`) has its own rc block.
+    removed |= crate::cli::prompt_init::uninstall(home, dry_run);
+
     if !removed && !shell.is_empty() {
         println!("  · No shell hook found");
     }
@@ -1132,6 +1135,11 @@ pub(super) fn remove_lean_ctx_from_hooks_json(content: &str) -> HookCleanupResul
                 }
             }
         }
+    }
+
+    // Claude Code status line: a wrapped command goes back, our own entry goes.
+    if crate::hooks::agents::remove_lean_ctx_statusline(&mut parsed) {
+        modified = true;
     }
 
     if !modified {

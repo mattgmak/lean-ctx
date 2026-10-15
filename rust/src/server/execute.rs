@@ -109,7 +109,8 @@ pub(crate) fn execute_command_with_env(
 /// Execute a command under the normal shell policy, with an optional cooperative
 /// cancellation signal used by explicit background jobs. The signal is checked
 /// by the same watchdog that enforces `timeout_ms`, so cancellation kills the
-/// complete Unix process group rather than only the shell leader.
+/// complete process tree — the Unix session or the Windows job — rather than
+/// only the shell leader.
 ///
 /// `idle_keyed` turns `timeout_ms` into an *idle* budget instead of a wall-clock
 /// one: the clock resets whenever the child produces new bytes (#1113/#1173). A
@@ -133,6 +134,40 @@ pub(crate) fn execute_command_with_env_cancellable(
     // background job's `status` poll can show progress instead of nothing.
     live: Option<&std::sync::Mutex<String>>,
 ) -> (String, i32) {
+    // Store isolation for model-directed subprocesses of a protected session.
+    //
+    // macOS refuses a nested `sandbox_apply` under the whole-MCP profile, so
+    // this process cannot wrap its own children in the launcher's rules. The
+    // request goes to the launcher's supervisor instead, which starts the child
+    // from outside that sandbox under the profile the launcher pinned. Decided
+    // *before* the build lease and before any caller-supplied `extra_env`: the
+    // supervisor takes the machine-wide lease itself (taking it on both sides
+    // would deadlock), and a tool call can neither select nor drop the rules. A
+    // protected session that cannot reach its supervisor runs nothing.
+    //
+    // This is the one exec seam `ctx_shell` has — foreground, background and the
+    // interpreter heredoc reroute all arrive here — and the Engine's own
+    // persistence never passes through it.
+    #[cfg(unix)]
+    let protected_prefix: Option<Vec<String>> = {
+        use crate::core::protected_execution::{Mode, launch_mode, sandbox_prefix};
+        match launch_mode() {
+            Err(error) => return (format!("ERROR: {error}"), 1),
+            Ok(Mode::Brokered(client)) => {
+                return client.shell(
+                    command, cwd, extra_env, timeout_ms, cancel, idle_keyed, live,
+                );
+            }
+            Ok(Mode::Sandboxed(profile)) => Some(sandbox_prefix(&profile)),
+            Ok(Mode::Direct) => None,
+        }
+    };
+    #[cfg(not(unix))]
+    let protected_prefix = match crate::cli::protected_child_prefix() {
+        Ok(prefix) => prefix,
+        Err(error) => return (format!("ERROR: {error}"), 1),
+    };
+
     let _build_lease = match acquire_build_lease(command, cancel) {
         Ok(lease) => lease,
         Err(error) => return (format!("ERROR: {error}"), 130),
@@ -143,6 +178,10 @@ pub(crate) fn execute_command_with_env_cancellable(
     let normalized_cmd = crate::shell::platform::zsh_safe_command(&normalized_cmd, &shell);
     let dir = std::path::Path::new(cwd);
     let mut cmd = std::process::Command::new(&shell);
+    if let Some([program, arguments @ ..]) = protected_prefix.as_deref() {
+        cmd = std::process::Command::new(program);
+        cmd.args(arguments).arg(&shell);
+    }
     if cfg!(windows) && crate::shell::platform::is_powershell(&shell) {
         cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass"]);
     }
@@ -188,10 +227,10 @@ pub(crate) fn execute_command_with_env_cancellable(
         cmd.env(key, val);
     }
     if is_build_or_test_command(command) {
-        if !extra_env.contains_key("CARGO_BUILD_JOBS") {
+        if resource_config.cargo_build_jobs > 0 && !extra_env.contains_key("CARGO_BUILD_JOBS") {
             cmd.env(
                 "CARGO_BUILD_JOBS",
-                resource_config.cargo_build_jobs.max(1).to_string(),
+                resource_config.cargo_build_jobs.to_string(),
             );
         }
         if resource_config.shared_cargo_target
@@ -217,14 +256,37 @@ pub(crate) fn execute_command_with_env_cancellable(
     // Isolate the shell in its own process group on Unix. A timeout must kill
     // descendants too; otherwise a child can retain a pipe write-end and make
     // the caller report an empty result despite bytes already captured (#995).
+    //
+    // A new *session* rather than just a group: it also drops the controlling
+    // terminal. Otherwise an interactive descendant (`zsh -i`, `bash -i`, a
+    // test suite that spawns one) takes the terminal's foreground with
+    // tcsetpgrp, and the agent that launched the MCP server is stopped by
+    // SIGTTIN — "zsh: suspended claude", with mouse reporting still on.
+    // The session leader's pid is its pgid, so the timeout kill is unchanged.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        // SAFETY: setsid is async-signal-safe and touches no parent state.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
+    // Windows has no process group to kill: contain the tree in a job object
+    // instead, so a timeout or cancel ends the `python -` a heredoc started
+    // rather than only its shell (#1920).
+    crate::shell::process_tree::ProcessTree::prepare(&mut cmd);
 
     let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
         Ok(c) => c,
+        Err(e) => return (format!("ERROR: {e}"), 1),
+    };
+    let tree = match crate::shell::process_tree::ProcessTree::start(&mut child) {
+        Ok(tree) => tree,
         Err(e) => return (format!("ERROR: {e}"), 1),
     };
     // Stream each pipe into a shared, cap-bounded buffer that the main thread can
@@ -243,10 +305,10 @@ pub(crate) fn execute_command_with_env_cancellable(
     let mut still_running: Vec<String> = Vec::new();
     let (code, timed_out, cancelled) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break (status.code().unwrap_or(1), false, false),
+            Ok(Some(status)) => break (crate::shell::exit_status::exit_code(status), false, false),
             Ok(None) => {
                 if cancel.is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Acquire)) {
-                    kill_timed_out_child(&mut child);
+                    tree.kill(&mut child);
                     let _ = child.wait();
                     break (130, false, true);
                 }
@@ -283,15 +345,21 @@ pub(crate) fn execute_command_with_env_cancellable(
                 };
                 if idle_for >= timeout || hard_deadline.is_some_and(|d| Instant::now() >= d) {
                     still_running = running_segments(&child, &normalized_cmd);
-                    kill_timed_out_child(&mut child);
+                    tree.kill(&mut child);
                     let _ = child.wait();
                     break (124, true, false);
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => break (1, false, false),
+            Err(_) => {
+                tree.kill(&mut child);
+                break (1, false, false);
+            }
         }
     };
+    // A command that exited on its own keeps what it deliberately left running,
+    // as the Unix session does; a killed tree has nothing left to release.
+    tree.release();
 
     // Bounded grace period for the readers to reach EOF, but always read the
     // shared buffers afterwards so output is never silently lost (#945). A reader
@@ -387,21 +455,6 @@ pub(crate) fn execute_command_with_env_cancellable(
     }
 
     (text, code)
-}
-
-/// Kill a timed-out command and every descendant that inherited its pipes.
-/// The child is a process-group leader on Unix, so killing only the shell would
-/// otherwise leave grandchildren alive and readers unable to reach EOF (#995).
-fn kill_timed_out_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let pgid = child.id() as libc::pid_t;
-        if pgid > 0 {
-            // SAFETY: killpg is a plain syscall; a stale group simply yields ESRCH.
-            unsafe { libc::killpg(pgid, libc::SIGKILL) };
-        }
-    }
-    let _ = child.kill();
 }
 
 /// Shared, cap-bounded capture buffer for one child pipe. The reader thread
@@ -639,7 +692,18 @@ mod tests {
 
     #[test]
     fn resource_broker_serializes_build_leases() {
-        let _isolation = crate::core::data_dir::isolated_data_dir();
+        let isolation = crate::core::data_dir::isolated_data_dir();
+        // Off by default: a user's builds are never queued behind other sessions.
+        assert!(
+            super::acquire_build_lease("cargo test", None)
+                .expect("lease")
+                .is_none()
+        );
+        std::fs::write(
+            isolation.path().join("config.toml"),
+            "[agents]\nserialize_build_commands = true\n",
+        )
+        .expect("opt in");
         let first = super::acquire_build_lease("cargo test first", None)
             .expect("first lease")
             .expect("build command gets lease");
@@ -685,6 +749,58 @@ mod tests {
         if let Some(v) = saved {
             crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_MS", v);
         }
+    }
+
+    /// The one exec seam: foreground runs, detached background jobs and the
+    /// interpreter-heredoc reroute all build their command here, so covering it
+    /// once covers all three. Synthetic store, isolated data dir — never the
+    /// developer's installed knowledge.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_supervisor_runs_the_shell_under_the_pinned_child_rules() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        let isolation = crate::core::data_dir::isolated_data_dir();
+        let fact = isolation.path().join("knowledge/knowledge.json");
+        std::fs::create_dir_all(fact.parent().unwrap()).unwrap();
+        std::fs::write(&fact, "synthetic-provider-fact").unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_str().unwrap();
+        let read_fact = format!("cat {}", fact.display());
+        let write_fact = format!("printf downgraded > {}", fact.display());
+
+        // Community: the store is an ordinary file, the shell is unwrapped.
+        crate::cli::unpin_synthetic_session();
+        let (text, code) = execute_command_in(&read_fact, cwd);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("synthetic-provider-fact"), "{text}");
+
+        let _session = crate::cli::pin_synthetic_session(isolation.path()).expect("pinned rules");
+        crate::core::protected_execution::with_test_supervisor(|| {
+            let (text, code) = execute_command_in(&read_fact, cwd);
+            assert_ne!(code, 0, "{text}");
+            assert!(!text.contains("synthetic-provider-fact"), "{text}");
+            let (text, code) = execute_command_in(&write_fact, cwd);
+            assert_ne!(code, 0, "{text}");
+            // Ordinary project work in the session's own directory is untouched.
+            let (text, code) =
+                execute_command_in("printf 'fn main() {}' > main.rs && cat main.rs", cwd);
+            assert_eq!(code, 0, "{text}");
+            assert!(text.contains("fn main()"), "{text}");
+        });
+        // The Engine keeps persisting from outside the child rules.
+        assert_eq!(
+            std::fs::read_to_string(&fact).unwrap(),
+            "synthetic-provider-fact"
+        );
+        std::fs::write(&fact, "engine-write").unwrap();
+
+        // A protected session whose rules went missing runs nothing at all —
+        // there is no unconfined fallback shell.
+        crate::test_env::remove_var(crate::cli::CHILD_PROFILE_ENV);
+        let (text, code) = execute_command_in("printf ran-unconfined", cwd);
+        assert_ne!(code, 0, "{text}");
+        assert!(text.starts_with("ERROR:"), "{text}");
+        assert!(!text.contains("ran-unconfined"), "{text}");
     }
 
     /// #1113/#1173: a poll loop that emits a short line every so often must
@@ -887,6 +1003,7 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore)]
     fn utf8_bytes_survive_shell_roundtrip() {
+        let _lock = crate::core::data_dir::test_env_lock();
         let (output, code) = execute_command_in(
             "printf '\\xD0\\x9F\\xD1\\x80\\xD0\\xB8\\xD0\\xB2\\xD0\\xB5\\xD1\\x82'",
             ".",
@@ -898,6 +1015,7 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore)] // ReadToEnd() blocks indefinitely on Windows CI
     fn execute_command_closes_stdin() {
+        let _lock = crate::core::data_dir::test_env_lock();
         let command = "sh -c 'if read -t 1 line; then echo 67890; else echo 12345; fi'";
         let (output, code) = execute_command_in(command, ".");
         assert_eq!(code, 0, "command failed: {output}");
@@ -905,6 +1023,19 @@ mod tests {
             output.contains("12345"),
             "child process should receive EOF on stdin, got: {output}"
         );
+    }
+
+    /// #1881: a command terminated by a signal reports `128 + signal`, not 1.
+    /// Exit 1 plus output would even pass as a grep-style success (#1090).
+    #[test]
+    #[cfg(unix)]
+    fn execute_command_reports_signal_termination_as_128_plus_signal() {
+        let (output, code) = execute_command_in("echo before-kill; kill -TERM $$", ".");
+        assert_eq!(code, 143, "SIGTERM must map to 143, got {code}: {output}");
+        assert!(output.contains("before-kill"), "output kept: {output}");
+
+        let (_, code) = execute_command_in("kill -KILL $$", ".");
+        assert_eq!(code, 137, "SIGKILL must map to 137");
     }
 
     /// #945: a command that finishes but leaves a process holding the stdout
@@ -915,6 +1046,7 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore)] // POSIX backgrounding (`&`) + sleep
     fn background_pipe_holder_keeps_foreground_output() {
+        let _lock = crate::core::data_dir::test_env_lock();
         let (output, code) = execute_command_in("echo REPRO_CANARY_945; sleep 4 &", ".");
         assert_eq!(code, 0, "command should succeed: {output:?}");
         assert!(
@@ -927,16 +1059,28 @@ mod tests {
         );
     }
 
+    /// A command runs without a controlling terminal, so an interactive
+    /// descendant cannot take the terminal's foreground from the agent.
+    /// (Vacuous where the test runner itself has no terminal, as in CI.)
+    #[test]
+    #[cfg(unix)]
+    fn command_has_no_controlling_terminal() {
+        let (output, code) = execute_command_in(
+            "if (exec 3</dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi",
+            ".",
+        );
+        assert_eq!(code, 0, "{output:?}");
+        assert!(output.contains("NO_TTY"), "got: {output:?}");
+    }
+
     #[test]
     #[cfg_attr(windows, ignore)]
     fn forwards_captured_agent_runtime_env() {
         // #370: the MCP server process lacks CODEX_THREAD_ID; a hook captured it
         // from the agent shell. ctx_shell must still forward it to the child.
-        let _lock = crate::core::data_dir::test_env_lock();
-        let dir = std::env::temp_dir().join("lean_ctx_exec_runtime_env");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        crate::test_env::set_var("LEAN_CTX_DATA_DIR", &dir);
+        // The capture lands in `state_dir()`, so all category dirs must be
+        // isolated — pinning only the data dir let parallel tests race it.
+        let _iso = crate::core::data_dir::isolated_data_dir();
 
         // Simulate a hook capturing the var from the native agent environment.
         crate::test_env::remove_var("CODEX_THREAD_ID");
@@ -946,9 +1090,6 @@ mod tests {
         crate::test_env::remove_var("CODEX_THREAD_ID");
 
         let (output, code) = execute_command_in("printf 'TID=%s' \"$CODEX_THREAD_ID\"", ".");
-
-        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(code, 0, "command failed: {output}");
         assert!(
@@ -962,6 +1103,7 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore)] // POSIX sleep
     fn per_call_timeout_kills_long_command() {
+        let _lock = crate::core::data_dir::test_env_lock();
         let (output, code) = super::execute_command_with_env(
             "sleep 3",
             ".",
@@ -980,6 +1122,7 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore)] // POSIX sleep
     fn per_call_timeout_preserves_partial_output() {
+        let _lock = crate::core::data_dir::test_env_lock();
         let (output, code) = super::execute_command_with_env(
             "printf TIMEOUT_PARTIAL_995; sleep 3",
             ".",
@@ -999,6 +1142,7 @@ mod tests {
 
     #[test]
     fn git_version_returns_when_git_is_available() {
+        let _lock = crate::core::data_dir::test_env_lock();
         let git_available = std::process::Command::new("git")
             .arg("--version")
             .stdout(std::process::Stdio::null())

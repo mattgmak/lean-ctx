@@ -165,18 +165,18 @@ pub fn reset_chain() {
 
 #[cfg(test)]
 pub mod tests {
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     use super::*;
     use crate::core::context_kernel::accounting_fix::compute_honest_accounting;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    // The chain is process-wide and the kernel e2e suites record into it too:
+    // a module-private lock let them reset and refill it mid-test once enough
+    // tests ran in parallel. Every kernel test serializes on the shared lock.
     fn isolated() -> MutexGuard<'static, ()> {
-        let guard = match TEST_LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let guard = crate::core::context_kernel::kernel_config::KERNEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_chain();
         guard
     }

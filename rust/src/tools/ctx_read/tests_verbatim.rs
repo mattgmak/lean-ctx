@@ -5,6 +5,9 @@ use super::*;
 /// self-describing legend. End-to-end through the real read pipeline.
 #[test]
 fn anchored_mode_emits_line_hash_anchors() {
+    // Reads go raw while another test holds LEAN_CTX_DISABLED=1; reading the
+    // environment under the same lock keeps this test out of that window.
+    let _env = crate::core::data_dir::test_env_lock();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("anc.rs");
     let p = path.to_string_lossy().to_string();
@@ -37,6 +40,7 @@ fn anchored_mode_emits_line_hash_anchors() {
 /// anchors back.
 #[test]
 fn anchored_mode_is_not_capped_to_raw_on_small_files() {
+    let _env = crate::core::data_dir::test_env_lock();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tiny.rs");
     let p = path.to_string_lossy().to_string();
@@ -144,6 +148,13 @@ fn verbatim_modes_preserve_decorative_comment_lines() {
 /// provider-side prompt caching.
 #[test]
 fn process_mode_output_is_byte_stable_across_calls() {
+    // Env-independent setup first: the first `count_tokens` in the process
+    // loads the tokenizer, which must not happen under the global env lock.
+    let content: String = (0..120)
+        .map(|i| format!("pub fn handler_{i}(x: u32) -> u32 {{ x * {i} }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tokens = count_tokens(&content);
     // Fresh, empty data dir (GL #556): the shared per-process test sandbox
     // accumulates feedback/bandit/session stores from parallel tests, which
     // feed adaptive_thresholds() and make entropy-mode output drift between
@@ -157,11 +168,6 @@ fn process_mode_output_is_byte_stable_across_calls() {
     crate::test_env::remove_var("LEAN_CTX_SAVINGS_FOOTER");
     crate::test_env::remove_var("LEAN_CTX_SHOW_SAVINGS");
     crate::test_env::remove_var("LEAN_CTX_QUIET");
-    let content: String = (0..120)
-        .map(|i| format!("pub fn handler_{i}(x: u32) -> u32 {{ x * {i} }}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let tokens = count_tokens(&content);
 
     for mode in [
         "map",

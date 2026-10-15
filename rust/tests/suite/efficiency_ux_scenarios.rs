@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Scenario tests for the Efficiency + UX Hardening Plan (10 fixes)
 //! and the shell compression error-guard hardening.
 //!
@@ -7,6 +8,49 @@
 use lean_ctx::core::cache::SessionCache;
 use lean_ctx::core::protocol::CrpMode;
 use std::io::Write;
+
+/// Exercise both cached scope policies in fresh processes: the production
+/// resolver uses OnceLock, so mutating the parent environment is insufficient.
+/// These SessionCache scenarios exclude the independent cross-agent relay.
+fn isolated_variant_scope(test_name: &str) -> Option<bool> {
+    const CHILD: &str = "LEAN_CTX_VARIANT_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        assert!(
+            !lean_ctx::core::config::Config::load()
+                .ocla
+                .delivery_enabled()
+        );
+        return Some(std::env::var("LEAN_CTX_CONVERSATION_SCOPE").unwrap() == "1");
+    }
+    for scope in ["1", "0"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[ocla.delivery]\nenabled = false\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name)
+            .env("LEAN_CTX_CONVERSATION_SCOPE", scope)
+            .env("LEAN_CTX_SCOPE", "variant-cache-test")
+            .env("LEAN_CTX_CONFIG_DIR", dir.path())
+            .env("LEAN_CTX_DATA_DIR", dir.path().join("data"))
+            .env_remove("CLAUDECODE")
+            .env_remove("CURSOR_TASK_ID")
+            .env_remove("LEAN_CTX_FORCE_FRESH")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test_name} scope={scope}: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    None
+}
 
 // =============================================================================
 // Fix 1 + 2: ctx_read Fast-Path + mtime guard
@@ -31,7 +75,7 @@ mod read_cache_hits {
             CrpMode::Off,
             None,
         );
-        assert!(!out1.content.is_empty());
+        assert!(!out1.content.is_empty(), "`out1.content` is empty");
         assert_ne!(out1.resolved_mode, "error");
 
         // Second read: should be a cache hit (mtime unchanged → fast path)
@@ -96,6 +140,11 @@ mod zstd_bypass {
 
     #[test]
     fn scenario_map_mode_uses_compressed_cache() {
+        let Some(_scoped) = isolated_variant_scope(
+            "suite::efficiency_ux_scenarios::zstd_bypass::scenario_map_mode_uses_compressed_cache",
+        ) else {
+            return;
+        };
         let mut cache = SessionCache::new();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("module.rs");
@@ -122,9 +171,11 @@ mod zstd_bypass {
             CrpMode::Off,
             None,
         );
-        assert!(!out1.content.is_empty());
+        assert!(!out1.content.is_empty(), "`out1.content` is empty");
 
-        // Second map read — should hit compressed cache (no zstd decompression needed)
+        // Second map read — served from the compressed cache. Since #1909 an
+        // unchanged variant collapses to the same `[unchanged]` stub as a
+        // `full` re-read (no conversation context in this process).
         let out2 = lean_ctx::tools::ctx_read::handle_with_task_resolved(
             &mut cache,
             path,
@@ -132,8 +183,28 @@ mod zstd_bypass {
             CrpMode::Off,
             None,
         );
-        assert!(!out2.content.is_empty());
-        assert_eq!(out1.content, out2.content);
+        assert!(!out2.content.is_empty(), "`out2.content` is empty");
+        assert!(out2.is_cache_hit);
+        assert!(out2.output_tokens <= out1.output_tokens);
+        // Known conversation or none at all (one conversation by contract):
+        // the unchanged variant collapses to its receipt (#1909). A caller
+        // that cannot be identified is covered by `conversation_allows_stub`.
+        assert!(
+            out2.content.contains("unchanged map view"),
+            "{}",
+            out2.content
+        );
+        let out3 = lean_ctx::tools::ctx_read::handle_with_task_resolved(
+            &mut cache,
+            path,
+            "map",
+            CrpMode::Off,
+            None,
+        );
+        assert_eq!(
+            out2.content, out3.content,
+            "repeat-view receipts stay deterministic"
+        );
     }
 }
 
@@ -159,7 +230,7 @@ mod exit_code {
         } else {
             String::new()
         };
-        assert!(exit_suffix.is_empty());
+        assert!(exit_suffix.is_empty(), "{exit_suffix:?}");
 
         let code: i32 = 127;
         let exit_suffix = if code != 0 {
@@ -668,7 +739,7 @@ Program.cs(23,5): error CS0103: The name 'undeclared' does not exist in the curr
         let success_output = "   Compiling serde v1.0.193\n   Compiling tokio v1.35.0\n   Compiling myapp v0.1.0\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 45.23s\n";
         let result = compress_if_beneficial_pub("cargo build", success_output);
         // Should not crash, and successful builds are NOT error-guarded
-        assert!(!result.is_empty());
+        assert!(!result.is_empty(), "`result` is empty");
     }
 
     #[test]
@@ -814,6 +885,11 @@ mod integration_workflow {
 
     #[test]
     fn scenario_multimode_read_workflow() {
+        let Some(_scoped) = isolated_variant_scope(
+            "suite::efficiency_ux_scenarios::integration_workflow::scenario_multimode_read_workflow",
+        ) else {
+            return;
+        };
         let mut cache = SessionCache::new();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("multi.rs");
@@ -841,7 +917,7 @@ mod integration_workflow {
             CrpMode::Off,
             None,
         );
-        assert!(!sig1.content.is_empty());
+        assert!(!sig1.content.is_empty(), "`sig1.content` is empty");
 
         let sig2 = lean_ctx::tools::ctx_read::handle_with_task_resolved(
             &mut cache,
@@ -850,8 +926,23 @@ mod integration_workflow {
             CrpMode::Off,
             None,
         );
-        // Should be identical (compressed cache hit)
-        assert_eq!(sig1.content, sig2.content);
+        assert!(sig2.is_cache_hit);
+        // A known conversation receives its unchanged-view receipt; without
+        // any conversation context the process is one conversation by
+        // contract, so its own re-read collapses too (#1909).
+        assert!(
+            sig2.content.contains("unchanged signatures view"),
+            "{}",
+            sig2.content
+        );
+        let sig3 = lean_ctx::tools::ctx_read::handle_with_task_resolved(
+            &mut cache,
+            path,
+            "signatures",
+            CrpMode::Off,
+            None,
+        );
+        assert_eq!(sig2.content, sig3.content);
 
         // 3. Read with map mode
         let map1 = lean_ctx::tools::ctx_read::handle_with_task_resolved(
@@ -861,6 +952,6 @@ mod integration_workflow {
             CrpMode::Off,
             None,
         );
-        assert!(!map1.content.is_empty());
+        assert!(!map1.content.is_empty(), "`map1.content` is empty");
     }
 }

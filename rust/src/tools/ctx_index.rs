@@ -26,8 +26,8 @@ pub fn handle(action: &str, project_root: &Path) -> String {
             crate::core::index_orchestrator::ensure_all_background(
                 project_root.to_string_lossy().as_ref(),
             );
-            // Build semantic index on top of the fresh BM25.
-            crate::core::index_orchestrator::build_semantic(
+            // Build semantic index once the fresh BM25 is on disk.
+            crate::core::index_orchestrator::build_semantic_background(
                 project_root.to_string_lossy().as_ref(),
             );
             // #420: a forced rebuild must drop the in-process call-graph cache so
@@ -37,25 +37,15 @@ pub fn handle(action: &str, project_root: &Path) -> String {
             "started".to_string()
         }
         "build-semantic" => {
-            // Build semantic index; auto-build BM25 first if missing.
-            let root = project_root.to_string_lossy();
-            let disk = crate::core::index_orchestrator::disk_status(&root);
-            if !disk.bm25_index.exists {
-                crate::core::index_orchestrator::ensure_all_background(&root);
-            }
-            crate::core::index_orchestrator::build_semantic(&root);
-            let sem = crate::core::index_orchestrator::semantic_summary(&root);
-            match sem.state {
-                "ready" => "semantic index ready".to_string(),
-                "failed" => format!(
-                    "semantic index failed: {}",
-                    sem.last_error.unwrap_or_else(|| "unknown".to_string())
-                ),
-                _ => sem
-                    .note
-                    .unwrap_or("semantic index not available".to_string()),
-            }
+            // Builds BM25 first if missing. Runs in the background: a CPU-only
+            // embed can take far longer than a tool call may block.
+            crate::core::index_orchestrator::build_semantic_background(
+                project_root.to_string_lossy().as_ref(),
+            );
+            "semantic index build started in the background; progress is saved as it goes — \
+             check with ctx_index action=status"
+                .to_string()
         }
-        _ => "Unknown action. Use: status, build, build-full, build-semantic".to_string(),
+        _ => "Unknown action. Use: status, build, build-full, build-semantic, why".to_string(),
     }
 }

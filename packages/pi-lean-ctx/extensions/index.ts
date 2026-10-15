@@ -37,7 +37,8 @@ import {
   writeMcpSchemaCache,
 } from "./mcp-cache.js";
 import { loadPiConfig, resolvePiShellPath, resolveSuppressedBuiltins } from "./config.js";
-import { classifySearchExit, sanitizeExtraEnv } from "./exec-result.js";
+import { posixSafeEnv } from "./env.js";
+import { classifySearchExit, innerTimeoutEnv, sanitizeExtraEnv } from "./exec-result.js";
 import { withFooter } from "./footer.js";
 
 const BRIDGE_STARTUP_TIMEOUT_MS = 10_000;
@@ -84,7 +85,7 @@ const readModeSchema = Type.Union([
   Type.Literal("reference"),
   Type.Literal("task"),
   Type.String({ description: "lines:N-M window (e.g. lines:5-20)" }),
-], { description: "Override auto-selection: full=verbatim anchored=full+anchors(edit via ctx_patch) diff=git-delta map=structure signatures=API raw=exact-bytes lines:N-M=window auto=smart(default)" });
+], { description: "Override auto-selection: full=complete(≤turn budget; raw=true beyond) anchored=full+anchors(edit via ctx_patch) diff=git-delta map=structure signatures=API raw=exact-bytes lines:N-M=window auto=smart(default)" });
 
 // Kept field-compatible with the canonical MCP `ctx_read` schema (registry in
 // rust/src/tools/registered/ctx_read.rs) so the tool looks identical across
@@ -114,6 +115,17 @@ const findSchema = Type.Object({
   limit: Type.Optional(Type.Number({ description: "Maximum number of results (default: 1000)" })),
 });
 
+/**
+ * Per-line budget for `ctx_grep` results, in bytes.
+ *
+ * #1650: `limit` bounds how many matches return, not how wide each one is, and
+ * the 512 KB output cap sits far above any single line — so one minified JSON
+ * line answered a `limit: 1` search with ~100 KB. 400 bytes comfortably fits a
+ * real source line while keeping a minified blob from filling the window; the
+ * `maxLineChars` parameter raises it, and `0` removes the bound entirely.
+ */
+const DEFAULT_GREP_MAX_LINE_CHARS = 400;
+
 const grepSchema = Type.Object({
   pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
   path: Type.String({ description: "Directory or file to search. Pass the directory you are working in — there is no cwd fallback." }),
@@ -122,6 +134,12 @@ const grepSchema = Type.Object({
   literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal string (default: false)" })),
   context: Type.Optional(Type.Number({ description: "Lines of context around each match (default: 0)" })),
   limit: Type.Optional(Type.Number({ description: "Maximum number of matches (default: 100)" })),
+  maxLineChars: Type.Optional(
+    Type.Number({
+      description:
+        "Per-line budget in bytes (default: 400, 0 = unlimited). Longer matching lines are previewed up to the budget; re-read the full line with ctx_read(path, mode=\"lines:N-N\").",
+    }),
+  ),
 });
 
 const leanCtxSchema = Type.Object({
@@ -133,6 +151,9 @@ const leanCtxSchema = Type.Object({
   ),
 });
 
+// Host bash tools reject environment names outside the POSIX identifier
+// shape, which Windows' `ProgramFiles(x86)` violates (#1799). See `env.ts`
+// for why the filter sits at this boundary and not in `leanCtxEnv`.
 function shellQuote(value: string): string {
   if (!value) return "''";
   if (/^[A-Za-z0-9_./=:@,+%^-]+$/.test(value)) return value;
@@ -331,17 +352,22 @@ export default async function (pi: ExtensionAPI) {
 
   const shellPath = resolvePiShellPath();
   const leanCtxSpawnHook =
-    (extra: Record<string, string>) =>
+    (extra: Record<string, string>, timeoutSecs?: number) =>
     ({ command, cwd, env }: { command: string; cwd: string; env: NodeJS.ProcessEnv }) => {
       const bin = resolveBinary();
+      // #1833: the per-call timeout reaches Pi's bash tool only; `lean-ctx -c`
+      // would stop the command at its own 120 s default without this.
+      const timeoutEnv = innerTimeoutEnv(timeoutSecs, { ...PI_CONFIG.forwardedEnv, ...env });
       return {
         command: `${shellQuote(bin)} -c ${shellQuote(command)}`,
         cwd,
         // Caller-supplied `env` (#1761) sits above the inherited environment
         // and below the flags lean-ctx must always see; `lean-ctx -c` passes
         // its environment through to the command, so this is the same
-        // channel the MCP `env` parameter uses.
-        env: leanCtxEnv({ ...env, ...extra }),
+        // channel the MCP `env` parameter uses. The result is filtered to
+        // names the host will accept (#1799); doing it last covers every
+        // source `leanCtxEnv` merges, including config-supplied `forwardedEnv`.
+        env: posixSafeEnv(leanCtxEnv({ ...env, ...extra, ...timeoutEnv })),
       };
     };
   const baseBashTool = createBashToolDefinition(process.cwd(), {
@@ -354,14 +380,24 @@ export default async function (pi: ExtensionAPI) {
   // #1761: the CLI rejects inline overrides like `GIT_EDITOR=true git …` and
   // recommends `ctx_shell(command=…, env={…})`. The spawn hook of a tool
   // definition is fixed per definition and calls may interleave, so a call
-  // that carries `env` gets its own definition instead of a shared mutable slot.
-  const bashToolWithEnv = (extra: Record<string, string>, raw: boolean) =>
+  // that carries `env` or a `timeout` gets its own definition instead of a
+  // shared mutable slot.
+  const bashToolWithEnv = (extra: Record<string, string>, raw: boolean, timeoutSecs?: number) =>
     raw
       ? createBashToolDefinition(process.cwd(), {
           shellPath,
-          spawnHook: ({ command, cwd, env }) => ({ command, cwd, env: { ...env, ...extra } }),
+          // `raw` bypasses lean-ctx entirely but still spawns through the
+          // host's bash tool, so it needs the same name filter (#1799).
+          spawnHook: ({ command, cwd, env }) => ({
+            command,
+            cwd,
+            env: posixSafeEnv({ ...env, ...extra }),
+          }),
         })
-      : createBashToolDefinition(process.cwd(), { shellPath, spawnHook: leanCtxSpawnHook(extra) });
+      : createBashToolDefinition(process.cwd(), {
+          shellPath,
+          spawnHook: leanCtxSpawnHook(extra, timeoutSecs),
+        });
 
   const bashSchemaWithRaw = Type.Object({
     command: Type.String({ description: "Bash command to execute" }),
@@ -423,8 +459,10 @@ export default async function (pi: ExtensionAPI) {
       const toolParams = { command: params.command, timeout: params.timeout };
       const extraEnv = sanitizeExtraEnv(params.env);
       const hasExtraEnv = Object.keys(extraEnv.accepted).length > 0;
-      const tool = hasExtraEnv
-        ? bashToolWithEnv(extraEnv.accepted, isRaw)
+      // `raw` never runs `lean-ctx -c`, so only Pi's own timeout applies there.
+      const innerTimeout = !isRaw && params.timeout !== undefined ? params.timeout : undefined;
+      const tool = hasExtraEnv || innerTimeout !== undefined
+        ? bashToolWithEnv(extraEnv.accepted, isRaw, innerTimeout)
         : isRaw
           ? rawBash
           : baseBashTool;
@@ -721,6 +759,20 @@ export default async function (pi: ExtensionAPI) {
       if (params.literal) searchArgs.push("-F");
       if (params.context && params.context > 0) searchArgs.push(`-C${params.context}`);
       if (params.glob) searchArgs.push("--glob", params.glob);
+
+      // #1650: `limit` caps how many matches come back, not how wide they are.
+      // One minified line could therefore return ~100 KB from a `limit: 1`
+      // search — the 512 KB output cap below sits far above a single long line,
+      // so nothing stopped it. ripgrep bounds this natively and knows where the
+      // match sits, so let it do the cutting rather than slicing the text here:
+      // `--max-columns-preview` keeps the head of the line plus ripgrep's own
+      // "[... N more matches]" marker, so the truncation is explicit rather
+      // than a silently short answer. `path:line:` is still in the output, so
+      // the full line is one `ctx_read(path, mode="lines:N-N")` away.
+      const maxLineChars = params.maxLineChars ?? DEFAULT_GREP_MAX_LINE_CHARS;
+      if (maxLineChars > 0) {
+        searchArgs.push(`-M${maxLineChars}`, "--max-columns-preview");
+      }
 
       const globalLimit = params.limit && params.limit > 0 ? params.limit : 100;
       searchArgs.push(params.pattern, absolutePath);

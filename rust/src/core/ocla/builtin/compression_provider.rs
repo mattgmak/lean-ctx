@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! BuiltinCompressionProvider — fail-closed compression via ContentPort + core::compressor.
 //!
 //! Uses Config::find_project_root() for bounded root resolution. Reports
@@ -18,7 +19,6 @@ use crate::core::ocla::types::{
     CompressionRequest, CompressionResult, OCLA_API_VERSION, OclaCapability, OclaCapabilityKind,
     OclaCapabilityStatus, OclaResult,
 };
-use crate::core::ocla_bus::{self, OclaEvent};
 use crate::core::tokens;
 
 const COMPRESSION_MANIFEST_JSON: &str = include_str!(concat!(
@@ -26,7 +26,7 @@ const COMPRESSION_MANIFEST_JSON: &str = include_str!(concat!(
     "/assets/ocla/capability-manifests/leanctx/context-optimization-v1.json"
 ));
 
-static COMPRESSION_MANIFEST: OnceLock<CapabilityManifestV1> = OnceLock::new();
+static COMPRESSION_MANIFEST: OnceLock<Result<CapabilityManifestV1, String>> = OnceLock::new();
 
 static DEFAULT_PORT: OnceLock<Option<CompressionContentPort>> = OnceLock::new();
 
@@ -69,13 +69,21 @@ impl BuiltinCompressionProvider {
     }
 
     /// The pinned v1 contract exposed by the context-compression capability.
-    pub fn manifest(&self) -> CapabilityManifestV1 {
+    pub fn manifest(&self) -> OclaResult<CapabilityManifestV1> {
         COMPRESSION_MANIFEST
             .get_or_init(|| {
-                serde_json::from_str(COMPRESSION_MANIFEST_JSON)
-                    .expect("pinned compression capability manifest must parse")
+                let manifest =
+                    serde_json::from_str::<CapabilityManifestV1>(COMPRESSION_MANIFEST_JSON)
+                        .map_err(|error| {
+                            format!("invalid pinned compression capability manifest: {error}")
+                        })?;
+                manifest.validate().map_err(|error| {
+                    format!("invalid pinned compression capability manifest: {error}")
+                })?;
+                Ok(manifest)
             })
             .clone()
+            .map_err(OclaError::InvalidRequest)
     }
 
     pub fn compress_with_port(
@@ -130,13 +138,6 @@ impl BuiltinCompressionProvider {
 
         let ref_key = port.persist(compressed.as_bytes())?;
 
-        ocla_bus::emit(OclaEvent::CompressionApplied {
-            path: Some(request.source_ref.clone()),
-            before_tokens: request.source_tokens,
-            after_tokens: delivered_tokens,
-            strategy: "aggressive_compress".to_string(),
-        });
-
         Ok(CompressionResult {
             delivered_ref: ref_key,
             delivered_tokens,
@@ -165,7 +166,7 @@ impl OclaService for BuiltinCompressionProvider {
         }
     }
 
-    fn manifest(&self) -> CapabilityManifestV1 {
+    fn manifest(&self) -> OclaResult<CapabilityManifestV1> {
         BuiltinCompressionProvider::manifest(self)
     }
 }
@@ -371,7 +372,10 @@ mod tests {
 
         assert_eq!(result.delivered_tokens, 0);
         assert_eq!(result.recovery_ref, Some("file:empty.rs".into()));
-        assert!(port.retrieve(&result.delivered_ref).unwrap().is_empty());
+        {
+            let found = &port.retrieve(&result.delivered_ref).unwrap();
+            assert!(found.is_empty(), "{found:?}");
+        }
     }
 
     #[test]

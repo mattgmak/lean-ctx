@@ -5,10 +5,11 @@ fn format_impact_empty() {
     let impact = ImpactResult {
         root_file: "a.rs".to_string(),
         affected_files: vec![],
+        weak_files: vec![],
         max_depth_reached: 0,
         edges_traversed: 0,
     };
-    let result = format_impact(&impact, "a.rs", "/tmp", OutputFormat::Text);
+    let result = format_impact(&impact, "a.rs", "/tmp", OutputFormat::Text, None);
     assert!(result.contains("No files depend on"));
 }
 
@@ -17,10 +18,11 @@ fn format_impact_with_files() {
     let impact = ImpactResult {
         root_file: "a.rs".to_string(),
         affected_files: vec!["b.rs".to_string(), "c.rs".to_string()],
+        weak_files: vec![],
         max_depth_reached: 2,
         edges_traversed: 3,
     };
-    let result = format_impact(&impact, "a.rs", "/tmp", OutputFormat::Text);
+    let result = format_impact(&impact, "a.rs", "/tmp", OutputFormat::Text, None);
     assert!(result.contains("2 affected files"));
     assert!(result.contains("b.rs"));
     assert!(result.contains("c.rs"));

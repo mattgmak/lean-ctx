@@ -1,12 +1,9 @@
 # Cognition Interface (v1)
 
-> **Status: research architecture note — not a public product name or capability
-> claim.** LeanCTX is **The Context SDK for AI Agents**, a local
-> context layer for existing agents: it selects, shapes, reuses, and recovers
-> task-fit context. Current scope and status are
-> governed by `docs/internal/README.md` (internal, not in this repository). Profiles,
-> autonomous orchestration, Team Server, and broader SDK surfaces referenced
-> below are Research or unavailable.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 LeanCTX cannot modify proprietary model weights. This note explores a
 **Cognition Interface**: a deterministic control surface for shaping what an

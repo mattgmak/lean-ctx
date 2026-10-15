@@ -113,7 +113,7 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         key(
             "string[]",
             serde_json::json!(cfg.redirect_exclude),
-            "URL patterns to exclude from proxy redirection",
+            "File globs lean-ctx delivers verbatim: native reads skip the hook redirect and automatic ctx_read modes return them in full (e.g. [\"docs/**\", \"*.json\"]). LEAN_CTX_HOOK_EXCLUDE (comma-separated) takes precedence.",
         ),
     );
     root.insert(
@@ -153,7 +153,7 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         key(
             "boolean",
             serde_json::json!(cfg.delta_explicit),
-            "Serve explicit full/lines re-reads of changed cached files as diffs (opt-in). Override via LCTX_DELTA_EXPLICIT=1",
+            "Legacy delta preference (opt-in); concrete per-call full/lines requests remain fresh and exact. Use mode=auto or mode=diff for reduced re-reads. Override via LCTX_DELTA_EXPLICIT=1",
         ),
     );
     root.insert(
@@ -439,10 +439,11 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             key_with_env(
                 "bool",
                 serde_json::json!(true),
-                "Default on: denies native tools at the permission level, forcing agents to use ctx_* MCP tools for maximum compression. Disable with shadow_mode = false if you prefer native tools.",
+                "Default on: lean-ctx steers agents to ctx_* MCP tools, and an explicit hook_mode = \"replace\" may deny native tools. shadow_mode = false caps every agent at Hybrid — native tools are never denied.",
                 "LEAN_CTX_SHADOW_MODE",
             ),
         );
+    root.insert("hook_mode".into(), hook_mode_key());
     root.insert(
         "shell_hook_mode".into(),
         key_enum_with_env(
@@ -549,12 +550,29 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             ),
         );
     root.insert(
+            "bm25_max_files".into(),
+            key(
+                "u64",
+                serde_json::json!(cfg.bm25_max_files),
+                "Maximum files in the BM25 corpus (the semantic index chunks the same corpus). 0 = unlimited",
+            ),
+        );
+    root.insert(
         "memory_profile".into(),
         key_enum_with_env(
             &["low", "balanced", "performance"],
             "performance",
             "Controls RAM vs feature trade-off (performance = max quality)",
             "LEAN_CTX_MEMORY_PROFILE",
+        ),
+    );
+    root.insert(
+        "semantic_mode".into(),
+        key_enum_with_env(
+            &["off", "auto", "eager"],
+            "auto",
+            "Semantic code intelligence: off, auto (use only running language servers / a live IDE), eager (may start language servers; trusted workspaces only)",
+            "LEAN_CTX_SEMANTIC_MODE",
         ),
     );
     root.insert(
@@ -570,8 +588,8 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             "savings_footer".into(),
             key_enum_with_env(
                 &["auto", "always", "never"],
-                "always",
-                "Controls visibility of token savings footers: always (default, show on every response), never, auto (context-dependent). Also: LEAN_CTX_SHOW_SAVINGS=1|0",
+                "never",
+                "Controls visibility of token savings footers: never (default), always (show on every response), auto (context-dependent). Also: LEAN_CTX_SHOW_SAVINGS=1|0",
                 "LEAN_CTX_SAVINGS_FOOTER",
             ),
         );
@@ -590,6 +608,25 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             serde_json::json!(cfg.max_ram_percent),
             "Soft process-RSS target as % of system RAM (1-50, default 5); eviction/throttling policy, not an OS hard cap",
             "LEAN_CTX_MAX_RAM_PERCENT",
+        ),
+    );
+    root.insert(
+        "mcp_max_rss_mb".into(),
+        key_with_env(
+            "u64",
+            serde_json::json!(cfg.mcp_max_rss_mb),
+            "Per-process RSS target (MB) of each stdio MCP server; the guardian evicts above the lower of this and max_ram_percent (default 512, 0 = percent only)",
+            "LEAN_CTX_MCP_MAX_RSS_MB",
+        ),
+    );
+    root.insert("daemon_max_rss_mb".into(), daemon_max_rss_key(&cfg));
+    root.insert(
+        "mcp_idle_exit_minutes".into(),
+        key_with_env(
+            "u64",
+            serde_json::json!(cfg.mcp_idle_exit_minutes),
+            "Exit a stdio MCP server after this many minutes without a tool call (0 = never, default). Hosts that do not restart servers (Codex) lose lean-ctx in a resumed thread",
+            "LEAN_CTX_MCP_IDLE_EXIT_MINUTES",
         ),
     );
     root.insert(
@@ -717,7 +754,16 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         key(
             "bool?",
             serde_json::json!(null),
-            "Filesystem path jail. null/true = enforced (tools confined to the project root + allow_paths). false = the blanket \"any path\" opt-out — every tool path is allowed (for containers/sandboxes where the boundary is external). Compression and secret redaction are unaffected. Flip both planes at once with `lean-ctx yolo` / `lean-ctx secure`",
+            "Filesystem path jail. null/true = enforced (what it admits is set by path_jail_scope). false = the blanket \"any path\" opt-out — every tool path is allowed (for containers/sandboxes where the boundary is external). Compression and secret redaction are unaffected. Flip both planes at once with `lean-ctx yolo` / `lean-ctx secure`",
+        ),
+    );
+    root.insert(
+        "path_jail_scope".into(),
+        key_with_env(
+            "string?",
+            serde_json::json!(null),
+            "What the enforced path jail admits. null/\"home\" (default since 3.11.3) = everything below your home directory, read and write, except protected zones: top-level dot entries (~/.ssh, ~/.aws, ~/.config, other agents' dirs), ~/Library, ~/AppData, ~/snap. \"projects\" (the default of 3.11.1–3.11.2) = every project below ~ is readable (a path counts when a folder between it and ~ holds .git, Cargo.toml, package.json, …; loose personal files do not); writes stay in the session's project + allow entries. \"project\" = only the active project + allow_paths/extra_roots/read_only_roots. Open one more dir with `lean-ctx allow-path <dir>`. Falls back to \"project\" for an implausible $HOME. Global-only",
+            "LEAN_CTX_PATH_JAIL_SCOPE",
         ),
     );
     root.insert(
@@ -772,6 +818,14 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         ),
     );
     root.insert(
+        "shell_allowlist_subcommand_scoping".into(),
+        key(
+            "bool",
+            serde_json::json!(true),
+            "Scope a multi-word shell_allowlist entry to the exact subcommand/prefix it names (GH #1419). Default true; set false to fall back to base-binary-only matching.",
+        ),
+    );
+    root.insert(
         "shell_security".into(),
         key_with_env(
             "string",
@@ -812,7 +866,7 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         key(
             "string[]",
             serde_json::json!(cfg.write_allow_paths),
-            "Absolute paths allowed for ctx_shell redirects and tee output; empty = OS temp directories",
+            "Extra absolute paths for ctx_shell redirects, tee output and downloads, beyond the scratch dirs. Capture into the session's project and allow_paths/extra_roots is always allowed; empty = OS temp directories only",
         ),
     );
 
@@ -1401,7 +1455,7 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             key_with_env(
                 "string",
                 serde_json::json!("minilm"),
-                "Local ONNX embedding model for ctx_semantic_search. One of: minilm (all-MiniLM-L6-v2, 384d, default), nomic (768d) — or any HuggingFace repo with an ONNX export via hf:org/repo[@revision] (e.g. hf:jinaai/jina-embeddings-v2-base-code for code). Switching models re-indexes once on the next search.",
+                "Local embedding model for ctx_semantic_search. Unset: minilm where ONNX Runtime is installed, potion-code otherwise. One of: minilm (all-MiniLM-L6-v2, 384d), potion-code (potion-code-16M, 256d static model2vec, pure Rust — no ONNX Runtime, indexes thousands of chunks per second), nomic (768d) — or any HuggingFace repo with an ONNX export via hf:org/repo[@revision] (e.g. hf:jinaai/jina-embeddings-v2-base-code for code). Switching models re-indexes once on the next search.",
                 "LEAN_CTX_EMBEDDING_MODEL",
             ),
         );

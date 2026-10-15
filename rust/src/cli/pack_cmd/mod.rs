@@ -1,3 +1,4 @@
+mod bundle;
 mod checkpoint;
 mod management;
 mod package;
@@ -13,7 +14,35 @@ pub use pr::*;
 #[allow(unreachable_pub, unused_imports)]
 pub use transfer::*;
 
+/// Every `pack` subcommand; anything else that names an existing path is a bundle.
+const SUBCOMMANDS: &[&str] = &[
+    "pr",
+    "create",
+    "install",
+    "update",
+    "list",
+    "ls",
+    "info",
+    "remove",
+    "rm",
+    "export",
+    "import",
+    "verify",
+    "checkpoint-seal",
+    "checkpoint-inspect",
+    "snapshot-v1-inspect",
+    "auto-load",
+    "publish",
+    "send",
+    "receive",
+    "help",
+];
+
 pub(crate) fn cmd_pack(args: &[String]) {
+    if bundle::wants_bundle(args, SUBCOMMANDS) {
+        bundle::cmd_pack_bundle(args);
+        return;
+    }
     let project_root = super::common::detect_project_root(args);
 
     let subcommand = args
@@ -35,6 +64,8 @@ pub(crate) fn cmd_pack(args: &[String]) {
         "checkpoint-seal" => checkpoint::cmd_pack_checkpoint_seal(args),
         "checkpoint-inspect" => checkpoint::cmd_pack_checkpoint_inspect(args),
         "snapshot-v1-inspect" => checkpoint::cmd_pack_snapshot_v1_inspect(args),
+        "migrate" => cmd_pack_migrate(args),
+        "rollback" => cmd_pack_rollback(args),
         "auto-load" => cmd_pack_auto_load(args),
         "publish" => cmd_pack_publish(args),
         "send" => cmd_pack_send(args, &project_root),
@@ -64,9 +95,11 @@ fn print_usage() {
          \x20 export   <name>[@version] [--output=<path>] [--sign] [--private] [--allow-secrets]  Export to .{ext} file (--sign: ed25519, required for publish; --private: hidden on the hosted registry; secret scan blocks credential-shaped content unless --allow-secrets)\n\
          \x20 import   <file.{ext}> [--apply]            Import from file\n\
          \x20 verify   <file.{ext}> [...]                Verify integrity + signature, no install (spec \u{a7}8/\u{a7}9; exit 1 on failure)\n\
-         \x20 checkpoint-seal --checkpoint=<payload.json> --output=<file.{ext}> --name=<name> [--version=<v>] [--unsigned]\n\
+         \x20 checkpoint-seal (--checkpoint=<payload.json> | --session=<id>) --output=<file.{ext}> --name=<name> [--version=<v>] [--unsigned]\n\
          \x20 checkpoint-inspect <file.{ext}>             Verify and emit the open checkpoint envelope as bounded JSON\n\
          \x20 snapshot-v1-inspect <file.json>              Verify bounded signed SnapshotV1 migration input\n\
+         \x20 migrate  <file.lctxpkg>                    Verify and copy legacy package byte-for-byte to .{ext}\n\
+         \x20 rollback <file.ctxpkg.migration.json>      Remove a verified migrated copy and retain its legacy source\n\
          \x20 install  <name>[@version] [--file=<path>]    Apply package to current project\n\
          \x20 install  <ns>/<name>[@version]              Install from the hosted registry\n\
          \x20                                             (ctxpkg.com; verifies sha256 + signature, pins in ctxpkg.lock,\n\
@@ -84,6 +117,15 @@ fn print_usage() {
          PR Pack:\n\
          \x20 pr       [--base <ref>] [--format json|markdown] [--depth <n>]  PR context pack\n\
          \n\
+         Chat Bundle (one XML document that fits a chat input box):\n\
+         \x20 [<path>] --limit <n[k|M]> [--unit chars|tokens] [--intent \"<task>\"]\n\
+         \x20          [--emit xml|plain|both] [-o <file>] [--copy] [--stats]\n\
+         \x20          [--include <glob,..>] [--ignore <glob,..>] [--with-knowledge[=<cats>] [--with-auto]] [--knowledge-limit <n>]\n\
+         \x20          [--no-security-check --force]\n\
+         \x20          Ranks files by task + import graph; top files in full, next tier as signatures,\n\
+         \x20          the rest only in the tree. The limit is a hard cap (default 128k chars); exit 1 if\n\
+         \x20          even the frame exceeds it. Files with detected secrets are withheld and listed.\n\
+         \n\
          CONFORMANCE LEVELS:\n\
          \x20 1 (Basic)     Flat nodes, no edges (any tool can implement)\n\
          \x20 2 (Graph)     Typed nodes + edges, dependency resolution, graph-merge\n\
@@ -95,6 +137,8 @@ fn print_usage() {
          \x20 lean-ctx pack export rust-patterns --output=rust-patterns.{ext}\n\
          \x20 lean-ctx pack send rust-patterns.{ext} --target http://remote:3344\n\
          \x20 lean-ctx pack receive envelope.json --secret mykey --apply\n\
-         \x20 lean-ctx pack list\n"
+         \x20 lean-ctx pack list\n\
+         \x20 lean-ctx pack --limit 128k --intent \"fix token refresh\" --copy\n\
+         \x20 lean-ctx pack src/auth --limit 32k --unit tokens -o auth.xml\n"
     );
 }

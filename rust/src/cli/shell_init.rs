@@ -6,8 +6,14 @@ macro_rules! qprintln {
     };
 }
 
+mod hook_refresh;
+pub use hook_refresh::refresh_installed_shell_hooks;
+use hook_refresh::write_lc_path_shims;
+
 pub fn print_hook_stdout(shell: &str) {
-    let binary = crate::core::portable_binary::resolve_portable_binary();
+    let binary = crate::core::portable_binary::stable_shell_binary(
+        &crate::core::portable_binary::resolve_portable_binary(),
+    );
     let binary = hook_binary_for_shell(shell, &binary);
 
     let code = match shell {
@@ -37,7 +43,7 @@ fn hook_binary_for_shell(shell: &str, binary: &str) -> String {
     }
 }
 
-fn backup_shell_config(path: &std::path::Path) {
+pub(super) fn backup_shell_config(path: &std::path::Path) {
     if !path.exists() {
         return;
     }
@@ -57,11 +63,11 @@ fn backup_shell_config(path: &std::path::Path) {
 /// `env.sh`. These are config files (RO-safe), so they live in [`config_dir`]
 /// (GH #408). For legacy/mixed installs `config_dir()` collapses onto the same
 /// single directory as before, so this is a no-op there.
-fn config_artifact_dir() -> Option<std::path::PathBuf> {
+pub(super) fn config_artifact_dir() -> Option<std::path::PathBuf> {
     crate::core::paths::config_dir().ok()
 }
 
-fn write_hook_file(filename: &str, content: &str) -> Option<std::path::PathBuf> {
+pub(super) fn write_hook_file(filename: &str, content: &str) -> Option<std::path::PathBuf> {
     let dir = config_artifact_dir()?;
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(filename);
@@ -81,7 +87,7 @@ fn write_hook_file(filename: &str, content: &str) -> Option<std::path::PathBuf> 
     }
 }
 
-fn resolved_hook_dir_display() -> String {
+pub(super) fn resolved_hook_dir_display() -> String {
     config_artifact_dir().map_or_else(
         || "$HOME/.config/lean-ctx".to_string(),
         |p| p.to_string_lossy().to_string(),
@@ -419,13 +425,17 @@ pub fn generate_hook_fish(binary: &str) -> String {
         \tcommand $argv\n\
         end\n\
         \n\
+        # Exit status 0 = ON, 1 = OFF/DISABLED; LEAN_CTX_ENABLED=0 is OFF (#1971).\n\
         function lean-ctx-status\n\
         \tif set -q LEAN_CTX_DISABLED\n\
         \t\tisatty stdout; and echo 'lean-ctx: DISABLED (LEAN_CTX_DISABLED is set)'\n\
-        \telse if set -q LEAN_CTX_ENABLED\n\
+        \t\treturn 1\n\
+        \telse if set -q LEAN_CTX_ENABLED; and test \"$LEAN_CTX_ENABLED\" != 0\n\
         \t\tisatty stdout; and echo 'lean-ctx: ON'\n\
+        \t\treturn 0\n\
         \telse\n\
         \t\tisatty stdout; and echo 'lean-ctx: OFF'\n\
+        \t\treturn 1\n\
         \tend\n\
         end\n\
         \n\
@@ -481,20 +491,24 @@ pub fn generate_hook_posix(binary: &str) -> String {
         r#"# lean-ctx shell hook — smart shell mode (track-by-default)
 _lean_ctx_cmds=({alias_list})
 
-_lc_is_agent() {{
+# Everything an alias or a user command reaches is named without a leading
+# underscore: agent harnesses that snapshot + replay the shell (Claude Code's
+# Bash tool) drop `_`-prefixed functions but keep the aliases calling them,
+# which failed every aliased command with `_lc: command not found` (#1898).
+lean_ctx_is_agent() {{
     [ -n "${{LEAN_CTX_AGENT:-}}" ] || [ -n "${{CURSOR_AGENT:-}}" ] || [ -n "${{CODEX_CLI_SESSION:-}}" ] || [ -n "${{CLAUDECODE:-}}" ] || [ -n "${{CODEBUDDY:-}}" ] || [ -n "${{GEMINI_SESSION:-}}" ]
 }}
 
-_lean_ctx_notice() {{
+lean_ctx_notice() {{
     [ -n "${{LEAN_CTX_DEBUG:-}}" ] && [ -t 1 ] && echo "$@"
 }}
 
-_lc() {{
+lean_ctx_track() {{
     if [ -n "${{LEAN_CTX_DISABLED:-}}" ] || [ -n "${{LEAN_CTX_NO_HOOK:-}}" ]; then
         command "$@"
         return
     fi
-    if [ ! -t 1 ] && ! _lc_is_agent; then
+    if [ ! -t 1 ] && ! lean_ctx_is_agent; then
         command "$@"
         return
     fi
@@ -507,12 +521,12 @@ _lc() {{
     fi
 }}
 
-_lc_compress() {{
+lean_ctx_compress() {{
     if [ -n "${{LEAN_CTX_DISABLED:-}}" ] || [ -n "${{LEAN_CTX_NO_HOOK:-}}" ]; then
         command "$@"
         return
     fi
-    if [ ! -t 1 ] && ! _lc_is_agent; then
+    if [ ! -t 1 ] && ! lean_ctx_is_agent; then
         command "$@"
         return
     fi
@@ -525,14 +539,19 @@ _lc_compress() {{
     fi
 }}
 
+# Pre-#1898 names, kept for aliases defined by an older hook in a live shell.
+_lc_is_agent() {{ lean_ctx_is_agent; }}
+_lc() {{ lean_ctx_track "$@"; }}
+_lc_compress() {{ lean_ctx_compress "$@"; }}
+
 lean-ctx-on() {{
     for _lc_cmd in "${{_lean_ctx_cmds[@]}}"; do
         # shellcheck disable=SC2139
-        alias "$_lc_cmd"='_lc '"$_lc_cmd"
+        alias "$_lc_cmd"='lean_ctx_track '"$_lc_cmd"
     done
-    alias k='_lc kubectl'
+    alias k='lean_ctx_track kubectl'
     export LEAN_CTX_ENABLED=1
-    _lean_ctx_notice "lean-ctx: ON (track mode — output unchanged, token savings recorded)"
+    lean_ctx_notice "lean-ctx: ON (track mode — output unchanged, token savings recorded)"
 }}
 
 lean-ctx-off() {{
@@ -541,7 +560,7 @@ lean-ctx-off() {{
     done
     unalias k 2>/dev/null || true
     export LEAN_CTX_ENABLED=0
-    _lean_ctx_notice "lean-ctx: OFF"
+    lean_ctx_notice "lean-ctx: OFF"
 }}
 
 lean-ctx-mode() {{
@@ -549,11 +568,11 @@ lean-ctx-mode() {{
         compress)
             for _lc_cmd in "${{_lean_ctx_cmds[@]}}"; do
                 # shellcheck disable=SC2139
-                alias "$_lc_cmd"='_lc_compress '"$_lc_cmd"
+                alias "$_lc_cmd"='lean_ctx_compress '"$_lc_cmd"
             done
-            alias k='_lc_compress kubectl'
+            alias k='lean_ctx_compress kubectl'
             export LEAN_CTX_ENABLED=1
-            _lean_ctx_notice "lean-ctx: COMPRESS mode (all output compressed)"
+            lean_ctx_notice "lean-ctx: COMPRESS mode (all output compressed)"
             ;;
         track)
             lean-ctx-on
@@ -574,13 +593,18 @@ lean-ctx-raw() {{
     LEAN_CTX_RAW=1 command "$@"
 }}
 
+# Exit status 0 = ON, 1 = OFF/DISABLED. lean-ctx-off exports
+# LEAN_CTX_ENABLED=0, so a set-but-zero value is OFF, not ON (#1971).
 lean-ctx-status() {{
     if [ -n "${{LEAN_CTX_DISABLED:-}}" ]; then
         [ -t 1 ] && echo "lean-ctx: DISABLED (LEAN_CTX_DISABLED is set)"
-    elif [ -n "${{LEAN_CTX_ENABLED:-}}" ]; then
+        return 1
+    elif [ "${{LEAN_CTX_ENABLED:-0}}" != "0" ]; then
         [ -t 1 ] && echo "lean-ctx: ON"
+        return 0
     else
         [ -t 1 ] && echo "lean-ctx: OFF"
+        return 1
     fi
 }}
 
@@ -600,6 +624,8 @@ if [ -n "${{ZSH_VERSION:-}}" ]; then
     }}
     compdef _lean-ctx lean-ctx 2>/dev/null
     compdef _lean-ctx lctx 2>/dev/null
+    compdef _lean_ctx_passthrough lean_ctx_track 2>/dev/null
+    compdef _lean_ctx_passthrough lean_ctx_compress 2>/dev/null
     compdef _lean_ctx_passthrough _lc 2>/dev/null
     compdef _lean_ctx_passthrough _lc_compress 2>/dev/null
 fi
@@ -609,7 +635,7 @@ _lean_ctx_should_activate() {{
     case "${{LEAN_CTX_SHELL_ACTIVATION:-{baked_default}}}" in
         off|none|manual) return 1 ;;
         agents-only|agents_only|agentsonly)
-            _lc_is_agent ;;
+            lean_ctx_is_agent ;;
         *) return 0 ;;
     esac
 }}
@@ -775,71 +801,6 @@ fi
     }
 }
 
-/// Directory for the `_lc`/`_lc_compress` PATH shims: the directory of the
-/// running `lean-ctx` executable, which is necessarily on `PATH` (the hook
-/// resolves the binary from there).
-fn lc_shim_dir() -> Option<std::path::PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-}
-
-/// Body of a `_lc`/`_lc_compress` PATH shim. Mirrors the hook's shell function
-/// of the same name: honor the disable switches, pass through raw for a
-/// non-TTY non-agent shell, otherwise route through the binary and fall back to
-/// running the command directly if the binary itself cannot exec (126/127).
-fn shim_script(name: &str, binary: &str, flag: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-         # lean-ctx PATH fallback for the `{name}` shell function -- DO NOT EDIT.\n\
-         # Shell resolves alias -> function -> PATH, so the hook's shell function\n\
-         # shadows this whenever it is loaded (identical behavior there). This runs\n\
-         # only where the function is absent: non-interactive subshells, scripts,\n\
-         # xargs/find -exec, a pipeline's outer shell, and agent harnesses that\n\
-         # snapshot+replay the shell and drop the function but keep the aliases\n\
-         # that call it. Without it those contexts fail `{name}: command not found`.\n\
-         if [ -n \"${{LEAN_CTX_DISABLED:-}}\" ] || [ -n \"${{LEAN_CTX_NO_HOOK:-}}\" ]; then\n\
-         \texec \"$@\"\n\
-         fi\n\
-         if [ ! -t 1 ] && [ -z \"${{LEAN_CTX_AGENT:-}}\" ] && [ -z \"${{CURSOR_AGENT:-}}\" ] && [ -z \"${{CODEX_CLI_SESSION:-}}\" ] \\\n\
-         \t&& [ -z \"${{CLAUDECODE:-}}\" ] && [ -z \"${{CODEBUDDY:-}}\" ] && [ -z \"${{GEMINI_SESSION:-}}\" ]; then\n\
-         \texec \"$@\"\n\
-         fi\n\
-         '{binary}' {flag} \"$@\"\n\
-         _lc_rc=$?\n\
-         if [ \"$_lc_rc\" -eq 127 ] || [ \"$_lc_rc\" -eq 126 ]; then\n\
-         \texec \"$@\"\n\
-         fi\n\
-         exit \"$_lc_rc\"\n"
-    )
-}
-
-/// Write the `_lc`/`_lc_compress` PATH shims into `dir` (executable on Unix).
-fn write_lc_path_shims_in(dir: &std::path::Path, binary: &str) {
-    for (name, flag) in [("_lc", "-t"), ("_lc_compress", "-c")] {
-        let path = dir.join(name);
-        if let Err(e) = std::fs::write(&path, shim_script(name, binary, flag)) {
-            tracing::warn!("could not write shim {}: {e}", path.display());
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-        }
-    }
-}
-
-/// Install `_lc`/`_lc_compress` fallback executables on `PATH` so aliases never
-/// break when the shell function is unavailable (see [`shim_script`]).
-/// Self-contained: depends on no env wiring (BASH_ENV/env.sh) or snapshot
-/// fidelity, and the same-named function shadows it where the hook is loaded.
-fn write_lc_path_shims(binary: &str) {
-    if let Some(dir) = lc_shim_dir() {
-        write_lc_path_shims_in(&dir, binary);
-    }
-}
-
 fn print_docker_env_hints(is_zsh: bool) {
     if is_zsh || !crate::shell::is_container() {
         return;
@@ -932,31 +893,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lc_shim_script_is_self_contained_fallback() {
-        let s = shim_script("_lc", "/usr/bin/lean-ctx", "-t");
-        assert!(s.starts_with("#!/bin/sh\n"), "needs a shebang: {s}");
-        assert!(s.contains("'/usr/bin/lean-ctx' -t \"$@\""), "{s}");
-        assert!(s.contains("exec \"$@\""), "{s}");
-        assert!(s.contains("CLAUDECODE"), "{s}");
-        assert!(s.contains("LEAN_CTX_DISABLED"), "{s}");
-    }
-
-    #[test]
-    fn lc_compress_shim_uses_compress_flag() {
-        let s = shim_script("_lc_compress", "/usr/bin/lean-ctx", "-c");
-        assert!(s.contains("'/usr/bin/lean-ctx' -c \"$@\""), "{s}");
-    }
-
-    #[test]
-    fn write_lc_path_shims_writes_both_executables() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write_lc_path_shims_in(tmp.path(), "/usr/bin/lean-ctx");
-        for name in ["_lc", "_lc_compress"] {
-            assert!(tmp.path().join(name).exists(), "missing shim {name}");
-        }
-    }
-
-    #[test]
     fn test_remove_lean_ctx_block_posix() {
         let input = r#"# existing config
 export PATH="$HOME/bin:$PATH"
@@ -1028,7 +964,7 @@ export EDITOR=vim
             "bash/zsh hook must contain pipe guard [ ! -t 1 ]"
         );
         assert!(
-            output.contains("_lc_is_agent"),
+            output.contains("lean_ctx_is_agent"),
             "bash/zsh hook must have agent-aware bypass"
         );
         assert!(
@@ -1039,25 +975,134 @@ export EDITOR=vim
 
     #[test]
     fn test_lc_uses_track_mode_by_default() {
-        let binary = "/usr/local/bin/lean-ctx";
-        let alias_list = crate::rewrite_registry::shell_alias_list();
-        let aliases = format!(
-            r#"_lc() {{
-    '{binary}' -t "$@"
-}}
-_lc_compress() {{
-    '{binary}' -c "$@"
-}}"#
+        let output = generate_hook_posix("/usr/local/bin/lean-ctx");
+        assert!(
+            output.contains("'/usr/local/bin/lean-ctx' -t \"$@\""),
+            "lean_ctx_track must use -t (track mode)"
         );
         assert!(
-            aliases.contains("-t \"$@\""),
-            "_lc must use -t (track mode) by default"
+            output.contains("'/usr/local/bin/lean-ctx' -c \"$@\""),
+            "lean_ctx_compress must use -c (compress mode)"
+        );
+        assert!(output.contains("alias \"$_lc_cmd\"='lean_ctx_track '\"$_lc_cmd\""));
+        assert!(output.contains("alias \"$_lc_cmd\"='lean_ctx_compress '\"$_lc_cmd\""));
+    }
+
+    /// #1898: agent harnesses (Claude Code's Bash tool) snapshot the shell and
+    /// replay aliases plus only the functions whose names do not start with `_`.
+    /// Every alias target — and every function those call — must survive that.
+    #[test]
+    fn posix_hook_alias_targets_survive_underscore_function_stripping() {
+        let output = generate_hook_posix("/usr/local/bin/lean-ctx");
+        for line in output.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("alias ") {
+                let target = rest.split_once('=').map_or("", |(_, t)| t);
+                let target = target.trim_start_matches(['\'', '"']);
+                assert!(
+                    !target.starts_with('_'),
+                    "alias must not target an underscore function: {line}"
+                );
+            }
+        }
+        for kept in ["lean_ctx_track", "lean_ctx_compress", "lean-ctx-on"] {
+            let start = output
+                .find(&format!("\n{kept}() {{"))
+                .unwrap_or_else(|| panic!("{kept} must be defined"));
+            let body = &output[start..start + output[start..].find("\n}\n").unwrap()];
+            for called in ["_lc ", "_lc_is_agent", "_lean_ctx_notice", "_lc_compress "] {
+                assert!(
+                    !body.contains(called),
+                    "{kept} must not call stripped function {called}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end replay of #1898 in a real bash: source the hook, drop every
+    /// `_`-prefixed function exactly like a Claude Code shell snapshot does,
+    /// then run an aliased command. Before the fix this printed
+    /// `_lc: command not found`.
+    #[cfg(unix)]
+    #[test]
+    fn posix_hook_aliases_work_after_snapshot_style_replay() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("bash")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("lean-ctx");
+        std::fs::write(&bin, "#!/bin/sh\necho \"lean-ctx:$*\"\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hook = dir.path().join("hook.sh");
+        std::fs::write(&hook, generate_hook_posix(&bin.to_string_lossy())).unwrap();
+        let script = dir.path().join("replay.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "shopt -s expand_aliases\n\
+                 . '{hook}'\n\
+                 lean-ctx-on\n\
+                 for f in $(compgen -A function); do\n\
+                 case \"$f\" in _*) unset -f \"$f\" ;; esac\n\
+                 done\n\
+                 git status --short\n",
+                hook = hook.display()
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .env("LEAN_CTX_AGENT", "1")
+            .env_remove("LEAN_CTX_DISABLED")
+            .env_remove("LEAN_CTX_ACTIVE")
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("command not found"),
+            "aliased command broke after snapshot replay: {stderr}"
         );
         assert!(
-            aliases.contains("-c \"$@\""),
-            "_lc_compress must use -c (compress mode)"
+            stdout.contains("lean-ctx:-t git status --short"),
+            "alias must route through lean-ctx: stdout={stdout} stderr={stderr}"
         );
-        let _ = alias_list;
+    }
+
+    /// #1971: after `lean-ctx-off`, `lean-ctx-status` still said ON, because
+    /// it only checked that `LEAN_CTX_ENABLED` was set — and off sets it to 0.
+    #[cfg(unix)]
+    #[test]
+    fn posix_status_reports_off_after_lean_ctx_off() {
+        if std::process::Command::new("bash")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("hook.sh");
+        std::fs::write(&hook, generate_hook_posix("lean-ctx")).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". '{}'\n\
+                 lean-ctx-on; lean-ctx-status; echo \"on=$?\"\n\
+                 lean-ctx-off; lean-ctx-status; echo \"off=$?\"\n",
+                hook.display()
+            ))
+            .env_remove("LEAN_CTX_DISABLED")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("on=0"), "status after on: {stdout}");
+        assert!(stdout.contains("off=1"), "status after off: {stdout}");
     }
 
     #[test]

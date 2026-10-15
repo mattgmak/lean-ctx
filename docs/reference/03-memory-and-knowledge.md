@@ -66,9 +66,9 @@ Files (50): [F1 …/agents/jetbrains.rs map] [F33 …/config/setter.rs signature
 ```
 
 The `[F1 … map]` / `[F33 … signatures]` entries are **persistent file
-references**: the next read of `F1` costs ~13 tokens because the agent already
-holds its compressed shape. This is what makes "start a new chat, it already
-knows where we were" work. If it *doesn't* work, see Journey 6 →
+references**: an eligible unchanged read can return a compact reference when the
+session already holds the content. Restoring saved context depends on retained,
+authorized records and the host integration. If recovery does not work, see Journey 6 →
 `lean-ctx sessions doctor`.
 
 ### Managing saved snapshots — `lean-ctx sessions`

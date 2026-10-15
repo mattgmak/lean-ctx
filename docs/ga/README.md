@@ -1,10 +1,9 @@
 # lean-ctx — GA Documentation Pack
 
-> **Status: historical operations pack — not a GA, Cloud, team, or enterprise
-> availability claim.** Use current local Runtime documentation and `lean-ctx
-> doctor` to establish behavior. LeanCTX is **The Context SDK for AI Agents**;
-> canonical product scope and status are in
-> `docs/internal/README.md` (internal, not in this repository).
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older definitions and availability below are historical.
 
 ## Overview
 

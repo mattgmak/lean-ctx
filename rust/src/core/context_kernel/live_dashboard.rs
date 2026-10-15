@@ -153,16 +153,16 @@ fn average(total: f64, count: usize) -> f64 {
 
 #[cfg(test)]
 pub mod tests {
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     use super::{DashboardSnapshot, format_summary, snapshot, snapshot_json};
     use crate::core::context_kernel::mcp_bridge::{self, McpCallData};
     use crate::core::context_kernel::proxy_bridge::{self, ProxyRequestData};
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    // Shared with every other kernel suite: the bridges, usage normalizer and
+    // receipt chain below are process-wide.
     fn isolated_test() -> MutexGuard<'static, ()> {
-        let guard = TEST_LOCK
+        let guard = crate::core::context_kernel::kernel_config::KERNEL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         proxy_bridge::reset_state();

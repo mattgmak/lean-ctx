@@ -26,7 +26,7 @@ shows the smallest tool profile that exposes the tool (`M` minimal, `S` standard
 
 | Tool | Purpose | Key params / actions | Profile |
 |------|---------|----------------------|---------|
-| `ctx_read` | Read a file with session cache + compression; re-reads ~13 tokens when unchanged | `path`*, `mode` (full\|raw\|map\|signatures\|diff\|aggressive\|entropy\|task\|reference\|lines:N-M\|auto), `start_line`, `fresh` | M |
+| `ctx_read` | Read a file with session cache + compression; eligible unchanged reads return a compact reference | `path`*, `mode` (full\|raw\|map\|signatures\|diff\|aggressive\|entropy\|task\|reference\|lines:N-M\|auto), `start_line`, `fresh` | M |
 | `ctx_multi_read` | Read many files in one call (same modes) | `paths[]`*, `mode`, `fresh` | S |
 | `ctx_smart_read` | Auto-pick the optimal read mode for a file | `path`* | P |
 | `ctx_delta` | Incremental diff — only lines changed since last read | `path`* | S |
@@ -57,7 +57,7 @@ shows the smallest tool profile that exposes the tool (`M` minimal, `S` standard
 | `ctx_compress` | Context checkpoint for long conversations | `include_signatures` | S |
 | `ctx_compress_memory` | Compress memory/config files (CLAUDE.md, .cursorrules); backs up `.original.md` | `path`* | P |
 | `ctx_artifacts` | Context-artifact registry with BM25 search | list\|status\|index\|reindex\|search\|remove | P |
-| `ctx_index` | Build & manage the code index | status\|build\|build-full | P |
+| `ctx_index` | Build & manage the code index; explain why a file is not indexed | status\|build\|build-full\|why | P |
 
 ## 3. Session & multi-agent
 

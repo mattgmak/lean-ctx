@@ -23,6 +23,7 @@ pub(crate) fn install_grok_mcp() {
         .map_or_else(|| home.join(".grok"), std::path::PathBuf::from);
     let path = grok_home.join("config.toml");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    super::super::project_pins::migrate_extra_roots(&existing);
     let Some(updated) =
         ensure_grok_mcp_server(&existing, &resolve_binary_path(), &mcp_server_env_pairs())
     else {
@@ -52,11 +53,14 @@ fn ensure_grok_mcp_server(
     if !lean_tbl.contains_key("args") {
         lean_tbl["args"] = toml_edit::value(toml_edit::Array::new());
     }
-    let env = lean_tbl["env"].or_insert(toml_edit::table());
-    let env_tbl = env.as_table_mut()?;
-    for (key, value) in env_pairs {
-        if env_tbl.get(key).and_then(toml_edit::Item::as_str) != Some(value.as_str()) {
-            env_tbl[key] = toml_edit::value(value);
+    super::super::strip_project_scoped_env_toml(lean_tbl);
+    if !env_pairs.is_empty() {
+        let env = lean_tbl["env"].or_insert(toml_edit::table());
+        let env_tbl = env.as_table_mut()?;
+        for (key, value) in env_pairs {
+            if env_tbl.get(key).and_then(toml_edit::Item::as_str) != Some(value.as_str()) {
+                env_tbl[key] = toml_edit::value(value);
+            }
         }
     }
     let updated = doc.to_string();
@@ -68,10 +72,7 @@ mod tests {
     use super::ensure_grok_mcp_server;
 
     fn env_pairs() -> Vec<(String, String)> {
-        vec![(
-            "LEAN_CTX_PROJECT_ROOT".to_string(),
-            "/work/repo".to_string(),
-        )]
+        vec![("LEAN_CTX_QUIET".to_string(), "1".to_string())]
     }
 
     #[test]
@@ -86,9 +87,18 @@ mod tests {
             Some("/usr/local/bin/lean-ctx")
         );
         assert_eq!(
-            doc["mcp_servers"]["lean-ctx"]["env"]["LEAN_CTX_PROJECT_ROOT"].as_str(),
-            Some("/work/repo")
+            doc["mcp_servers"]["lean-ctx"]["env"]["LEAN_CTX_QUIET"].as_str(),
+            Some("1")
         );
+    }
+
+    #[test]
+    fn heals_a_global_project_pin() {
+        let input = "[mcp_servers.lean-ctx]\ncommand = \"lean-ctx\"\nargs = []\n\
+                     [mcp_servers.lean-ctx.env]\nLEAN_CTX_PROJECT_ROOT = \"/work/repo\"\n";
+        let output = ensure_grok_mcp_server(input, "lean-ctx", &[]).expect("pin must be healed");
+        assert!(!output.contains("LEAN_CTX_PROJECT_ROOT"), "{output}");
+        assert!(ensure_grok_mcp_server(&output, "lean-ctx", &[]).is_none());
     }
 
     #[test]

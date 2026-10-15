@@ -1,11 +1,15 @@
-# LeanCTX local Runtime reference
+# LeanCTX Engine reference
 
-This reference describes the local Runtime. Its public boundary is governed by
-the internal canonical entry point (`docs/internal/README.md`, internal — not in this repository) and
-Product Architecture (`docs/internal/vision/PRODUCT-ARCHITECTURE.md`, internal — not in this repository).
+**Context Gateway for AI Systems**
 
-LeanCTX is the Context SDK for existing agents. The agent, model, task logic,
-and retry policy remain the integrator's responsibility.
+**Control what your AI can see.**
+
+**Select → Control → Prove** describes the product. This reference documents the
+local LeanCTX Engine; the LeanCTX SDK exposes supported application interfaces.
+The agent, model, task logic and retry policy remain the integrator's responsibility.
+
+Start with [What is LeanCTX?](../what-is-leanctx.md), then the
+[canonical product boundary](../POSITIONING_CANONICAL.md).
 
 ## Current paths
 

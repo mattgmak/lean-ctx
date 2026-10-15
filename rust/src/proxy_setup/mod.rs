@@ -15,6 +15,14 @@ mod util;
 #[path = "tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "tests_codex_rail.rs"]
+mod tests_codex_rail;
+
+#[cfg(test)]
+#[path = "tests_codex_provider.rs"]
+mod tests_codex_provider;
+
 use std::path::Path;
 
 use crate::marked_block;
@@ -75,7 +83,12 @@ pub fn preview_proxy_cleanup(home: &Path) {
     let settings_dir = crate::core::editor_registry::claude_state_dir(home);
     let settings_path = settings_dir.join("settings.json");
     if let Ok(content) = std::fs::read_to_string(&settings_path)
-        && content.contains("ANTHROPIC_BASE_URL")
+        && let Ok(doc) = crate::core::jsonc::parse_jsonc(&content)
+        && doc
+            .get("env")
+            .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+            .and_then(|v| v.as_str())
+            .is_some_and(is_local_lean_ctx_url)
     {
         let cfg = crate::core::config::Config::load();
         if let Some(ref upstream) = cfg.proxy.anthropic_upstream {
@@ -106,6 +119,44 @@ pub fn preview_proxy_cleanup(home: &Path) {
     {
         println!("  Would remove lean-ctx from Command Code MCP (~/.commandcode/mcp.json)");
     }
+}
+
+/// Hosts whose model traffic is routed through the local lean-ctx proxy right
+/// now (read-only). Requires the proxy to be enabled; a leftover local URL with
+/// the proxy off routes nothing and is reported as not routed.
+#[must_use]
+pub fn egress_routed_hosts(home: &Path) -> Vec<&'static str> {
+    if crate::core::config::Config::load().proxy_enabled != Some(true) {
+        return Vec::new();
+    }
+    let mut routed = Vec::new();
+    let settings_path = crate::core::editor_registry::claude_state_dir(home).join("settings.json");
+    if std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|content| crate::core::jsonc::parse_jsonc(&content).ok())
+        .and_then(|doc| {
+            doc.get("env")
+                .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+                .and_then(|v| v.as_str())
+                .map(is_local_lean_ctx_url)
+        })
+        .unwrap_or(false)
+    {
+        routed.push("claude");
+    }
+    let codex_path = crate::core::home::resolve_codex_config_path()
+        .unwrap_or_else(|| home.join(".codex/config.toml"));
+    if std::fs::read_to_string(codex_path)
+        .is_ok_and(|content| codex_config_has_local_proxy_entry(&content))
+    {
+        routed.push("codex");
+    }
+    if std::fs::read_to_string(home.join(".grok/config.toml"))
+        .is_ok_and(|content| grok_config_has_local_proxy_entry(&content))
+    {
+        routed.push("grok");
+    }
+    routed
 }
 
 /// Removes stale proxy URLs from Claude Code / Codex settings when the proxy is not enabled.

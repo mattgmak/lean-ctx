@@ -25,6 +25,10 @@ mod edit_health;
 mod file_rewrite;
 mod observe;
 mod payload;
+// PowerShell-tool rewrites: PowerShell quoting, no `lean-ctx -c` wrap (#1848).
+mod powershell_rewrite;
+mod protected;
+pub(crate) use protected::handle_protected_gate;
 // Redirect decision logic (#660/#966 LOC gate) for Read/Grep/Glob.
 mod read_dedup;
 mod redirect;
@@ -32,8 +36,8 @@ mod redirect;
 // `search_rewrite` submodule (#660 LOC gate).
 mod search_rewrite;
 pub mod solution_capture;
+mod value_recap;
 mod vibe;
-pub(crate) use codex::emit_session_start_additional_context;
 pub use codex::{handle_codex_pretooluse, handle_codex_session_start};
 pub use solution_capture::handle_post_commit;
 pub use vibe::handle_vibe_pre_tool;
@@ -45,6 +49,13 @@ pub(crate) use codex::{CODEX_SHELL_RECOVERY_HINT, session_start_additional_conte
 pub use deny::handle_deny;
 pub use observe::*;
 pub use read_dedup::handle_read_dedup;
+
+/// Every tool name the `read-dedup` handler deduplicates; installers must
+/// route each of them to it (asserted by the installer tests).
+#[cfg(test)]
+pub(crate) fn read_dedup_tools() -> impl Iterator<Item = &'static str> {
+    std::iter::once("Read").chain(read_dedup::CTX_READ_TOOLS)
+}
 pub use search_rewrite::{shell_quote, shell_tokenize};
 #[cfg(test)]
 mod tests;
@@ -205,6 +216,54 @@ fn build_dual_allow_output() -> String {
     .to_string()
 }
 
+/// A deny verdict every supported host reads: Cursor's legacy keys, Copilot's
+/// top-level `permissionDecision`, and Claude Code's `hookSpecificOutput`.
+fn build_dual_deny_output(msg: &str) -> String {
+    serde_json::json!({
+        // Cursor legacy dialect.
+        "decision": "deny",
+        "reason": msg,
+        "permission": "deny",
+        "user_message": msg,
+        // GitHub Copilot CLI dialect (top-level permissionDecision).
+        "permissionDecision": "deny",
+        // Claude Code / CodeBuddy dialect.
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": msg
+        }
+    })
+    .to_string()
+}
+
+/// Claude Code (and Claude-compatible CodeBuddy) PreToolUse payloads carry
+/// `transcript_path` plus `hook_event_name: "PreToolUse"`. Gemini sends
+/// `BeforeTool`, Cursor/Copilot send no such pair.
+fn is_claude_pretooluse_payload(v: &serde_json::Value) -> bool {
+    v.get("transcript_path").is_some()
+        && v.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("PreToolUse")
+}
+
+/// The deny verdict for one concrete payload. Claude Code validates hook output
+/// strictly: a top-level `decision` other than the legacy `approve|block` makes
+/// it discard the whole object as a non-blocking error, so the verdict and its
+/// guidance never reach the model. Claude gets only `hookSpecificOutput`; every
+/// other host keeps the multi-dialect object.
+fn build_deny_output(msg: &str, payload: &serde_json::Value) -> String {
+    if is_claude_pretooluse_payload(payload) {
+        return serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": msg
+            }
+        })
+        .to_string();
+    }
+    build_dual_deny_output(msg)
+}
+
 fn build_dual_rewrite_output(tool_input: Option<&serde_json::Value>, rewritten: &str) -> String {
     let updated_input = if let Some(obj) = tool_input.and_then(|v| v.as_object()) {
         let mut m = obj.clone();
@@ -336,7 +395,12 @@ pub fn handle_copilot() {
         return;
     };
 
-    if let Some(rewritten) = file_rewrite::rewrite_candidate(&cmd, &binary) {
+    let rewritten = if powershell_rewrite::is_powershell_tool(&tool_name) {
+        powershell_rewrite::rewrite_candidate_powershell(&cmd, &binary)
+    } else {
+        file_rewrite::rewrite_candidate(&cmd, &binary)
+    };
+    if let Some(rewritten) = rewritten {
         print!(
             "{}",
             build_dual_rewrite_output(tool_args.as_ref(), &rewritten)
@@ -360,11 +424,6 @@ pub fn handle_rewrite_inline() {
 
     if let Some(rewritten) = file_rewrite::rewrite_candidate(&cmd, &binary) {
         print!("{rewritten}");
-        return;
-    }
-
-    if cmd.starts_with("lean-ctx ") || cmd.starts_with(&format!("{binary} ")) {
-        print!("{cmd}");
         return;
     }
 

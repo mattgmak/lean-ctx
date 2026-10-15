@@ -1,14 +1,9 @@
 # Wrapped Permalink Contract v1
 
-> **Status: historical research contract — not an available LeanCTX service.**
-> This document records a proposed hosted sharing and public-ranking flow. It
-> does not establish a LeanCTX Cloud account service, public leaderboard,
-> publishing endpoint, managed data path, or savings claim. LeanCTX is **The
-> Context SDK for AI Agents**; the available product is local Runtime/CLI/MCP/
-> proxy capability with local evidence and offline verification. Product scope
-> and status are governed by `docs/internal/README.md` (internal, not in this repository).
-> Do not implement or advertise these endpoints without a new explicit product
-> decision and the required privacy, security, and evidence gates.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 ## Goal
 

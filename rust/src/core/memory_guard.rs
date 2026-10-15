@@ -1,7 +1,8 @@
 //! Process-level RAM guardian with adaptive eviction and hard OOM protection.
 //!
 //! Monitors RSS via platform-specific APIs and triggers tiered cache eviction
-//! when memory usage exceeds configurable thresholds (default: 5% of system RAM).
+//! when memory usage exceeds configurable thresholds (default: 5% of system RAM,
+//! lowered to `mcp_max_rss_mb` — 512 MB — inside a stdio MCP server).
 //! At critical levels, performs aggressive eviction and signals background tasks
 //! to abort. It never exits the process — recovery is always via eviction.
 
@@ -12,8 +13,21 @@ static PEAK_RSS: AtomicU64 = AtomicU64::new(0);
 static GUARD_RUNNING: AtomicBool = AtomicBool::new(false);
 static ABORT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CURRENT_PRESSURE: AtomicU8 = AtomicU8::new(0);
+/// Absolute per-process RSS target in bytes (0 = none). The stdio MCP server
+/// sets it at startup: hosts such as the Codex app-server keep one server per
+/// loaded thread alive for days, and on a large machine the percentage target
+/// alone let each of them settle near 1 GB before any eviction ran.
+static PROCESS_RSS_CAP: AtomicU64 = AtomicU64::new(0);
 
-/// Current process RSS in bytes, or `None` if unavailable.
+/// Install an absolute RSS target for this process; the effective limit is the
+/// lower of it and the `max_ram_percent` target. `0` removes it.
+pub fn set_process_rss_cap(bytes: u64) {
+    PROCESS_RSS_CAP.store(bytes, Ordering::Relaxed);
+}
+
+/// Current process memory in bytes, or `None` if unavailable: resident set
+/// size on Linux and Windows, physical footprint on macOS (see
+/// `macos_footprint` — resident size there hides compressed pages).
 pub fn get_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -113,12 +127,14 @@ fn windows_rss_for_handle(process: windows_sys::Win32::Foundation::HANDLE) -> Op
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
 
-    let mut counters = PROCESS_MEMORY_COUNTERS::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..PROCESS_MEMORY_COUNTERS::default()
+    };
 
-    // SAFETY: `counters` has the documented size in `cb` and remains valid and
-    // writable for the duration of the call.
-    let ok = unsafe { K32GetProcessMemoryInfo(process, &mut counters, counters.cb) };
+    // SAFETY: callers pass the current-process pseudo-handle or a live handle
+    // returned by OpenProcess; `counters` is correctly sized and writable.
+    let ok = unsafe { K32GetProcessMemoryInfo(process, &raw mut counters, counters.cb) };
 
     if ok == 0 {
         None
@@ -131,11 +147,13 @@ fn windows_rss_for_handle(process: windows_sys::Win32::Foundation::HANDLE) -> Op
 fn windows_system_ram() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
-    let mut status = MEMORYSTATUSEX::default();
-    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..MEMORYSTATUSEX::default()
+    };
 
     // SAFETY: `status` has the required `dwLength` and is writable for the call.
-    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
 
     if ok == 0 {
         None
@@ -144,12 +162,44 @@ fn windows_system_ram() -> Option<u64> {
     }
 }
 
-/// Returns the RSS limit in bytes based on `max_ram_percent` config.
+/// Returns the RSS limit in bytes: the `max_ram_percent` target, lowered to
+/// the process cap when one is installed ([`set_process_rss_cap`]).
 pub fn rss_limit_bytes() -> Option<u64> {
     let sys_ram = get_system_ram_bytes()?;
     let cfg = super::config::Config::load();
     let pct = super::config::MemoryGuardConfig::effective(&cfg).max_ram_percent;
-    Some(sys_ram / 100 * u64::from(pct))
+    Some(effective_limit(
+        sys_ram / 100 * u64::from(pct),
+        PROCESS_RSS_CAP.load(Ordering::Relaxed),
+    ))
+}
+
+fn effective_limit(percent_limit: u64, cap: u64) -> u64 {
+    if cap == 0 {
+        percent_limit
+    } else {
+        percent_limit.min(cap)
+    }
+}
+
+/// Pressure tier for `rss` against the base `limit` (#790 multipliers:
+/// Soft above 1×, Medium above 1.2×, Hard above 1.5×, Critical above 2×).
+fn pressure_for(rss: u64, limit: u64) -> PressureLevel {
+    if limit == 0 {
+        return PressureLevel::Normal;
+    }
+    let ratio = rss as f64 / limit as f64;
+    if ratio > 2.0 {
+        PressureLevel::Critical
+    } else if ratio > 1.5 {
+        PressureLevel::Hard
+    } else if ratio > 1.2 {
+        PressureLevel::Medium
+    } else if ratio > 1.0 {
+        PressureLevel::Soft
+    } else {
+        PressureLevel::Normal
+    }
 }
 
 /// Computes a memory-bounded work batch from current RSS and the guardian's
@@ -275,26 +325,11 @@ impl MemorySnapshot {
 
         PEAK_RSS.fetch_max(rss, Ordering::Relaxed);
 
-        let cfg = super::config::Config::load();
-        let guard_cfg = super::config::MemoryGuardConfig::effective(&cfg);
-        let base = f64::from(guard_cfg.max_ram_percent);
-
-        // #790: tightened multipliers so ABORT fires earlier:
-        // - Critical: 2× (was 3×) — e.g. 10% config on 64 GB → 12.8 GB (was 19.2 GB)
-        // - Hard:     1.5× (was 2×) — 9.6 GB (was 12.8 GB)
-        // - Medium:   1.2× (was 1.4×)
-        // Users expect max_ram_percent to be a meaningful cap, not a 3× suggestion.
-        let level = if pct > base * 2.0 {
-            PressureLevel::Critical
-        } else if pct > base * 1.5 {
-            PressureLevel::Hard
-        } else if pct > base * 1.2 {
-            PressureLevel::Medium
-        } else if pct > base {
-            PressureLevel::Soft
-        } else {
-            PressureLevel::Normal
-        };
+        // #790: tightened multipliers so ABORT fires earlier — e.g. 10% config
+        // on 64 GB → Hard at 9.6 GB, Critical at 12.8 GB. Users expect the
+        // limit to be a meaningful cap, not a 3× suggestion. Measured against
+        // bytes so the per-process cap and the percentage share one ladder.
+        let level = pressure_for(rss, limit);
 
         Some(Self {
             rss_bytes: rss,
@@ -307,22 +342,79 @@ impl MemorySnapshot {
     }
 }
 
+/// Live heap bytes and allocator-resident bytes (`stats.allocated`,
+/// `stats.resident`), when jemalloc is the allocator. The gap between process
+/// RSS and `allocated` is what eviction cannot reach: allocator retention,
+/// code and thread stacks.
+pub fn allocator_stats() -> Option<(u64, u64)> {
+    #[cfg(all(feature = "jemalloc", not(windows), not(target_env = "musl")))]
+    {
+        tikv_jemalloc_ctl::epoch::advance().ok()?;
+        let allocated = tikv_jemalloc_ctl::stats::allocated::read().ok()?;
+        let resident = tikv_jemalloc_ctl::stats::resident::read().ok()?;
+        Some((allocated as u64, resident as u64))
+    }
+    #[cfg(not(all(feature = "jemalloc", not(windows), not(target_env = "musl"))))]
+    {
+        None
+    }
+}
+
 /// Force-purge all jemalloc arenas to return memory to the OS.
 /// Uses `MALLCTL_ARENAS_ALL` (value 4096) which is the jemalloc sentinel
 /// for "all arenas". Logs errors instead of silently swallowing them.
 pub fn jemalloc_purge() {
     #[cfg(all(feature = "jemalloc", not(windows), not(target_env = "musl")))]
-    {
-        use tikv_jemalloc_ctl::raw;
-        let purge_mib = b"arena.4096.purge\0";
-        // SAFETY: `purge_mib` is a static, NUL-terminated jemalloc MIB name and
-        // the value type (`u64`) matches the `arena.<i>.purge` ctl; `raw::write`
-        // validates the name and surfaces errors via `Result`.
-        unsafe {
-            if let Err(e) = raw::write(purge_mib, 0u64) {
-                tracing::debug!("[memory_guard] jemalloc purge failed: {e}");
-            }
-        }
+    if let Err(rc) = purge_all_arenas() {
+        tracing::warn!("[memory_guard] jemalloc purge failed: mallctl rc={rc}");
+    }
+}
+
+/// `arena.<i>.purge` is a void ctl: it must be called with no old and no new
+/// value. Writing one (as this did before #2075) fails with EPERM, which left
+/// every purge a silent no-op: measured on macOS, a dropped 900 MB parse
+/// working set stayed resident instead of falling back to ~50 MB.
+#[cfg(all(feature = "jemalloc", not(windows), not(target_env = "musl")))]
+fn purge_all_arenas() -> Result<(), i32> {
+    // SAFETY: static NUL-terminated ctl name; null old/new pointers with zero
+    // length are exactly the calling convention of a void mallctl.
+    let rc = unsafe {
+        rjem::mallctl(
+            c"arena.4096.purge".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(rc) }
+}
+
+/// jemalloc's C entry points. tikv-jemalloc-sys builds jemalloc with the
+/// `_rjem_` symbol prefix (see `_rjem_malloc_conf` in `main.rs`) and
+/// tikv-jemallocator already links it, so declaring the few symbols needed
+/// here avoids a direct dependency on the -sys crate.
+#[cfg(all(feature = "jemalloc", not(windows), not(target_env = "musl")))]
+mod rjem {
+    use std::ffi::{c_char, c_int, c_void};
+
+    unsafe extern "C" {
+        #[link_name = "_rjem_malloc"]
+        pub fn malloc(size: usize) -> *mut c_void;
+        #[link_name = "_rjem_calloc"]
+        pub fn calloc(count: usize, size: usize) -> *mut c_void;
+        #[link_name = "_rjem_realloc"]
+        pub fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
+        #[link_name = "_rjem_free"]
+        pub fn free(ptr: *mut c_void);
+        #[link_name = "_rjem_mallctl"]
+        pub fn mallctl(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> c_int;
     }
 }
 
@@ -354,12 +446,12 @@ fn publish_pressure(level: PressureLevel) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CriticalEvictionSchedule {
+enum EvictionSchedule {
     RetryAfter(u64),
     PauseFor(u64),
 }
 
-impl CriticalEvictionSchedule {
+impl EvictionSchedule {
     fn poll_secs(self) -> u64 {
         match self {
             Self::RetryAfter(secs) | Self::PauseFor(secs) => secs,
@@ -367,34 +459,34 @@ impl CriticalEvictionSchedule {
     }
 }
 
-/// Backoff state for critical eviction rounds that reclaimed no memory.
+/// Backoff state for eviction rounds (any pressure level) that reclaimed no memory.
 #[derive(Default)]
-struct CriticalEvictionBackoff {
+struct EvictionBackoff {
     consecutive_zero_progress: u32,
 }
 
-impl CriticalEvictionBackoff {
+impl EvictionBackoff {
     const BASE_POLL_SECS: u64 = 1;
     const MAX_POLL_SECS: u64 = 60;
     const PAUSE_AFTER_ZERO_PROGRESS_ROUNDS: u32 = 10;
     const PAUSE_SECS: u64 = 5 * 60;
 
-    fn record(&mut self, made_progress: bool) -> CriticalEvictionSchedule {
+    fn record(&mut self, made_progress: bool) -> EvictionSchedule {
         if made_progress {
             self.consecutive_zero_progress = 0;
-            return CriticalEvictionSchedule::RetryAfter(Self::BASE_POLL_SECS);
+            return EvictionSchedule::RetryAfter(Self::BASE_POLL_SECS);
         }
 
         self.consecutive_zero_progress = self.consecutive_zero_progress.saturating_add(1);
         if self.consecutive_zero_progress >= Self::PAUSE_AFTER_ZERO_PROGRESS_ROUNDS {
-            return CriticalEvictionSchedule::PauseFor(Self::PAUSE_SECS);
+            return EvictionSchedule::PauseFor(Self::PAUSE_SECS);
         }
 
         let exponent = self.consecutive_zero_progress.saturating_sub(2).min(6);
         let poll_secs = Self::BASE_POLL_SECS
             .saturating_mul(1u64 << exponent)
             .min(Self::MAX_POLL_SECS);
-        CriticalEvictionSchedule::RetryAfter(poll_secs)
+        EvictionSchedule::RetryAfter(poll_secs)
     }
 
     fn reset(&mut self) {
@@ -402,10 +494,44 @@ impl CriticalEvictionBackoff {
     }
 }
 
+/// When the next eviction round may run. Sampling continues every second
+/// under pressure; the gate only spaces out rounds that reclaimed nothing,
+/// and lets a rise to a higher pressure level through at once.
+#[derive(Default)]
+struct EvictionGate {
+    backoff: EvictionBackoff,
+    last: Option<(PressureLevel, std::time::Instant)>,
+}
+
+impl EvictionGate {
+    fn due(&self, level: PressureLevel, now: std::time::Instant) -> bool {
+        self.last
+            .is_none_or(|(last_level, next_at)| level > last_level || now >= next_at)
+    }
+
+    fn record(
+        &mut self,
+        level: PressureLevel,
+        made_progress: bool,
+        now: std::time::Instant,
+    ) -> EvictionSchedule {
+        if self.last.is_some_and(|(last_level, _)| level > last_level) {
+            self.backoff.reset();
+        }
+        let schedule = self.backoff.record(made_progress);
+        self.last = Some((
+            level,
+            now + std::time::Duration::from_secs(schedule.poll_secs()),
+        ));
+        schedule
+    }
+}
+
 /// Start the background memory guardian task (idempotent).
 /// Polls every 3s (normal), 1s (under pressure), or up to 15s once RSS has been
-/// stably calm (idle backoff). Critical no-progress eviction rounds back off to
-/// 60s, then pause for five minutes. The callback returns whether it reclaimed
+/// stably calm (idle backoff). Eviction rounds that reclaim nothing back off to
+/// 60s, then pause for five minutes, at every pressure level; pressure logs
+/// repeat at most once a minute per level. The callback returns whether it reclaimed
 /// memory so the guard can distinguish a real retry from an empty-cache loop.
 pub fn start_guard(eviction_callback: Arc<dyn Fn(PressureLevel) -> bool + Send + Sync>) {
     // The guardian is a long-lived background monitor for the running
@@ -439,77 +565,90 @@ pub fn start_guard(eviction_callback: Arc<dyn Fn(PressureLevel) -> bool + Send +
             const IDLE_POLL_SECS: u64 = 15;
             let mut poll_secs = 3u64;
             let mut calm_ticks = 0u64;
-            let mut critical_backoff = CriticalEvictionBackoff::default();
+            let mut gate = EvictionGate::default();
 
-            // #790: immediate first sample — close the 3s blind window so
-            // builders that start right after start_guard() see real pressure.
-            if let Some(snap) = MemorySnapshot::capture() {
-                publish_pressure(snap.pressure_level);
-                if snap.pressure_level >= PressureLevel::Soft {
-                    let made_progress = eviction_callback(snap.pressure_level);
-                    if snap.pressure_level == PressureLevel::Critical {
-                        poll_secs = critical_backoff.record(made_progress).poll_secs();
-                    }
-                }
-            }
+            // Pressure logging: on every level change, then at most once per
+            // LOG_EVERY while the level holds — a process whose baseline sits
+            // above a small cap must not write a line per second for hours.
+            const LOG_EVERY: std::time::Duration = std::time::Duration::from_mins(1);
+            let mut logged: Option<(PressureLevel, std::time::Instant)> = None;
 
+            // #790: the first sample runs immediately — close the 3s blind
+            // window so builders that start right after start_guard() see
+            // real pressure.
+            let mut first = true;
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(poll_secs));
+                if !first {
+                    std::thread::sleep(std::time::Duration::from_secs(poll_secs));
+                }
+                first = false;
                 let Some(snap) = MemorySnapshot::capture() else {
                     continue;
                 };
 
                 publish_pressure(snap.pressure_level);
 
-                if snap.pressure_level == PressureLevel::Critical {
-                    tracing::error!(
-                        "[memory_guard] CRITICAL: RSS={:.0}MB ({:.1}% of {:.0}GB) — \
-                         aggressive eviction to prevent OS OOM kill",
-                        snap.rss_bytes as f64 / 1_048_576.0,
-                        snap.rss_percent,
-                        snap.system_ram_bytes as f64 / 1_073_741_824.0,
-                    );
-                    let made_progress = (eviction_callback)(PressureLevel::Critical);
-                    jemalloc_purge();
-
-                    let schedule = critical_backoff.record(made_progress);
-                    poll_secs = schedule.poll_secs();
-                    if let CriticalEvictionSchedule::PauseFor(secs) = schedule {
-                        tracing::warn!(
-                            "[memory_guard] eviction made no progress for {} critical rounds; \
-                             pausing eviction for {secs}s",
-                            critical_backoff.consecutive_zero_progress,
-                        );
-                    }
-                    calm_ticks = 0;
-                    continue;
-                }
-
-                critical_backoff.reset();
-
-                if snap.pressure_level >= PressureLevel::Soft {
-                    poll_secs = 1;
-                    calm_ticks = 0;
-                    tracing::warn!(
-                        "[memory_guard] pressure={:?} RSS={:.0}MB limit={:.0}MB ({:.1}% of {:.0}GB)",
-                        snap.pressure_level,
-                        snap.rss_bytes as f64 / 1_048_576.0,
-                        snap.rss_limit_bytes as f64 / 1_048_576.0,
-                        snap.rss_percent,
-                        snap.system_ram_bytes as f64 / 1_073_741_824.0,
-                    );
-                    (eviction_callback)(snap.pressure_level);
-
-                    if snap.pressure_level >= PressureLevel::Hard {
-                        jemalloc_purge();
-                    }
-                } else {
+                if snap.pressure_level < PressureLevel::Soft {
+                    gate = EvictionGate::default();
+                    logged = None;
                     calm_ticks = calm_ticks.saturating_add(1);
                     poll_secs = if calm_ticks >= CALM_TICKS_BEFORE_BACKOFF {
                         IDLE_POLL_SECS
                     } else {
                         3
                     };
+                    continue;
+                }
+                calm_ticks = 0;
+                // Under pressure the guard samples every second, so
+                // `publish_pressure` (and with it build aborts) never lags;
+                // only eviction attempts follow the gate's backoff.
+                poll_secs = 1;
+
+                if logged.is_none_or(|(level, at)| {
+                    level != snap.pressure_level || at.elapsed() >= LOG_EVERY
+                }) {
+                    logged = Some((snap.pressure_level, std::time::Instant::now()));
+                    let heap = allocator_stats()
+                        .map(|(allocated, _)| format!(" heap={}MB", allocated >> 20))
+                        .unwrap_or_default();
+                    let line = format!(
+                        "[memory_guard] pressure={:?} RSS={:.0}MB{heap} limit={:.0}MB ({:.1}% of {:.0}GB)",
+                        snap.pressure_level,
+                        snap.rss_bytes as f64 / 1_048_576.0,
+                        snap.rss_limit_bytes as f64 / 1_048_576.0,
+                        snap.rss_percent,
+                        snap.system_ram_bytes as f64 / 1_073_741_824.0,
+                    );
+                    if snap.pressure_level == PressureLevel::Critical {
+                        tracing::error!("{line} — aggressive eviction to prevent OS OOM kill");
+                    } else {
+                        tracing::warn!("{line}");
+                    }
+                }
+
+                let now = std::time::Instant::now();
+                if !gate.due(snap.pressure_level, now) {
+                    continue;
+                }
+                let made_progress = (eviction_callback)(snap.pressure_level);
+                if snap.pressure_level >= PressureLevel::Hard {
+                    jemalloc_purge();
+                    release_system_heap();
+                }
+
+                // Rounds that reclaim nothing back off (and finally pause) at
+                // every level: what is left above the limit is not evictable.
+                // An escalation to a higher level is due at once regardless.
+                if let EvictionSchedule::PauseFor(secs) =
+                    gate.record(snap.pressure_level, made_progress, now)
+                {
+                    tracing::warn!(
+                        "[memory_guard] eviction made no progress for {} rounds at {:?}; \
+                         pausing eviction for {secs}s unless pressure rises",
+                        gate.backoff.consecutive_zero_progress,
+                        snap.pressure_level,
+                    );
                 }
             }
         })
@@ -519,7 +658,51 @@ pub fn start_guard(eviction_callback: Arc<dyn Fn(PressureLevel) -> bool + Send +
 /// Force immediate purge of all caches and jemalloc arenas.
 pub fn force_purge() {
     jemalloc_purge();
+    release_system_heap();
     tracing::info!("[memory_guard] force_purge completed");
+}
+
+/// Route tree-sitter's C allocations (parse trees, parser stacks, query
+/// cursors) through jemalloc, whose arenas [`jemalloc_purge`] returns to the
+/// OS. The platform malloc keeps them instead: measured on macOS, freed
+/// parser-sized blocks stayed in the footprint and `malloc_zone_pressure_relief`
+/// released nothing, so a daemon that parses every file of every root grew
+/// with each new root (#2075).
+///
+/// Must run once at process start, before the first tree-sitter object
+/// exists: a block allocated by one allocator must never be freed by the other.
+pub fn route_tree_sitter_to_jemalloc() {
+    #[cfg(all(
+        feature = "jemalloc",
+        feature = "tree-sitter",
+        not(windows),
+        not(target_env = "musl")
+    ))]
+    // SAFETY: called first thing in `main`, before any thread or tree-sitter
+    // object exists, so no allocation can cross allocators. The jemalloc entry
+    // points have exactly the C `malloc` family's signatures and semantics.
+    unsafe {
+        tree_sitter::set_allocator(
+            Some(rjem::malloc),
+            Some(rjem::calloc),
+            Some(rjem::realloc),
+            Some(rjem::free),
+        );
+    }
+}
+
+/// Return glibc's free pages to the OS. C dependencies other than tree-sitter
+/// (SQLite, regex engines) still allocate through the platform malloc, whose
+/// per-thread arenas otherwise keep every page an index build touched.
+/// macOS has no equivalent: `malloc_zone_pressure_relief` released nothing
+/// in measurement, which is why tree-sitter is routed to jemalloc instead.
+pub fn release_system_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` only walks glibc's own arenas and releases pages
+    // that hold no live allocation; it is thread-safe.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 // --- Platform-specific implementations ---
@@ -555,8 +738,37 @@ fn linux_memtotal() -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(deprecated, clippy::borrow_as_ptr, clippy::ptr_as_ptr)]
 fn macos_rss() -> Option<u64> {
+    macos_footprint(std::process::id()).or_else(macos_resident_size)
+}
+
+/// Physical footprint (`ri_phys_footprint`): the figure Activity Monitor and
+/// the kernel's memory-pressure (jetsam) accounting use. Unlike
+/// `resident_size` it keeps counting pages the memory compressor squeezed out
+/// of RAM, so a long-idle process cannot hide a large heap from the guardian —
+/// measured: an idle MCP server at 40 MB resident still had a ~180 MB heap.
+/// `proc_pid_rusage` is public libproc API and works for any same-user pid.
+#[cfg(target_os = "macos")]
+fn macos_footprint(pid: u32) -> Option<u64> {
+    // SAFETY: `rusage_info_v2` is a plain C struct for which all-zero bytes
+    // are a valid value.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: `info` is a live, correctly sized `rusage_info_v2` for the
+    // requested `RUSAGE_INFO_V2` flavour; libproc writes at most that struct.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            std::ptr::from_mut(&mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    (rc == 0).then_some(info.ri_phys_footprint)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated, clippy::borrow_as_ptr, clippy::ptr_as_ptr)]
+fn macos_resident_size() -> Option<u64> {
     use std::mem;
     // SAFETY: `mach_task_basic_info_data_t` is a plain C struct for which an
     // all-zero bit pattern is a valid initial value.
@@ -583,8 +795,10 @@ fn macos_rss() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn macos_rss_for_pid(pid: u32) -> Option<u64> {
-    // Use `ps -o rss= -p <pid>` as a portable fallback.
-    // `task_for_pid` requires root/entitlements, `proc_pid_rusage` is private API.
+    if let Some(footprint) = macos_footprint(pid) {
+        return Some(footprint);
+    }
+    // Fallback: `ps -o rss= -p <pid>` (`task_for_pid` needs entitlements).
     let output = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
@@ -621,6 +835,31 @@ fn macos_memsize() -> Option<u64> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    /// #1899: jemalloc reads the conf as a C string and rejects
+    /// `background_thread` wherever it lacks pthread support.
+    #[cfg(all(feature = "jemalloc", not(windows), not(target_env = "musl")))]
+    #[test]
+    fn jemalloc_conf_is_c_string_with_platform_safe_options() {
+        let conf = crate::JEMALLOC_CONF;
+        assert_eq!(conf.last(), Some(&0), "must be NUL-terminated");
+        let body = std::str::from_utf8(&conf[..conf.len() - 1]).unwrap();
+        assert!(!body.contains('\0'), "no interior NUL");
+        assert!(body.contains("dirty_decay_ms:1000"));
+        assert_eq!(
+            body.contains("background_thread"),
+            cfg!(target_os = "linux"),
+            "background_thread is only supported on Linux: {body}"
+        );
+    }
+
+    /// #2075: the purge ctl is void; passing a value made it fail with EPERM,
+    /// so no purge ever returned a page to the OS.
+    #[cfg(all(feature = "jemalloc", not(windows), not(target_env = "musl")))]
+    #[test]
+    fn jemalloc_purge_is_accepted_by_the_allocator() {
+        assert_eq!(purge_all_arenas(), Ok(()));
+    }
 
     #[test]
     fn rss_returns_some_on_supported_os() {
@@ -674,6 +913,27 @@ pub mod tests {
     }
 
     #[test]
+    fn process_cap_lowers_but_never_raises_the_percent_limit() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(effective_limit(3200 * MB, 0), 3200 * MB);
+        assert_eq!(effective_limit(3200 * MB, 512 * MB), 512 * MB);
+        assert_eq!(effective_limit(256 * MB, 512 * MB), 256 * MB);
+    }
+
+    #[test]
+    fn pressure_ladder_against_a_512mb_cap() {
+        const MB: u64 = 1024 * 1024;
+        let limit = 512 * MB;
+        assert_eq!(pressure_for(500 * MB, limit), PressureLevel::Normal);
+        assert_eq!(pressure_for(520 * MB, limit), PressureLevel::Soft);
+        assert_eq!(pressure_for(650 * MB, limit), PressureLevel::Medium);
+        assert_eq!(pressure_for(800 * MB, limit), PressureLevel::Hard);
+        // The ~1 GB Codex instances land in Critical → emergency drop.
+        assert_eq!(pressure_for(1100 * MB, limit), PressureLevel::Critical);
+        assert_eq!(pressure_for(u64::MAX, 0), PressureLevel::Normal);
+    }
+
+    #[test]
     fn hard_pressure_requests_abort_immediately() {
         assert!(!pressure_requests_abort(PressureLevel::Normal));
         assert!(!pressure_requests_abort(PressureLevel::Soft));
@@ -683,42 +943,61 @@ pub mod tests {
     }
 
     #[test]
-    fn critical_zero_progress_backoff_doubles_then_pauses_and_resets() {
-        let mut backoff = CriticalEvictionBackoff::default();
+    fn eviction_gate_spaces_fruitless_rounds_but_lets_escalation_through() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let mut gate = EvictionGate::default();
+        assert!(gate.due(PressureLevel::Soft, start));
 
+        // Ten fruitless Soft rounds: 1,1,2,4,…,60 s apart, then a 5 min pause.
+        let mut now = start;
+        let mut paused_from = start;
+        let mut schedule = EvictionSchedule::RetryAfter(0);
+        for _ in 0..10 {
+            assert!(gate.due(PressureLevel::Soft, now));
+            paused_from = now;
+            schedule = gate.record(PressureLevel::Soft, false, now);
+            now += std::time::Duration::from_secs(schedule.poll_secs());
+        }
+        assert_eq!(schedule, EvictionSchedule::PauseFor(5 * 60));
+        assert!(!gate.due(
+            PressureLevel::Soft,
+            paused_from + std::time::Duration::from_secs(1)
+        ));
+        assert!(gate.due(
+            PressureLevel::Medium,
+            paused_from + std::time::Duration::from_secs(1)
+        ));
+
+        // A rise to Critical during the pause is evicted at once, with a fresh backoff.
+        assert!(gate.due(
+            PressureLevel::Critical,
+            paused_from + std::time::Duration::from_secs(1)
+        ));
         assert_eq!(
-            backoff.record(false),
-            CriticalEvictionSchedule::RetryAfter(1)
+            gate.record(PressureLevel::Critical, true, at(1000)),
+            EvictionSchedule::RetryAfter(1)
         );
-        assert_eq!(
-            backoff.record(false),
-            CriticalEvictionSchedule::RetryAfter(1)
-        );
-        assert_eq!(
-            backoff.record(false),
-            CriticalEvictionSchedule::RetryAfter(2)
-        );
-        assert_eq!(
-            backoff.record(false),
-            CriticalEvictionSchedule::RetryAfter(4)
-        );
+        assert!(!gate.due(PressureLevel::Critical, at(1000)));
+        assert!(gate.due(PressureLevel::Critical, at(1001)));
+    }
+
+    #[test]
+    fn critical_zero_progress_backoff_doubles_then_pauses_and_resets() {
+        let mut backoff = EvictionBackoff::default();
+
+        assert_eq!(backoff.record(false), EvictionSchedule::RetryAfter(1));
+        assert_eq!(backoff.record(false), EvictionSchedule::RetryAfter(1));
+        assert_eq!(backoff.record(false), EvictionSchedule::RetryAfter(2));
+        assert_eq!(backoff.record(false), EvictionSchedule::RetryAfter(4));
 
         for _ in 0..4 {
             backoff.record(false);
         }
-        assert_eq!(
-            backoff.record(false),
-            CriticalEvictionSchedule::RetryAfter(60)
-        );
-        assert_eq!(
-            backoff.record(false),
-            CriticalEvictionSchedule::PauseFor(5 * 60)
-        );
+        assert_eq!(backoff.record(false), EvictionSchedule::RetryAfter(60));
+        assert_eq!(backoff.record(false), EvictionSchedule::PauseFor(5 * 60));
 
-        assert_eq!(
-            backoff.record(true),
-            CriticalEvictionSchedule::RetryAfter(1)
-        );
+        assert_eq!(backoff.record(true), EvictionSchedule::RetryAfter(1));
         assert_eq!(backoff.consecutive_zero_progress, 0);
     }
 

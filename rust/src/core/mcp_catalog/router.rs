@@ -81,6 +81,7 @@ fn entry_to_chunk(e: &CatalogEntry) -> ContentChunk {
         params = e.params,
     );
     ContentChunk {
+        origin: None,
         file_path: e.namespaced.clone(),
         symbol_name: e.tool.clone(),
         kind: crate::core::bm25_index::ChunkKind::Other,
@@ -126,7 +127,7 @@ mod tests {
     fn ranks_relevant_tool_first() {
         let cat = sample();
         let top = shortlist(&cat, "commit message to git", 3);
-        assert!(!top.is_empty());
+        assert!(!top.is_empty(), "`top` is empty");
         assert_eq!(top[0].entry.namespaced, "git::commit");
         assert!(top.len() <= 3);
     }
@@ -154,8 +155,14 @@ mod tests {
     #[test]
     fn empty_catalog_or_zero_n_is_empty() {
         let empty = Catalog::default();
-        assert!(shortlist(&empty, "anything", 5).is_empty());
-        assert!(shortlist(&sample(), "anything", 0).is_empty());
+        {
+            let found = &shortlist(&empty, "anything", 5);
+            assert!(found.is_empty(), "{found:?}");
+        }
+        {
+            let found = &shortlist(&sample(), "anything", 0);
+            assert!(found.is_empty(), "{found:?}");
+        }
     }
 
     #[test]

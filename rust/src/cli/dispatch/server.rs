@@ -8,12 +8,24 @@ use anyhow::Result;
 pub(super) fn run_mcp_server() -> Result<()> {
     use rmcp::ServiceExt;
 
+    // Host-only startup configuration. The MCP stream cannot supply authority.
+    let receipt_host = crate::server::native_receipts::load_configured_host_authority()
+        .map_err(anyhow::Error::msg)?;
+
     // Time-to-initialize is the metric that decides whether a client's
     // start-on-demand first tool call races us (GH #669) — measured from
     // process entry to the completed MCP initialize handshake.
     let started_at = std::time::Instant::now();
 
     crate::core::runtime_flags::enable_mcp_server();
+
+    // Per-process RSS target, installed before the server starts the memory
+    // guardian. Long-lived hosts keep many of these servers alive at once.
+    crate::core::memory_guard::set_process_rss_cap(
+        crate::core::config::Config::load()
+            .mcp_max_rss_mb_effective()
+            .saturating_mul(1024 * 1024),
+    );
 
     crate::core::startup_guard::crash_loop_backoff(crate::core::startup_guard::MCP_PROCESS_NAME);
 
@@ -74,7 +86,8 @@ pub(super) fn run_mcp_server() -> Result<()> {
         .enable_all()
         .build()?;
 
-    let server = tools::create_server();
+    let mut server = tools::create_server();
+    server.native_receipt_authority = receipt_host;
     drop(startup_lock);
 
     let result = rt.block_on(async {
@@ -108,6 +121,10 @@ pub(super) fn run_mcp_server() -> Result<()> {
             cleanup_orphan_mcp_processes();
             spawn_proxy_if_needed();
             crate::cli::wrapped_publish::maybe_auto_publish_background();
+            // GH #2006: keep the session store bounded (daily, off the handshake).
+            if let Some(report) = crate::core::session::housekeeping::run_daily() {
+                tracing::debug!(?report, "session housekeeping");
+            }
         });
 
         let server_handle = server.clone();
@@ -166,6 +183,11 @@ pub(super) fn run_mcp_server() -> Result<()> {
         // the client timeouts it was meant to prevent. True crash loops die
         // before this line, so their detection is unaffected.
         core::startup_guard::reset_crash_loop(core::startup_guard::MCP_PROCESS_NAME);
+        core::telemetry_features::record_mcp_session_start();
+        // Hosts that keep stdin open and outlive the thread (Codex app-server)
+        // trigger neither EOF nor the parent watchdog: release memory when
+        // idle, and exit when the operator opted in.
+        crate::server::mcp_idle::spawn(server_handle.clone());
         match service.waiting().await {
             Ok(reason) => {
                 tracing::info!("MCP server stopped: {reason:?}");
@@ -182,6 +204,13 @@ pub(super) fn run_mcp_server() -> Result<()> {
                 }
             }
         }
+        // Persist calls since the last periodic fold, then flush them so the
+        // session's usage reaches the server today (bounded network wait).
+        let _ = tokio::task::spawn_blocking(|| {
+            core::telemetry_features::record_mcp_session_end();
+            crate::cloud_sync::send_telemetry(core::telemetry_aggregate::SendTrigger::Exit)
+        })
+        .await;
 
         server_handle.shutdown().await;
 
@@ -351,6 +380,10 @@ fn spawn_parent_watchdog() {
                         // Same flush set as the clean shutdown path (#550) — the
                         // hand-rolled copy here used to miss the predictor + feedback.
                         core::tool_lifecycle::flush_all();
+                        core::telemetry_features::record_mcp_session_end();
+                        crate::cloud_sync::send_telemetry(
+                            core::telemetry_aggregate::SendTrigger::Exit,
+                        );
                         std::process::exit(0);
                     }
                 }

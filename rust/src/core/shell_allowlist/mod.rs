@@ -12,6 +12,8 @@ mod enforcement;
 mod heredoc;
 mod mode;
 mod powershell;
+mod ps_statements;
+mod self_config;
 mod substitution;
 mod tokenizer;
 
@@ -50,6 +52,16 @@ pub use tokenizer::*;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_conditionals;
+#[cfg(test)]
+mod tests_heredoc_quotes;
+#[cfg(test)]
 mod tests_multiword;
 #[cfg(test)]
+mod tests_pipe_target;
+#[cfg(test)]
+mod tests_ps1930;
+#[cfg(test)]
 mod tests_tokenizer;
+#[cfg(test)]
+mod tests_warn_only;

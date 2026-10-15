@@ -1,8 +1,9 @@
 # LeanCTX comparison notes
 
-> **Status: historical comparison notes — not canonical product or performance
-> claims.** LeanCTX is **The Context SDK for AI Agents**. Current scope and
-> status are governed by `docs/internal/README.md` (internal, not in this repository).
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 These notes preserve the decision questions behind earlier comparisons. They do
 not assert current feature counts, percentage reductions, provider coverage,

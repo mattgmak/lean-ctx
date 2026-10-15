@@ -119,6 +119,28 @@ pub(crate) enum ReadMode {
     Density(f64),
 }
 
+/// One spelling per [`ReadMode`] variant family — what the docs count as
+/// "read modes" (#1896). `mode_families_cover_every_variant` keeps it exact.
+#[cfg(test)]
+pub(crate) const MODE_FAMILIES: &[&str] = &[
+    "full",
+    "full-compact",
+    "anchored",
+    "raw",
+    "signatures",
+    "map",
+    "aggressive",
+    "entropy",
+    "cognitive",
+    "mdl",
+    "task",
+    "reference",
+    "auto",
+    "diff",
+    "lines:5-10",
+    "density:0.40",
+];
+
 /// Error returned when a string is not a recognised [`ReadMode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParseModeError {
@@ -256,6 +278,21 @@ impl FromStr for ReadMode {
                     } else {
                         ReadMode::Lines(parse_line_range(payload, other)?)
                     }
+                } else if let Some(count) = other.trim().strip_prefix('-')
+                    && count.chars().all(|c| c.is_ascii_digit())
+                    && !count.is_empty()
+                {
+                    // #1813: the schema documents a bare `-N` tail form, but only
+                    // the `lines:-N` spelling was implemented. A bare `-3` fell
+                    // through to `Unknown` and was answered with the *head* of
+                    // the file — the caller read the wrong end, and on a long
+                    // file truncation hid that the tail never arrived. Honour
+                    // the documented spelling instead of removing it: `tail -N`
+                    // is what a caller reaches for, and `-N` is how they write it.
+                    ReadMode::LinesTail(
+                        parse_tail_count(count)
+                            .ok_or_else(|| ParseModeError::Malformed(other.to_string()))?,
+                    )
                 } else if let Some(payload) = other.strip_prefix("anchored:") {
                     ReadMode::Anchored(Some(parse_line_range(payload, other)?))
                 } else if let Some(payload) = other.strip_prefix("density:") {
@@ -270,6 +307,89 @@ impl FromStr for ReadMode {
             }
         })
     }
+}
+
+/// Rewrite the documented bare tail spelling `-N` to its canonical `lines:-N`
+/// form (#1813).
+///
+/// The schema has always advertised `-N=tail`, but only `lines:-N` was ever
+/// implemented. A bare `-3` therefore failed to parse as a mode and was
+/// answered with the *head* of the file, with no header and no warning — the
+/// caller read the wrong end, and on a long file the token cap hid that the
+/// tail had never been delivered. Silently returning the opposite end is the
+/// worst of the available answers, so the documented spelling is honoured
+/// rather than removed: `tail -N` is what a caller reaches for, and `-N` is how
+/// they write it.
+///
+/// This lives beside [`ReadMode`] because spelling is what that type owns, and
+/// because both entry points — the MCP handler and `lean-ctx read` — must agree.
+/// Canonicalizing to one internal form also avoids teaching a second spelling
+/// to the render path and cache key, which branch on `starts_with("lines:")` in
+/// several places each.
+///
+/// Only a pure `-<digits>` payload is rewritten. Anything else (`-N-M`, `-x`, a
+/// bare `-`) is left alone so it still reaches the normal unknown-mode warning
+/// instead of being silently reinterpreted — which is the failure this exists
+/// to remove.
+#[must_use]
+///
+/// A mode that is still invalid after that gets one more chance: an
+/// unambiguous misspelling of a valid mode is repaired by
+/// [`repair_mode_spelling`] (`lines:72:92`, `Full`).
+pub(crate) fn canonicalize_tail_mode(mode: &str) -> Option<String> {
+    let trimmed = mode.trim();
+    canonical_bare_window(trimmed).or_else(|| {
+        trimmed
+            .parse::<ReadMode>()
+            .is_err()
+            .then(|| repair_mode_spelling(trimmed))
+            .flatten()
+    })
+}
+
+/// The `lines:` form of a bare window spelling (`-N`, `5,10-20`).
+fn canonical_bare_window(trimmed: &str) -> Option<String> {
+    // GH #2000: the schema documents the bare comma multi-select (`5,10-20`)
+    // next to `-N`, and it had the same failure: no `lines:` prefix, so it
+    // parsed as an unknown mode and the whole file came back unmarked. Only a
+    // payload `parse_line_multi` accepts is rewritten, so garbage still reaches
+    // the unknown-mode path.
+    if trimmed.contains(',') {
+        return parse_line_multi(trimmed)
+            .ok()
+            .map(|payload| format!("lines:{payload}"));
+    }
+    let count = trimmed.strip_prefix('-')?;
+    (!count.is_empty() && count.chars().all(|c| c.is_ascii_digit()))
+        .then(|| format!("lines:-{count}"))
+}
+
+/// Unambiguous misspellings of a valid mode: a capitalised keyword (`Full`),
+/// a range written with another separator (`lines:72:92`, `lines:72..92`,
+/// `lines:72–92`) or a prefix joined by a space or `=` (`lines 72-92`). Only a
+/// repair that then parses is returned, so anything genuinely unclear still
+/// reaches the actionable invalid-mode error (#1209).
+fn repair_mode_spelling(mode: &str) -> Option<String> {
+    let lower = mode.to_ascii_lowercase();
+    if lower != mode && lower.parse::<ReadMode>().is_ok() {
+        return Some(lower);
+    }
+    for prefix in ["lines", "anchored"] {
+        let Some(rest) = lower.strip_prefix(prefix) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches([':', '=', ' ']);
+        let mut payload = rest.trim().to_string();
+        for separator in ["..", "\u{2013}", "\u{2014}", " to ", ":"] {
+            payload = payload.replace(separator, "-");
+        }
+        payload.retain(|c| !c.is_whitespace());
+        let candidate = format!("{prefix}:{payload}");
+        if candidate != mode && candidate.parse::<ReadMode>().is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 impl fmt::Display for ReadMode {
@@ -385,6 +505,29 @@ impl ReadMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unambiguous_mode_misspellings_are_repaired() {
+        for (input, expected) in [
+            ("lines:72:92", "lines:72-92"),
+            ("lines:72..92", "lines:72-92"),
+            ("lines:72\u{2013}92", "lines:72-92"),
+            ("lines 72-92", "lines:72-92"),
+            ("lines=10-20", "lines:10-20"),
+            ("anchored:5:9", "anchored:5-9"),
+            ("Full", "full"),
+            ("MAP", "map"),
+        ] {
+            assert_eq!(
+                canonicalize_tail_mode(input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+        for untouched in ["full", "lines:5-10", "lines:-3", "nonsense", "lines:abc"] {
+            assert_eq!(canonicalize_tail_mode(untouched), None, "{untouched}");
+        }
+    }
 
     /// Every canonical mode string the handler/`render.rs` produce or accept.
     const CANONICAL: &[&str] = &[

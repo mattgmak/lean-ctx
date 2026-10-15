@@ -586,6 +586,7 @@ mod tests {
 
     #[test]
     fn compatibility_warning_when_version_too_low() {
+        let _isolated = crate::core::data_dir::isolated_data_dir();
         let mut manifest = test_manifest(vec![PackageLayer::Knowledge]);
         manifest.compatibility.min_lean_ctx_version = Some("99.0.0".into());
 
@@ -611,6 +612,7 @@ mod tests {
 
     #[test]
     fn dependency_warning_for_required_deps() {
+        let _isolated = crate::core::data_dir::isolated_data_dir();
         let mut manifest = test_manifest(vec![PackageLayer::Knowledge]);
         manifest.dependencies.push(PackageDependency {
             name: "missing-pkg".into(),
@@ -640,6 +642,7 @@ mod tests {
 
     #[test]
     fn optional_dependency_no_warning() {
+        let _isolated = crate::core::data_dir::isolated_data_dir();
         let mut manifest = test_manifest(vec![PackageLayer::Knowledge]);
         manifest.dependencies.push(PackageDependency {
             name: "optional-pkg".into(),
@@ -695,6 +698,7 @@ mod tests {
 
     #[test]
     fn v2_graph_import_creates_local_graph() {
+        let _isolated = crate::core::data_dir::isolated_data_dir();
         use crate::core::context_package::graph_model::{ContextEdge, ContextGraph, ContextNode};
 
         let mut graph = ContextGraph::new();
@@ -748,8 +752,11 @@ mod tests {
 
     #[test]
     fn v2_graph_import_merges_with_existing() {
+        let _isolated = crate::core::data_dir::isolated_data_dir();
         use crate::core::context_package::graph_model::{ContextGraph, ContextNode};
 
+        // Both imports must resolve the same data directory while other tests mutate env.
+        let _env = crate::core::data_dir::test_env_lock();
         let mut first_graph = ContextGraph::new();
         first_graph.add_node(ContextNode::fact("shared", "original", "cat"));
 
@@ -763,6 +770,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let r1 = load_package(&manifest, &first_content, dir.path().to_str().unwrap()).unwrap();
+        assert!(r1.warnings.is_empty(), "{:?}", r1.warnings);
         assert_eq!(r1.v2_nodes_added, 1);
 
         let mut second_graph = ContextGraph::new();
@@ -777,6 +785,7 @@ mod tests {
         };
 
         let r2 = load_package(&manifest, &second_content, dir.path().to_str().unwrap()).unwrap();
+        assert!(r2.warnings.is_empty(), "{:?}", r2.warnings);
         assert_eq!(r2.v2_nodes_added, 1);
         assert_eq!(r2.v2_nodes_updated, 1);
     }

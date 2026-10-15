@@ -173,9 +173,112 @@ pub(super) fn resolve_raw_alias(arg_raw: bool, mode_arg: Option<String>) -> Opti
     }
 }
 
+/// Rewrite the documented bare tail spelling `-N` to `lines:-N` (#1813).
+/// Thin wrapper over the shared rule in [`crate::tools::ctx_read::mode`] so the
+/// MCP handler and `lean-ctx read` cannot drift apart on spelling.
+pub(super) fn canonicalize_tail_mode(mode_arg: Option<String>) -> Option<String> {
+    let mode = mode_arg?;
+    Some(crate::tools::ctx_read::canonicalize_tail_mode(&mode).unwrap_or(mode))
+}
+
+/// The explicit `mode` a `ctx_read` call asked for, after both spelling rules.
+///
+/// #1965: the order matters. The tail spelling is canonicalized *before* the
+/// raw alias looks at the mode, so `mode="-3", raw=true` keeps its window like
+/// `lines:-3` does (#1490). The other way round, raw saw a bare `-3`, did not
+/// recognise it as a window, and replaced it with the whole file — silently.
+pub(in crate::tools::registered) fn resolve_explicit_mode(
+    arg_raw: bool,
+    mode_arg: Option<String>,
+) -> Option<String> {
+    resolve_raw_alias(arg_raw, canonicalize_tail_mode(mode_arg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1813: the schema documents `-N=tail`; only `lines:-N` was implemented,
+    // so a bare `-3` was answered with the head of the file, silently.
+    #[test]
+    fn bare_tail_mode_canonicalizes_to_lines_form() {
+        for (input, expected) in [
+            ("-3", "lines:-3"),
+            ("-1", "lines:-1"),
+            ("-250", "lines:-250"),
+        ] {
+            assert_eq!(
+                canonicalize_tail_mode(Some(input.to_string())),
+                Some(expected.to_string()),
+                "{input} is the documented tail spelling"
+            );
+        }
+    }
+
+    // GH #2000: the schema documents `5,10-20=multi` without a prefix; the bare
+    // form fell through to an unknown mode and returned the whole file.
+    #[test]
+    fn bare_multi_select_canonicalizes_to_lines_form() {
+        for (input, expected) in [
+            ("3,7", "lines:3,7"),
+            ("3,7-9", "lines:3,7-9"),
+            ("105,125,784-835", "lines:105,125,784-835"),
+            ("5, 10-20", "lines:5, 10-20"),
+            ("1-3,-5", "lines:1-3,-5"),
+        ] {
+            assert_eq!(
+                canonicalize_tail_mode(Some(input.to_string())),
+                Some(expected.to_string()),
+                "{input} is the documented multi-select spelling"
+            );
+        }
+        // The canonical result must parse as the multi-select it names.
+        let mode: crate::tools::ctx_read::ReadMode = "lines:3,7-9".parse().unwrap();
+        assert_eq!(mode.to_string(), "lines:3,7-9");
+    }
+
+    #[test]
+    fn comma_shapes_that_are_not_line_selections_are_left_alone() {
+        for mode in ["lines:3,7", "3,x", ",", "3,,7", "full,signatures", "3-,7"] {
+            assert_eq!(
+                canonicalize_tail_mode(Some(mode.to_string())),
+                Some(mode.to_string()),
+                "{mode} must not be reinterpreted as a line selection"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_and_other_modes_pass_through_untouched() {
+        for mode in [
+            "lines:-3", // already canonical
+            "full",
+            "signatures",
+            "lines:5-10",
+            "anchored:1-2",
+        ] {
+            assert_eq!(
+                canonicalize_tail_mode(Some(mode.to_string())),
+                Some(mode.to_string())
+            );
+        }
+        assert_eq!(canonicalize_tail_mode(None), None);
+    }
+
+    /// Only a pure `-<digits>` payload is a tail. Anything else must keep
+    /// reaching the unknown-mode warning rather than being silently
+    /// reinterpreted as something the caller did not ask for — which is the
+    /// exact failure this fix exists to remove.
+    #[test]
+    fn dash_shapes_that_are_not_tails_are_left_alone() {
+        for mode in ["-", "-x", "-3-5", "--3", "-3px", "- 3"] {
+            assert_eq!(
+                canonicalize_tail_mode(Some(mode.to_string())),
+                Some(mode.to_string()),
+                "{mode} must not be reinterpreted as a tail"
+            );
+        }
+    }
 
     // #1490: raw=true must NOT override an explicit lines: or anchored: mode.
     #[test]
@@ -188,6 +291,23 @@ mod tests {
             resolve_raw_alias(true, Some("anchored:5-10".into())),
             Some("anchored:5-10".into()),
         );
+    }
+
+    // #1965: `-N` with raw=true returned the whole file instead of the tail.
+    #[test]
+    fn gh1965_raw_keeps_bare_tail_window() {
+        for (mode, expected) in [
+            ("-3", "lines:-3"),
+            ("lines:-3", "lines:-3"),
+            ("lines:195-201", "lines:195-201"),
+            ("full", "raw"),
+        ] {
+            assert_eq!(
+                resolve_explicit_mode(true, Some(mode.into())),
+                Some(expected.into()),
+                "raw=true with mode={mode}"
+            );
+        }
     }
 
     #[test]

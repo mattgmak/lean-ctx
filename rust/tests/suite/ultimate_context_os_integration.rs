@@ -10,6 +10,9 @@ fn lean_ctx_bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_lean-ctx"));
     cmd.current_dir(env!("CARGO_MANIFEST_DIR"));
     cmd.env("LEAN_CTX_ACTIVE", "1");
+    // Tool-backed subcommands would auto-start a daemon that outlives the
+    // test and indexes the repo at ~300 % CPU on CI (GL #1291).
+    cmd.env("__LEAN_CTX_NO_DAEMON", "1");
     cmd
 }
 
@@ -753,7 +756,7 @@ mod cli_commands {
         let out = lean_ctx_bin().arg("--help").output().unwrap();
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(stdout.contains("Context SDK for AI Agents"));
+        assert!(stdout.contains("Context Gateway for AI Systems"));
     }
 
     #[test]
@@ -1070,8 +1073,21 @@ mod shell_compression {
 
     #[test]
     fn shell_compresses_git_status() {
-        let out = lean_ctx_bin().args(["-c", "git status"]).output().unwrap();
-        assert!(out.status.success());
+        // Its own repository: the crate checkout need not be a git work tree
+        // (a source export, or a build copied without `.git`).
+        let repo = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init: {init:?}");
+        let out = lean_ctx_bin()
+            .args(["-c", "git status"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
     }
 
     #[test]
@@ -1249,6 +1265,6 @@ mod e2e_multi_agent_scenario {
         );
 
         let snapshot = session.build_compaction_snapshot();
-        assert!(!snapshot.is_empty());
+        assert!(!snapshot.is_empty(), "`snapshot` is empty");
     }
 }

@@ -1,12 +1,9 @@
 # Historical Non-Coding Cookbook
 
-> **Status: historical research — not a supported SDK guide.** The recipes below
-> predate the current SDK boundary and may reference archived SDKs, adapters, or
-> product surfaces. They must not be used as installation instructions or proof
-> of availability. Current scope is governed by
-> `docs/internal/README.md` (internal, not in this repository): Python SDK v1 is Preview
-> with a narrow declared reference-wrapper scope; non-coding personas, TypeScript
-> parity, and generic adapter claims are not current public commitments.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 These historical recipes explored building non-coding agents on lean-ctx.
 

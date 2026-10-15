@@ -1,21 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OCLA Event Bus (P2 / Track B — Event-Backbone).
 //!
-//! Zero-cost when disabled: a single `AtomicBool` check (< 5ns) gates all
-//! emission. When enabled, events flow into the existing `core::events` ring
-//! buffer and JSONL persistence.
+//! Zero-cost when disabled: a single `AtomicBool` check gates all emission.
+//! When enabled, events flow into the bounded OCLA ring and ContextBus-owned
+//! private observation persistence.
 //!
 //! ## Design principles
 //!
-//! - **Wrap, don't replace**: The existing `events.rs` infrastructure (ring
-//!   buffer, JSONL rotation, persistence) is used as-is. `OclaBus` adds the
-//!   OCLA semantic layer on top.
-//! - **10 event types**: 5 existing (wired to current code) + 5 new (for
-//!   P8/P9/P11 traits, wired as those modules integrate).
+//! - **One durable authority**: `OclaBus` is only the bounded read projection;
+//!   ContextBus owns durable OCLA observations.
+//! - **Lossless observations**: all 11 event variants retain their original fields.
 //! - **Test isolation**: `OclaBus::scoped(capacity)` creates a bus instance
 //!   that does NOT touch the global singleton, enabling parallel tests.
-//! - **Determinism**: Event IDs come from the existing sequence allocator.
-//!   Timestamps are the only non-deterministic field (acceptable for
-//!   observability; not included in contract assertions).
+//! - **Identity**: IDs are process-local; durable rows also carry a producer
+//!   instance identifier. The SQLite cursor defines durable commit order.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -26,7 +24,7 @@ use crate::core::context_kernel::bounded::BoundedQueue;
 
 // ─── OCLA Event Types ────────────────────────────────────────────────────────
 
-/// The 10 OCLA event types defined in the P2 spec.
+/// OCLA capability-execution observations, not Agent Bus coordination commands.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum OclaEvent {
@@ -67,7 +65,8 @@ pub enum OclaEvent {
         evidence_class: Option<String>,
         measurement_method: Option<String>,
     },
-    /// Intent classified for a request (P8 — model_router.rs).
+    /// Intent classified for a request. Part of bus-event schema v1; no
+    /// producer since v4 removed automatic model routing.
     IntentClassified {
         tier: String,
         confidence: f64,
@@ -85,7 +84,8 @@ pub enum OclaEvent {
         is_duplicate: bool,
         tokens_saved: u64,
     },
-    /// Model routing decision made (P8 — model_router.rs).
+    /// Model routing decision. Part of bus-event schema v1; never emitted since
+    /// v4 removed automatic model routing (kept for schema compatibility).
     ModelRouted {
         requested_model: String,
         routed_model: String,
@@ -196,6 +196,7 @@ pub struct OclaBus {
     ring: Mutex<BoundedQueue<OclaBusRecord>>,
     capacity: usize,
     next_id: AtomicU64,
+    emitted_count: AtomicU64,
     overflow_policy: OverflowPolicy,
     overflow_count: AtomicUsize,
 }
@@ -212,6 +213,7 @@ impl OclaBus {
             ring: Mutex::new(BoundedQueue::new(capacity)),
             capacity,
             next_id: AtomicU64::new(1),
+            emitted_count: AtomicU64::new(0),
             overflow_policy,
             overflow_count: AtomicUsize::new(0),
         }
@@ -270,6 +272,63 @@ impl OclaBus {
             .ring
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.push_record(&mut ring, record);
+        self.emitted_count.fetch_add(1, Ordering::Relaxed);
+        id
+    }
+
+    fn emit_durable_if_enabled(&self, event: OclaEvent) -> u64 {
+        if !self.is_enabled() {
+            return 0;
+        }
+
+        // Reserve an identity without holding a projection lock across SQLite.
+        // Gaps on failure are intentional: an attempted ID is never reused.
+        // Explicit CAS loop: `fetch_update` is deprecated on newer stable and
+        // its replacement `try_update` is not available on older toolchains.
+        let mut id = self.next_id.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = id.checked_add(1) else {
+                tracing::error!("OCLA event ID space exhausted");
+                return 0;
+            };
+            match self
+                .next_id
+                .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
+        }
+        let record = OclaBusRecord {
+            id,
+            timestamp_ms: current_timestamp_ms(),
+            event,
+        };
+        if let Err(error) = crate::core::context_os::try_runtime().and_then(|runtime| {
+            runtime.bus.append_ocla_observation(
+                crate::core::context_os::observation::producer_instance(),
+                &record,
+            )
+        }) {
+            tracing::warn!("canonical OCLA observation persistence failed: {error}");
+            return 0;
+        }
+
+        self.emitted_count.fetch_add(1, Ordering::Relaxed);
+        // The durable row is authoritative even if the bounded read projection
+        // is unavailable or its configured overflow policy evicts this record.
+        if let Ok(mut ring) = crate::core::context_os::observation::lock_observation(&self.ring) {
+            self.push_record(&mut ring, record);
+        } else {
+            tracing::warn!(
+                "OCLA projection unavailable; committed observation retained in ContextBus"
+            );
+        }
+        id
+    }
+
+    fn push_record(&self, ring: &mut BoundedQueue<OclaBusRecord>, record: OclaBusRecord) {
         let _dropped = if ring.is_full() {
             let dropped_count = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
             let overflow = OverflowEvent {
@@ -293,8 +352,6 @@ impl OclaBus {
         } else {
             ring.push(record)
         };
-
-        id
     }
 
     /// Drain all events from the ring (consumes them). Useful for test assertions.
@@ -339,9 +396,9 @@ impl OclaBus {
         self.len() == 0
     }
 
-    /// Total events emitted (including those evicted from the ring).
+    /// Successful emissions, including evicted projections but not failed writes.
     pub fn total_emitted(&self) -> u64 {
-        self.next_id.load(Ordering::Relaxed) - 1
+        self.emitted_count.load(Ordering::Relaxed)
     }
 
     /// Total queue overflows observed by this bus since creation.
@@ -363,6 +420,7 @@ impl std::fmt::Debug for OclaBus {
             .field("ring", &format_args!("[{ring_len} events]"))
             .field("capacity", &self.capacity)
             .field("next_id", &self.next_id.load(Ordering::Relaxed))
+            .field("emitted_count", &self.total_emitted())
             .field("overflow_policy", &self.overflow_policy)
             .field("overflow_count", &self.overflow_count())
             .finish()
@@ -378,10 +436,11 @@ fn global_bus() -> &'static OclaBus {
     INSTANCE.get_or_init(|| OclaBus::new(DEFAULT_CAPACITY))
 }
 
-/// Emit an OCLA event on the global bus. No-op (< 5ns) when disabled.
+/// Emit an OCLA event on the global bus and persist it through ContextBus.
+/// No-op when disabled; persistence failure returns 0 and retains no record.
 #[inline]
 pub fn emit(event: OclaEvent) -> u64 {
-    global_bus().emit_if_enabled(event)
+    global_bus().emit_durable_if_enabled(event)
 }
 
 /// Enable the global OCLA bus.
@@ -425,76 +484,13 @@ pub fn overflow_policy() -> OverflowPolicy {
     global_bus().overflow_policy()
 }
 
-// ─── Bridge to existing events.rs ────────────────────────────────────────────
+// ─── Legacy compatibility alias ─────────────────────────────────────────────
 
-/// Bridge: emit an OCLA event AND forward it to the existing events.rs system.
-/// This ensures backward compatibility — the dashboard, CLI, and JSONL all
-/// continue to see events through the legacy path.
+/// Compatibility alias retained for callers compiled against the old name.
+/// Canonical persistence is performed exactly once by [`emit`]; no legacy
+/// EventKind mapping or JSONL write occurs.
 pub fn emit_and_bridge(event: OclaEvent) -> u64 {
-    bridge_to_legacy(&event);
     emit(event)
-}
-
-/// Convert an OCLA event to a legacy EventKind and emit it.
-fn bridge_to_legacy(event: &OclaEvent) {
-    use super::events::{EventKind, emit as legacy_emit};
-
-    let kind = match event {
-        OclaEvent::CompressionApplied {
-            path,
-            before_tokens,
-            after_tokens,
-            strategy,
-        } => EventKind::Compression {
-            path: path.clone().unwrap_or_default(),
-            before_lines: *before_tokens as u32,
-            after_lines: *after_tokens as u32,
-            strategy: strategy.clone(),
-            kept_line_count: *after_tokens as u32,
-            removed_line_count: before_tokens.saturating_sub(*after_tokens) as u32,
-        },
-        OclaEvent::ThresholdShift {
-            language,
-            old_value,
-            new_value,
-            metric,
-        } => EventKind::ThresholdShift {
-            language: language.clone(),
-            old_entropy: if *metric == ThresholdMetric::Entropy {
-                *old_value
-            } else {
-                0.0
-            },
-            new_entropy: if *metric == ThresholdMetric::Entropy {
-                *new_value
-            } else {
-                0.0
-            },
-            old_jaccard: if *metric == ThresholdMetric::Jaccard {
-                *old_value
-            } else {
-                0.0
-            },
-            new_jaccard: if *metric == ThresholdMetric::Jaccard {
-                *new_value
-            } else {
-                0.0
-            },
-        },
-        OclaEvent::RequestCompleted { .. }
-        | OclaEvent::FeedbackRecorded { .. }
-        | OclaEvent::SavingsRecorded { .. }
-        | OclaEvent::IntentClassified { .. }
-        | OclaEvent::OutcomeRecorded { .. }
-        | OclaEvent::ResponseOptimized { .. }
-        | OclaEvent::ModelRouted { .. }
-        | OclaEvent::AgentChainEvent { .. }
-        | OclaEvent::CrossAgentStubServed { .. } => {
-            return;
-        }
-    };
-
-    legacy_emit(kind);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -856,7 +852,7 @@ pub mod tests {
 
         for event in &events {
             let json = serde_json::to_string(event).unwrap();
-            assert!(!json.is_empty());
+            assert!(!json.is_empty(), "`json` is empty");
             let _: OclaEvent = serde_json::from_str(&json).unwrap();
         }
         assert_eq!(events.len(), 11, "exactly 11 event types");

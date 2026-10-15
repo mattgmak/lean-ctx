@@ -321,26 +321,21 @@ fn vscode_instruction_setting_respects_explicit_user_value() {
 }
 
 #[test]
-fn mcp_env_pairs_propagate_project_and_extra_roots_from_env() {
-    // #403: init must bake the captured project/worktree scope into the MCP
-    // server entry, otherwise the long-lived server rejects explicit paths
-    // under sibling worktrees as jail escapes.
+fn mcp_env_pairs_never_pin_the_installing_sessions_project() {
+    // Agent MCP configs are user-global. Copying the installing process's
+    // project scope in pinned one project for every later session (the #403
+    // regression this replaces), so even a set env must not leak into them.
     let _iso = crate::core::data_dir::isolated_data_dir();
     crate::test_env::set_var("LEAN_CTX_PROJECT_ROOT", "/work/main");
     crate::test_env::set_var("LEAN_CTX_EXTRA_ROOTS", "/work/wt-a:/work/wt-b");
 
     let pairs = mcp_server_env_pairs();
-    let get = |k: &str| pairs.iter().find(|(p, _)| p == k).map(|(_, v)| v.as_str());
-    assert!(
-        get("LEAN_CTX_DATA_DIR").is_none(),
-        "data dir is auto-detected at runtime, never pinned into the config (GH #408)"
-    );
-    assert_eq!(get("LEAN_CTX_PROJECT_ROOT"), Some("/work/main"));
-    assert_eq!(get("LEAN_CTX_EXTRA_ROOTS"), Some("/work/wt-a:/work/wt-b"));
-
-    // The JSON view mirrors the pairs for the JSON-config agents.
-    let json = mcp_server_env_json();
-    assert_eq!(json["LEAN_CTX_PROJECT_ROOT"].as_str(), Some("/work/main"));
+    let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+    for key in project_pins::PROJECT_SCOPED_ENV_KEYS {
+        assert!(!keys.contains(key), "{key} must not be written: {keys:?}");
+    }
+    assert!(!keys.contains(&"LEAN_CTX_DATA_DIR"), "GH #408");
+    assert!(mcp_server_env_json().as_object().unwrap().is_empty());
 
     crate::test_env::remove_var("LEAN_CTX_PROJECT_ROOT");
     crate::test_env::remove_var("LEAN_CTX_EXTRA_ROOTS");
@@ -413,6 +408,65 @@ fn claude_settings_hooks_emit_override_verbatim_and_stay_idempotent() {
     assert_eq!(settings, after, "idempotent under a stable override");
 
     crate::test_env::remove_var("LEAN_CTX_HOOK_BINARY");
+}
+
+/// #1879: with `[setup] manage_hooks = false` the MCP-start refresh must leave a
+/// hand-curated settings.json byte-identical; with the default it still heals.
+#[test]
+fn refresh_respects_manage_hooks_opt_out() {
+    let iso = crate::core::data_dir::isolated_data_dir();
+    let home = tempfile::tempdir().unwrap();
+    let settings_path = home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    let curated = r#"{"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"lean-ctx hook redirect"}]}]},"permissions":{"allow":[]}}"#;
+    std::fs::write(&settings_path, curated).unwrap();
+    let config_path = iso.path().join("config.toml");
+
+    let old_home = std::env::var("HOME").ok();
+    crate::test_env::set_var("HOME", home.path());
+
+    std::fs::write(&config_path, "[setup]\nmanage_hooks = false\n").unwrap();
+    refresh_installed_hooks();
+    let opted_out = std::fs::read_to_string(&settings_path).unwrap();
+
+    std::fs::write(&config_path, "[setup]\nmanage_hooks = true\n").unwrap();
+    refresh_installed_hooks();
+    let managed = std::fs::read_to_string(&settings_path).unwrap();
+
+    match old_home {
+        Some(h) => crate::test_env::set_var("HOME", h),
+        None => crate::test_env::remove_var("HOME"),
+    }
+
+    assert_eq!(opted_out, curated, "opt-out must not touch settings.json");
+    assert!(
+        managed.contains("hook rewrite"),
+        "default still refreshes: {managed}"
+    );
+}
+
+/// The value status line (3.10.3) must reach installs that already exist: the
+/// update/MCP-start refresh used to rewrite hooks only, so it never appeared.
+#[test]
+fn refresh_adds_the_value_status_line_to_an_existing_claude_install() {
+    let _iso = crate::core::data_dir::isolated_data_dir();
+    crate::test_env::remove_var("LEAN_CTX_VALUE_DISPLAY");
+    let home = tempfile::tempdir().unwrap();
+    install_claude_hook_config(home.path());
+    let settings_path = home.path().join(".claude/settings.json");
+    let before: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert!(
+        before.get("statusLine").is_none(),
+        "precondition: 3.10.3 state"
+    );
+
+    refresh_agent_hooks("claude", home.path());
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let cmd = after["statusLine"]["command"].as_str().unwrap_or_default();
+    assert!(cmd.ends_with(" statusline"), "status line set: {after}");
 }
 
 // ── #719: wrapper scripts must honor the override and survive healing ──
@@ -853,28 +907,28 @@ fn rewrite_script_skips_multiline_commands() {
     );
 }
 
+/// Denying native tools made agents fail and retry instead of working, so
+/// even agents that *can* run Replace default to Hybrid.
 #[test]
-fn codex_is_replace() {
+fn replace_capable_agents_default_to_hybrid() {
     let _env = crate::core::data_dir::test_env_lock();
-    assert_eq!(recommend_hook_mode("codex"), HookMode::Replace);
+    for agent in REPLACE_AGENTS {
+        assert_eq!(recommend_hook_mode(agent), HookMode::Hybrid, "{agent}");
+    }
+    assert!(!replace_mode_chosen());
 }
 
 #[test]
-fn cursor_is_replace() {
+fn explicit_replace_is_honoured_and_arms_the_deny_hook() {
     let _env = crate::core::data_dir::test_env_lock();
-    assert_eq!(recommend_hook_mode("cursor"), HookMode::Replace);
-}
-
-#[test]
-fn gemini_is_replace() {
-    let _env = crate::core::data_dir::test_env_lock();
-    assert_eq!(recommend_hook_mode("gemini"), HookMode::Replace);
-}
-
-#[test]
-fn claude_is_replace() {
-    let _env = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_HOOK_MODE", "replace");
     assert_eq!(recommend_hook_mode("claude"), HookMode::Replace);
+    assert_eq!(recommend_hook_mode("codex"), HookMode::Replace);
+    assert!(replace_mode_chosen());
+    crate::test_env::set_var("LEAN_CTX_HOOK_MODE", "auto");
+    assert_eq!(recommend_hook_mode("claude"), HookMode::Hybrid);
+    assert!(!replace_mode_chosen());
+    crate::test_env::remove_var("LEAN_CTX_HOOK_MODE");
 }
 
 #[test]
@@ -947,29 +1001,37 @@ fn roundtrip_unix_path() {
 #[test]
 fn disabled_env_caps_replace_at_hybrid() {
     let _env = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_HOOK_MODE", "replace");
     crate::test_env::set_var("LEAN_CTX_DISABLED", "1");
     assert_eq!(recommend_hook_mode("claude"), HookMode::Hybrid);
     assert_eq!(recommend_hook_mode("cursor"), HookMode::Hybrid);
     assert_eq!(recommend_hook_mode("crush"), HookMode::Hybrid);
-    assert_eq!(recommend_hook_mode("unknown-agent"), HookMode::Mcp);
+    assert!(!replace_mode_chosen());
     crate::test_env::remove_var("LEAN_CTX_DISABLED");
+    crate::test_env::remove_var("LEAN_CTX_HOOK_MODE");
+    assert_eq!(recommend_hook_mode("unknown-agent"), HookMode::Mcp);
 }
 
 #[test]
 fn shadow_mode_false_env_caps_replace_at_hybrid() {
     let _env = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_HOOK_MODE", "replace");
     crate::test_env::set_var("LEAN_CTX_SHADOW_MODE", "false");
     assert_eq!(recommend_hook_mode("claude"), HookMode::Hybrid);
     assert_eq!(recommend_hook_mode("gemini"), HookMode::Hybrid);
+    assert!(!replace_mode_chosen());
     crate::test_env::remove_var("LEAN_CTX_SHADOW_MODE");
+    crate::test_env::remove_var("LEAN_CTX_HOOK_MODE");
 }
 
 #[test]
 fn heal_off_env_caps_replace_at_hybrid() {
     let _env = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_HOOK_MODE", "replace");
     crate::test_env::set_var("LEAN_CTX_HEAL", "off");
     assert_eq!(recommend_hook_mode("claude"), HookMode::Hybrid);
     crate::test_env::remove_var("LEAN_CTX_HEAL");
+    crate::test_env::remove_var("LEAN_CTX_HOOK_MODE");
 }
 
 #[test]

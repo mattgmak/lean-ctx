@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use rmcp::ErrorData;
 use rmcp::model::Tool;
 use serde_json::{Map, Value, json};
@@ -15,21 +16,20 @@ impl McpTool for CtxAgentTool {
     fn tool_def(&self) -> Tool {
         tool_def(
             "ctx_agent",
-            "Research-only local collaboration helper. It is not part of the default LeanCTX Runtime surface or a public agent-orchestration product.\n\
-            Enable the session category explicitly before evaluating it.\n\
-            Actions: register (agent_type+role), post (message+category), read (poll),\n\
-            status (active|idle|finished), handoff (task+summary), sync (agents+messages+scent),\n\
-            claim/release (file/task), brief (sub-agent briefing),\n\
-            return (distill→knowledge), diary|recall_diary|diaries (agent journal),\n\
-            share_knowledge|receive_knowledge (cross-agent), list, info.\n\
-            ANTIPATTERN: Do not treat this local helper as a durable workflow or a hosted coordination service.",
+            "Local multi-agent coordination helper for explicit opt-in sessions. It is not a hosted workflow service.\n\
+             Active presence uses a bounded lease; read or status=active renews it.\n\
+             Actions: register, list, post, read, status, info, handoff, sync, poll_events, export,\n\
+              claim/release, lease_acquire/lease_renew/lease_release, brief/return, diary/recall_diary/diaries,\n\
+              share_knowledge/receive_knowledge, control_status. Directed events require an agent filter when read.\n\
+             Leases (message=path or symbol:<name>; renew/release take category=lease_ref) are machine-wide:\n\
+              every lean-ctx process sharing the data dir sees the same holder.",
             json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["register", "list", "post", "read", "status", "info", "handoff", "sync", "claim", "release", "brief", "return", "diary", "recall_diary", "diaries", "share_knowledge", "receive_knowledge|lease_acquire|lease_release", "lease_acquire", "lease_release"],
-                        "description": "register|list|post|read|status|info|handoff|sync|claim|release|brief|return|diary|recall_diary|diaries|share_knowledge|receive_knowledge|lease_acquire|lease_release"
+                        "enum": crate::tools::ctx_agent::ACTIONS,
+                        "description": crate::tools::ctx_agent::ACTIONS.join("|")
                     },
                     "agent_type": {
                         "type": "string",
@@ -38,6 +38,10 @@ impl McpTool for CtxAgentTool {
                     "role": {
                         "type": "string",
                         "description": "dev|review|test|plan"
+                    },
+                    "durable_identity_id": {
+                        "type": "string",
+                        "description": "Explicit durable identity ID to bind on register; never inferred"
                     },
                     "message": {
                         "type": "string",
@@ -55,6 +59,32 @@ impl McpTool for CtxAgentTool {
                         "type": "string",
                         "enum": ["active", "idle", "finished"],
                         "description": "active|idle|finished"
+                    },
+                    "privacy": {
+                        "type": "string",
+                        "description": "public|team|private; poll_events accepts comma-separated event kinds"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "low|normal|high|critical; brief also accepts a numeric token budget"
+                    },
+                    "ttl_hours": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "message TTL in hours; lease_acquire/lease_renew: 0 = 10 min (default), 1 = 1 h"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["json", "text"],
+                        "description": "export output format"
+                    },
+                    "write": {
+                        "type": "boolean",
+                        "description": "export a proof snapshot under the project proofs directory"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "plain proof filename for export (no directories)"
                     }
                 },
                 "allOf": [
@@ -66,7 +96,10 @@ impl McpTool for CtxAgentTool {
                     { "if": { "properties": { "action": { "const": "brief" } }, "required": ["action"] }, "then": { "required": ["action", "message"] } },
                     { "if": { "properties": { "action": { "const": "return" } }, "required": ["action"] }, "then": { "required": ["action", "message"] } },
                     { "if": { "properties": { "action": { "const": "diary" } }, "required": ["action"] }, "then": { "required": ["action", "message"] } },
-                    { "if": { "properties": { "action": { "const": "share_knowledge" } }, "required": ["action"] }, "then": { "required": ["action", "message"] } }
+                    { "if": { "properties": { "action": { "const": "share_knowledge" } }, "required": ["action"] }, "then": { "required": ["action", "message"] } },
+                    { "if": { "properties": { "action": { "const": "lease_acquire" } }, "required": ["action"] }, "then": { "required": ["action", "message"] } },
+                    { "if": { "properties": { "action": { "const": "lease_renew" } }, "required": ["action"] }, "then": { "required": ["action", "message", "category"] } },
+                    { "if": { "properties": { "action": { "const": "lease_release" } }, "required": ["action"] }, "then": { "required": ["action", "message", "category"] } }
                 ],
                 "required": ["action"]
             }),
@@ -82,6 +115,11 @@ impl McpTool for CtxAgentTool {
             .ok_or_else(|| ErrorData::invalid_params("action is required", None))?;
         let agent_type = get_str(args, "agent_type");
         let role = get_str(args, "role");
+        let durable_identity_id = if action == "register" {
+            get_str(args, "durable_identity_id")
+        } else {
+            None
+        };
         let message = get_str(args, "message");
         let category = get_str(args, "category");
         let to_agent = get_str(args, "to_agent");
@@ -104,6 +142,7 @@ impl McpTool for CtxAgentTool {
             &action,
             agent_type.as_deref(),
             role.as_deref(),
+            durable_identity_id.as_deref(),
             &project_root,
             current_agent_id.as_deref(),
             message.as_deref(),
@@ -163,4 +202,80 @@ impl McpTool for CtxAgentTool {
             content_blocks: None,
         })
     }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use crate::server::tool_trait::McpTool;
+    use crate::tools::ctx_agent::ACTIONS;
+
+    #[test]
+    fn schema_advertises_optional_durable_identity_binding() {
+        let schema = serde_json::to_string(&CtxAgentTool.tool_def()).expect("tool schema");
+        assert!(schema.contains("durable_identity_id"));
+        assert!(schema.contains("Explicit durable identity ID"));
+    }
+
+    #[test]
+    fn schema_exposes_each_bus_action_without_combined_enum_values() {
+        let schema = serde_json::to_value(CtxAgentTool.tool_def()).expect("tool schema");
+        let action_enum = schema["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        for action in [
+            "poll_events",
+            "export",
+            "control_status",
+            "lease_acquire",
+            "lease_renew",
+            "lease_release",
+        ] {
+            assert!(
+                action_enum.iter().any(|value| value == action),
+                "missing action {action}"
+            );
+        }
+        assert!(
+            !action_enum
+                .iter()
+                .any(|value| value.as_str().is_some_and(|value| value.contains('|')))
+        );
+        assert!(schema["inputSchema"]["properties"]["privacy"].is_object());
+        assert!(schema["inputSchema"]["properties"]["ttl_hours"].is_object());
+    }
+
+    /// #1913: a merged `a|b|c` entry advertised an action no client could send.
+    #[test]
+    fn action_enum_lists_each_dispatched_action_once() {
+        let tool = CtxAgentTool.tool_def();
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let listed: Vec<&str> = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .map(|v| v.as_str().expect("string entry"))
+            .collect();
+        assert_eq!(listed, ACTIONS);
+        let mut unique = listed.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), listed.len(), "no duplicate entries");
+        for action in &listed {
+            assert!(
+                action.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "enum entry {action:?} must be a single action name"
+            );
+            let arm = format!("\"{action}\"");
+            assert!(
+                DISPATCH_SOURCE.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with(&arm) && line.contains("=>")
+                }),
+                "advertised action {action:?} is not dispatched"
+            );
+        }
+    }
+
+    const DISPATCH_SOURCE: &str = include_str!("../ctx_agent.rs");
 }

@@ -150,7 +150,9 @@ mod tests {
 
     #[test]
     fn coder_role_allows_all() {
-        // Reset to coder for this test (other tests may have changed the global role)
+        // Other tests change the global role; hold the guard so none can
+        // switch it between the set and the check below.
+        let _role = roles::lock_global_role();
         let _ = roles::set_active_role("coder");
         let result = check_tool_access("ctx_edit");
         assert!(
@@ -163,6 +165,7 @@ mod tests {
 
     #[test]
     fn ctx_call_is_not_exempt_from_guard() {
+        let _role = roles::lock_global_role();
         let _ = roles::set_active_role("coder");
         let result = check_tool_access("ctx_call");
         assert!(

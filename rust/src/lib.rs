@@ -7,10 +7,14 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc runtime options, exported by the binary as `_rjem_malloc_conf`
+/// (see `main.rs`). NUL-terminated: jemalloc reads it as a C string.
 #[cfg(all(feature = "jemalloc", not(windows), not(target_env = "musl")))]
-#[allow(non_upper_case_globals)]
-#[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+pub const JEMALLOC_CONF: &[u8] = if cfg!(target_os = "linux") {
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0"
+} else {
+    b"dirty_decay_ms:1000,muzzy_decay_ms:1000\0"
+};
 
 // ---------------------------------------------------------------------------
 // Pillar: Engine — context compression, MCP tools, agent hooks, local UX
@@ -42,7 +46,9 @@ pub mod token_report;
 pub mod tool_defs;
 pub mod tools;
 
-#[cfg(feature = "http-server")]
+// Always compiled: the shared accounting the rest of the engine reads (CCR
+// archive, usage meters, savings, introspection). The HTTP proxy server and its
+// provider adapters inside are gated on `http-server` (#586).
 #[allow(dead_code)]
 pub mod proxy;
 pub mod proxy_autostart;

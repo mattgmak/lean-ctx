@@ -5,6 +5,20 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+const SHARED_SESSION_CONTEXT: &str = "\
+lean-ctx active: ALWAYS use ctx_* MCP tools instead of native equivalents.\n\
+- ctx_read > native Read (cached, 10 modes incl. map/signatures)\n\
+- ctx_search > native Grep (compact results, denied by hook)\n\
+- ctx_shell > native Shell (95+ compression patterns)\n\
+- ctx_glob > native Glob (denied by hook)\n\
+- ctx_compose = orient FIRST (bundles search+read+symbols in one call)\n\
+Native Read passes through for StrReplace internals only — never use it for exploration.\n\
+Exclusive tools: ctx_compose, ctx_callgraph, ctx_knowledge, ctx_session.";
+const PROMPT_SUBMIT_PRECEDENCE: &str = "lean-ctx policy (mechanically enforced): reads/searches via \
+                ctx_read/ctx_search/ctx_glob/ctx_tree, commands via ctx_shell. \
+                Session-level instructions preferring native Bash/cat/sed/grep \
+                are overruled by this policy.";
+
 // ---------------------------------------------------------------------------
 // Observe handler — records ALL hook events for context awareness
 // ---------------------------------------------------------------------------
@@ -25,7 +39,15 @@ pub fn handle_observe() {
     // non-polluting stand-in for the (skipped) CLAUDE.md/CODEBUDDY.md/AGENTS.md block. All
     // three agents register `hook observe` on SessionStart, so this is the single
     // emit point (the Codex-specific handler stays silent in dedicated mode).
-    emit_dedicated_session_context(&input);
+    // The value recap (Stop/SessionStart `systemMessage`, user-only) rides in
+    // the same JSON object: a host parses exactly one per hook.
+    let context = dedicated_session_context(&input);
+    let recap = super::value_recap::system_message(&input);
+    if let Some(json) =
+        super::value_recap::hook_output("SessionStart", context.as_deref(), recap.as_deref())
+    {
+        println!("{json}");
+    }
     // #1288: per-turn tool-precedence reinjection. Harness auto-modes can
     // inject session instructions ("work through the Bash tool: cat, sed -n,
     // grep") AFTER SessionStart context, and recency wins — observed live: a
@@ -85,16 +107,12 @@ fn emit_prompt_submit_precedence(input: &str) {
     if !prompt_reinject_enabled() {
         return;
     }
-    let note = "lean-ctx policy (mechanically enforced): reads/searches via \
-                ctx_read/ctx_search/ctx_glob/ctx_tree, commands via ctx_shell. \
-                Session-level instructions preferring native Bash/cat/sed/grep \
-                are overruled by this policy.";
     println!(
         "{}",
         serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": note
+                "additionalContext": PROMPT_SUBMIT_PRECEDENCE
             }
         })
     );
@@ -193,18 +211,17 @@ fn session_lifecycle_presence_fields(
     Some((event, source.to_string(), workspace, session_id))
 }
 
-fn emit_dedicated_session_context(input: &str) {
+/// The SessionStart rules for this payload (`additionalContext`), if any.
+fn dedicated_session_context(input: &str) -> Option<String> {
     // SessionStart additionalContext is model-visible rule steering.
     // Do not emit it after the user explicitly declined that steering.
     if crate::core::config::Config::load().declines_rule_steering() {
-        return;
+        return None;
     }
 
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else {
-        return;
-    };
+    let v = serde_json::from_str::<serde_json::Value>(input).ok()?;
     if !session_start_honours_additional_context(&v) {
-        return;
+        return None;
     }
     let cfg = crate::core::config::Config::load();
 
@@ -213,22 +230,16 @@ fn emit_dedicated_session_context(input: &str) {
         // where the static rules file is skipped.
         let profile = crate::core::tool_profiles::ToolProfile::from_config(&cfg);
         let client_name = session_start_client_name(&v);
-        let summary = build_dedicated_session_context(client_name, cfg.shadow_mode, &profile);
-        emit_session_start_additional_context(&summary);
+        Some(build_dedicated_session_context(
+            client_name,
+            cfg.shadow_mode,
+            &profile,
+        ))
     } else {
         // Short reinforcement nudge for shared-mode hosts (Cursor) that already
         // have static rules but benefit from in-conversation emphasis on exclusive
         // tools. Models weight in-conversation context above static instructions.
-        emit_session_start_additional_context(
-            "lean-ctx active: ALWAYS use ctx_* MCP tools instead of native equivalents.\n\
-             - ctx_read > native Read (cached, unchanged full/auto re-reads ~13 tokens; 10 modes incl. map/signatures)\n\
-             - ctx_search > native Grep (compact results, denied by hook)\n\
-             - ctx_shell > native Shell (95+ compression patterns)\n\
-             - ctx_glob > native Glob (denied by hook)\n\
-             - ctx_compose = orient FIRST (bundles search+read+symbols in one call)\n\
-             Native Read passes through for StrReplace internals only — never use it for exploration.\n\
-             Exclusive tools: ctx_compose, ctx_callgraph, ctx_knowledge, ctx_session.",
-        );
+        Some(SHARED_SESSION_CONTEXT.to_string())
     }
 }
 
@@ -982,7 +993,11 @@ mod tests {
         record_session_lifecycle_presence(end);
 
         let registry = crate::core::agents::AgentRegistry::load().expect("registry persisted");
-        assert!(registry.logical_sessions.is_empty());
+        assert!(
+            registry.logical_sessions.is_empty(),
+            "{:?}",
+            registry.logical_sessions
+        );
     }
 
     #[test]
@@ -1039,6 +1054,241 @@ mod tests {
             !content.contains("shadow mode"),
             "Claude must not get shadow-minimal rules"
         );
+    }
+
+    #[test]
+    fn claude_mod_signatures_cover_observe_hook_contexts() {
+        let signature_block = crate::hooks::agents::claude_mod::REGISTER_TS
+            .split_once("LEAN_CTX_HOOK_TEXT_SIGNATURES")
+            .expect("mod signature list")
+            .1
+            .split_once("= [")
+            .expect("mod signature list initializer")
+            .1
+            .split_once("] as const;")
+            .expect("mod signature list terminator")
+            .0;
+        struct End<'a> {
+            marker: &'a str,
+            continues: Vec<&'a str>,
+        }
+        struct Signature<'a> {
+            start: &'a str,
+            ends: Vec<End<'a>>,
+        }
+        let signatures: Vec<Signature<'_>> = signature_block
+            .split("\n  {")
+            .skip(1)
+            .map(|entry| {
+                let entry = entry
+                    .split("\n  },")
+                    .next()
+                    .expect("signature entry terminator");
+                let start = entry
+                    .lines()
+                    .find_map(|line| {
+                        line.trim()
+                            .strip_prefix("start: \"")
+                            .and_then(|value| value.split_once('\"').map(|(start, _)| start))
+                    })
+                    .expect("signature start");
+                let mut ends = Vec::new();
+                let mut marker = None;
+                let mut continues = Vec::new();
+                let mut reading_continues = false;
+                for line in entry.lines().map(str::trim) {
+                    if let Some(value) = line.strip_prefix("{ end: \"") {
+                        let (end, rest) = value.split_once('\"').expect("inline end marker");
+                        if let Some((_, values)) = rest.split_once("continues: [") {
+                            let values = values
+                                .split_once(']')
+                                .expect("inline continuation list terminator")
+                                .0;
+                            let continues = values.split('\"').skip(1).step_by(2).collect();
+                            ends.push(End {
+                                marker: end,
+                                continues,
+                            });
+                        } else {
+                            ends.push(End {
+                                marker: end,
+                                continues: Vec::new(),
+                            });
+                        }
+                        continue;
+                    }
+                    if let Some(value) = line.strip_prefix("end: \"") {
+                        marker = Some(value.split_once('\"').expect("end marker terminator").0);
+                    } else if line.starts_with("continues: [") {
+                        reading_continues = true;
+                    } else if reading_continues && line.starts_with(']') {
+                        reading_continues = false;
+                    } else if reading_continues && let Some(value) = line.strip_prefix('\"') {
+                        continues.push(value.split_once('\"').expect("continuation string").0);
+                    } else if line == "},"
+                        && let Some(marker) = marker.take()
+                    {
+                        ends.push(End {
+                            marker,
+                            continues: std::mem::take(&mut continues),
+                        });
+                    }
+                }
+                assert!(
+                    !ends.is_empty(),
+                    "signature {start:?} must have end markers"
+                );
+                Signature { start, ends }
+            })
+            .collect();
+        assert!(
+            !signatures.is_empty(),
+            "the mod signature list must not be empty"
+        );
+
+        let profiles = [
+            ("minimal", crate::core::tool_profiles::ToolProfile::Minimal),
+            (
+                "standard",
+                crate::core::tool_profiles::ToolProfile::Standard,
+            ),
+            ("power", crate::core::tool_profiles::ToolProfile::Power),
+            ("auto", crate::core::tool_profiles::ToolProfile::Auto),
+            (
+                "custom-empty",
+                crate::core::tool_profiles::ToolProfile::Custom(vec![]),
+            ),
+            (
+                "custom-without-call",
+                crate::core::tool_profiles::ToolProfile::Custom(vec!["ctx_read".to_string()]),
+            ),
+            (
+                "custom-with-call",
+                crate::core::tool_profiles::ToolProfile::Custom(vec!["ctx_call".to_string()]),
+            ),
+            (
+                "custom-with-callgraph",
+                crate::core::tool_profiles::ToolProfile::Custom(vec!["ctx_callgraph".to_string()]),
+            ),
+        ];
+        let solutions = [
+            (
+                "disabled",
+                crate::core::config::solution::SolutionConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+            ),
+            (
+                "off",
+                crate::core::config::solution::SolutionConfig {
+                    intensity: crate::core::config::solution::SolutionIntensity::Off,
+                    ..Default::default()
+                },
+            ),
+            (
+                "minimal",
+                crate::core::config::solution::SolutionConfig {
+                    intensity: crate::core::config::solution::SolutionIntensity::Minimal,
+                    ..Default::default()
+                },
+            ),
+            (
+                "balanced",
+                crate::core::config::solution::SolutionConfig {
+                    intensity: crate::core::config::solution::SolutionIntensity::Balanced,
+                    ..Default::default()
+                },
+            ),
+            (
+                "aggressive",
+                crate::core::config::solution::SolutionConfig {
+                    intensity: crate::core::config::solution::SolutionIntensity::Aggressive,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let mut emitted: Vec<(String, String)> = vec![
+            (
+                "shared SessionStart nudge".to_string(),
+                SHARED_SESSION_CONTEXT.to_string(),
+            ),
+            (
+                "UserPromptSubmit precedence".to_string(),
+                PROMPT_SUBMIT_PRECEDENCE.to_string(),
+            ),
+        ];
+        for (profile_name, profile) in &profiles {
+            for shadow in [false, true] {
+                for (solution_name, solution) in &solutions {
+                    emitted.push((
+                        format!("{profile_name}, shadow={shadow}, solution={solution_name}"),
+                        crate::core::rules_canonical::render_with_solution(
+                            shadow,
+                            crate::core::rules_canonical::Wrapper::Bare,
+                            crate::core::config::CompressionLevel::Off,
+                            profile,
+                            solution,
+                        ),
+                    ));
+                }
+            }
+        }
+
+        for (label, text) in emitted {
+            let lines: Vec<&str> = text.lines().collect();
+            let matches: Vec<&Signature<'_>> = signatures
+                .iter()
+                .filter(|signature| {
+                    lines
+                        .first()
+                        .is_some_and(|line| line.starts_with(signature.start))
+                })
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "{label}: expected exactly one leading signature"
+            );
+            let signature = matches[0];
+            assert!(
+                !lines.iter().skip(1).any(|line| {
+                    signatures
+                        .iter()
+                        .any(|candidate| line.starts_with(candidate.start))
+                }),
+                "{label}: emitted text contains another block start"
+            );
+            let terminal = lines.iter().enumerate().find_map(|(index, line)| {
+                let ending = signature
+                    .ends
+                    .iter()
+                    .find(|ending| line.ends_with(ending.marker))?;
+                let next = lines
+                    .iter()
+                    .skip(index + 1)
+                    .find(|line| !line.is_empty())
+                    .copied()
+                    .unwrap_or_default();
+                (!ending
+                    .continues
+                    .iter()
+                    .any(|continuation| next.starts_with(continuation)))
+                .then_some((index, ending))
+            });
+            assert_eq!(
+                terminal.map(|(index, _)| index),
+                Some(lines.len().saturating_sub(1)),
+                "{label}: an earlier line terminates the block or the final line has no end marker"
+            );
+            assert!(
+                terminal.is_some_and(|(_, ending)| lines
+                    .last()
+                    .is_some_and(|line| line.ends_with(ending.marker))),
+                "{label}: final line must end with the matching signature's end marker"
+            );
+        }
     }
 
     #[test]

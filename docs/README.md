@@ -1,52 +1,48 @@
-# LeanCTX repository documentation
+# LeanCTX documentation
 
-This directory documents the local LeanCTX Runtime and the work needed to
-converge its public contracts.
+**Context Gateway for AI Systems**
 
-LeanCTX is the **Context SDK for AI Agents**. It sits inside or alongside an
-existing agent loop and controls how context is selected, shaped, reused, and
-recovered before inference; it can expose evidence about those decisions. It does not replace an agent,
-orchestrate a fleet, choose a model, or host an agent platform.
+**Control what your AI can see.**
+
+LeanCTX sits between AI and the information it reads: **Select → Control → Prove**.
+It prepares task-relevant context, applies supported access/content rules and
+records observable evidence. Your application, agent loop and model stay yours.
+
+## Start with the product
+
+1. [What is LeanCTX?](what-is-leanctx.md) — placement, inputs, outputs and editions.
+2. [Where LeanCTX fits](where-leanctx-fits.md) — retrieval, gateways, guardrails and agents.
+3. [Architecture](../ARCHITECTURE.md) — runtime and integration boundaries.
+4. [Setup guides](guides/README.md) — use existing AI tools.
+5. [LeanCTX SDK](https://github.com/Thinkery-AG/leanctx-sdk) — embed supported Engine capabilities.
+
+The **LeanCTX Engine** is the runtime; the **LeanCTX SDK** is its application
+integration surface. Context Intelligence is a capability inside the Gateway.
 
 ## Product status
 
-| Status | Public meaning |
-| --- | --- |
-| **Available** | Local Runtime: CLI, MCP, proxy paths, context selection/compression/reuse, and local receipt or offline-verification primitives. |
-| **Preview** | Python SDK v1 and its declared OpenAI Agents reference-wrapper scope; common session and receipt convergence; explicit capability and degradation matrices. |
-| **Research** | Performance Benchmark; Performance Profiles; first-class Context Kits; canonical evidence bundle; automated tuning; managed/cloud operation; marketplaces; organization controls; public rankings; and external-capability composition. |
+| Status | Scope |
+|---|---|
+| **Available** | Community Engine local CLI/MCP, supported hook/proxy paths, context selection, structural views, compression/reuse/recovery, configured controls and local evidence. Standalone SDK Stable APIs follow the SDK release manifest. |
+| **Preview** | Explicit SDK Preview APIs and other contracts individually labeled Preview; older in-tree wrapper experiments are not the standalone SDK's stable contract. |
+| **Research** | Performance Profiles as a promoted product; first-class Context Kits; universal workspace/coordination, AutoTune, marketplace and Performance Benchmark directions not yet promoted through their release gates. |
+| **Enterprise** | Commercial organization controls and deployment are scoped to the separately licensed Enterprise release and agreement; OSS Research labels do not determine Enterprise availability. |
 
-Read the status boundary before relying on a document:
-internal product authority (`docs/internal/README.md`, internal — not in this repository) and the
-Product Architecture (`docs/internal/vision/PRODUCT-ARCHITECTURE.md`, internal — not in this repository).
+## Technical references
 
-## Start here
+- [Local Engine reference](reference/README.md)
+- [Contracts and schemas](contracts/README.md)
+- [MCP tool inventory](reference/generated/mcp-tools.md) and [configuration keys](reference/generated/config-keys.md)
+- [SDK surface and compatibility](reference/sdk-surface.md)
+- [Security](../SECURITY.md) and [contributing](../CONTRIBUTING.md)
 
-- Project overview: [`README.md`](../README.md)
-- Contributing: [`CONTRIBUTING.md`](../CONTRIBUTING.md)
-- Security: [`SECURITY.md`](../SECURITY.md)
-- Architecture: [`ARCHITECTURE.md`](../ARCHITECTURE.md)
-- Current tool and configuration inventories: [MCP tools](reference/generated/mcp-tools.md) · [config keys](reference/generated/config-keys.md)
+Generated inventories enumerate mechanisms, not release guarantees. The
+[canonical positioning](POSITIONING_CANONICAL.md) and
+[public claims contract](contracts/public-product-claims-v1.md) govern public language.
 
-## Current local Runtime
+## Historical and research records
 
-- Core binary and MCP server: [`rust/`](../rust/)
-- Integration setup: [guides](guides/README.md)
-- Local Runtime reference: [reference](reference/README.md)
-- Local contracts and schemas: [contracts](contracts/README.md)
-- The SDK: [`thinkery-leanctx-sdk`](https://github.com/Thinkery-AG/leanctx-sdk) (external repo — see [SDK surface](reference/sdk-surface.md))
-
-## Context Kits and package material
-
-The signed `.ctxpkg` substrate exists locally. First-class Context Kit
-semantics and any hosted distribution are **Research**, not a
-public registry, marketplace, or enterprise service. See
-[package-status notes](guides/publishing-packages.md) and
-[the v2 research record](specs/context-package-v2.md).
-
-## Historical and research material
-
-Some repository documents preserve experiments, implementation sketches, or
-retired commercial concepts. They are not installation instructions or public
-availability claims. Each such document must carry a prominent status header;
-when it conflicts with the internal product authority, the authority wins.
+Retained proposals have explicit status notices and point to the current
+definition. The local signed `.ctxpkg` substrate does not establish a hosted
+registry, marketplace or first-class Context Kit product. See
+[package status](guides/publishing-packages.md).

@@ -32,7 +32,8 @@ pub fn handle(
     let walk_root = crate::core::walk_filter::explicit_walk_root(requested_root);
     let root = walk_root.as_path();
     if !root.exists() {
-        return (format!("ERROR: {dir} does not exist"), 0);
+        let hint = crate::core::path_suggest::hint(root);
+        return (format!("ERROR: {dir} does not exist{hint}"), 0);
     }
     if !root.is_dir() {
         return (format!("ERROR: {dir} is not a directory"), 0);
@@ -46,13 +47,17 @@ pub fn handle(
     let max = max_results.min(MAX_RESULTS);
 
     // Support both simple (`*.rs`) and recursive (`**/*.ts`) patterns.
-    let glob_matcher = match glob::Pattern::new(pattern) {
+    // `**.rs` / `src**/x` mean "recursively"; the glob crate only accepts `**`
+    // as a whole path component, so repair that one shape before compiling.
+    let repaired = repair_recursive_wildcards(pattern);
+    let glob_matcher = match glob::Pattern::new(&repaired) {
         Ok(m) => m,
         Err(e) => return (format!("ERROR: invalid glob pattern '{pattern}': {e}"), 0),
     };
 
     let mut matches = Vec::new();
     let mut files_walked = 0u32;
+    let protected = crate::core::policy::runtime::active().is_some();
 
     // Vendor dirs (node_modules, …) follow the gitignore toggle: explicitly
     // disabling gitignore is the escape hatch to look inside them (#400).
@@ -75,7 +80,10 @@ pub fn handle(
         .sort_by_file_path(std::path::Path::cmp)
         .build();
 
-    for entry in walker.filter_map(std::result::Result::ok) {
+    for (visited, entry) in walker.filter_map(std::result::Result::ok).enumerate() {
+        if protected && visited >= 20_000 {
+            return ("ERROR: protected directory walk limit exceeded".into(), 0);
+        }
         if matches.len() >= max {
             break;
         }
@@ -98,13 +106,22 @@ pub fn handle(
             continue;
         }
 
-        let rel_path = path.strip_prefix(root).unwrap_or(path);
+        let admitted = if protected {
+            match crate::server::policy_guard::protect_result("ctx_glob", &path.to_string_lossy()) {
+                Ok(path) => path,
+                Err(_) => continue,
+            }
+        } else {
+            path.to_string_lossy().into_owned()
+        };
+        let rel_path = Path::new(&admitted)
+            .strip_prefix(root)
+            .unwrap_or(Path::new(&admitted));
         let rel_str = rel_path.to_string_lossy();
 
         if glob_matcher.matches(&rel_str) {
-            let short_path =
-                protocol::shorten_path_relative(&path.to_string_lossy(), &root.to_string_lossy());
-            matches.push((short_path, path.to_string_lossy().to_string()));
+            let short_path = protocol::shorten_path_relative(&admitted, &root.to_string_lossy());
+            matches.push((short_path, admitted));
         }
     }
 
@@ -163,8 +180,56 @@ fn group_paths_by_directory(matches: &[(String, String)]) -> String {
     out.trim_end().to_string()
 }
 
+/// Splits a `**` glued to other characters into its own path component:
+/// `**.rs` → `**/*.rs`, `src**` → `src*/**`, `a/**b/c` → `a/**/*b/c`. A
+/// pattern whose `**` already stands alone is returned unchanged.
+fn repair_recursive_wildcards(pattern: &str) -> String {
+    if !pattern.contains("**") {
+        return pattern.to_string();
+    }
+    pattern
+        .split('/')
+        .map(|part| {
+            if part == "**" || !part.contains("**") {
+                return part.to_string();
+            }
+            let collapsed = part.replace("***", "**");
+            let (before, after) = collapsed.split_once("**").unwrap_or((&collapsed, ""));
+            let mut pieces = Vec::new();
+            if !before.is_empty() {
+                pieces.push(format!("{before}*"));
+            }
+            pieces.push("**".to_string());
+            if !after.is_empty() {
+                pieces.push(format!("*{after}"));
+            }
+            pieces.join("/")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn glued_recursive_wildcards_are_repaired() {
+        use super::repair_recursive_wildcards as r;
+        assert_eq!(r("**.rs"), "**/*.rs");
+        assert_eq!(r("src**"), "src*/**");
+        assert_eq!(r("a/**b/c.ts"), "a/**/*b/c.ts");
+        assert_eq!(r("**/*.ts"), "**/*.ts");
+        assert_eq!(r("*.rs"), "*.rs");
+    }
+
+    #[test]
+    fn glued_recursive_pattern_finds_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/x.rs"), "").unwrap();
+        let (out, _) = super::handle("**.rs", &dir.path().to_string_lossy(), true, true, 100);
+        assert!(out.contains("x.rs"), "{out}");
+    }
+
     use super::*;
 
     #[test]

@@ -53,17 +53,21 @@ pub(crate) fn try_atomic_write(
     let tmp = parent.join(format!(".{filename}.lean-ctx.tmp.{pid}.{nanos}"));
 
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(perms) = permissions {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(perms.mode());
+        }
+        let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
-        let _ = f.flush();
-        let _ = f.sync_all();
+        f.flush()?;
+        f.sync_all()?;
     }
 
     if let Some(perms) = permissions {
-        let _ = std::fs::set_permissions(&tmp, perms.clone());
+        std::fs::set_permissions(&tmp, perms.clone())?;
     }
 
     // #956: on Windows, `rename` fails outright if `path` already exists, so
@@ -111,11 +115,32 @@ fn windows_replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
     let tmp_w = to_wide(tmp);
     let path_w = to_wide(path);
 
-    let ok = unsafe { MoveFileExW(tmp_w.as_ptr(), path_w.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
+    // A reader, Defender or the search indexer briefly holding `path` open
+    // without FILE_SHARE_DELETE makes the replace fail with ACCESS_DENIED (5)
+    // or SHARING_VIOLATION (32) until the handle closes. Those are transient:
+    // retry with backoff for about a second before reporting the error.
+    const ACCESS_DENIED: i32 = 5;
+    const SHARING_VIOLATION: i32 = 32;
+    let mut delay = std::time::Duration::from_millis(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        // SAFETY: both vectors own NUL-terminated UTF-16 buffers and remain
+        // alive for the duration of the call.
+        let ok = unsafe { MoveFileExW(tmp_w.as_ptr(), path_w.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+        if ok != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let transient = matches!(
+            error.raw_os_error(),
+            Some(ACCESS_DENIED | SHARING_VIOLATION)
+        );
+        if !transient || std::time::Instant::now() >= deadline {
+            return Err(error);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_millis(100));
     }
-    Ok(())
 }
 
 /// Best-effort `fsync` of a directory's inode so a preceding `rename`/`create`
@@ -124,6 +149,30 @@ fn windows_replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
 fn fsync_dir(dir: &Path) {
     if let Ok(f) = std::fs::File::open(dir) {
         let _ = f.sync_all();
+    }
+}
+
+/// Make a preceding `rename`/`create`/`remove` in `dir` durable, reporting
+/// failure. On Unix this fsyncs the directory. Windows cannot flush a directory
+/// through a plain `File::open` (it fails with `ERROR_ACCESS_DENIED`); NTFS
+/// journals directory metadata itself, so only the directory's existence is
+/// verified there — the same contract as the `#[cfg(unix)]` sync sites
+/// elsewhere in the crate.
+pub(crate) fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::metadata(dir)?.is_dir() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "sync target is not a directory",
+            ))
+        }
     }
 }
 
@@ -190,6 +239,70 @@ pub(crate) fn in_place_overwrite(
         let _ = std::fs::set_permissions(path, perms.clone());
     }
     Ok(())
+}
+
+/// Why a store file could not be read safely.
+#[derive(Debug)]
+pub(crate) enum StoreReadError {
+    /// The path, a directory on it, or the opened file is a symlink, not a regular
+    /// file, or resolves outside `store_root`.
+    Escapes,
+    Io(std::io::Error),
+}
+
+/// Read a file of a local content store (archive, tee) for the model without
+/// following links out of the store and without a check-then-open race.
+///
+/// The parent directory must canonicalize to a path inside `store_root`, the final
+/// component is opened without following symlinks (`O_NOFOLLOW` on Unix), and the
+/// opened handle must be a regular file. Whatever the path pointed at between the
+/// check and the read, the bytes returned come from the file that was checked.
+pub(crate) fn read_store_file(
+    store_root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<String, StoreReadError> {
+    use std::io::Read;
+
+    let root = std::fs::canonicalize(store_root).map_err(StoreReadError::Io)?;
+    let parent = path.parent().ok_or(StoreReadError::Escapes)?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(StoreReadError::Io)?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(StoreReadError::Escapes);
+    }
+    let link = std::fs::symlink_metadata(path).map_err(StoreReadError::Io)?;
+    if link.file_type().is_symlink() || !link.is_file() {
+        return Err(StoreReadError::Escapes);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        // ELOOP: the final component was swapped for a symlink after the check.
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return StoreReadError::Escapes;
+        }
+        StoreReadError::Io(error)
+    })?;
+    let opened = file.metadata().map_err(StoreReadError::Io)?;
+    if !opened.is_file() {
+        return Err(StoreReadError::Escapes);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != link.dev() || opened.ino() != link.ino() {
+            return Err(StoreReadError::Escapes);
+        }
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(StoreReadError::Io)?;
+    Ok(content)
 }
 
 /// True for errors that mean "this directory won't accept create/rename" even

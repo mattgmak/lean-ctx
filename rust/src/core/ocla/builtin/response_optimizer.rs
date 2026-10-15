@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
 //! BuiltinResponseOptimizer — response dedup and cache via OCLA trait.
 //!
 //! Wraps `proxy/response_optimizer.rs` behind the canonical trait interface.
-//! Emits ResponseOptimized events to OclaBus. The actual cache and dedup
+//! The actual cache and dedup
 //! logic is delegated to the existing optimizer; this provides the trait seam.
 
 use crate::core::ocla::traits::{OclaService, ResponseOptimizer};
@@ -9,7 +10,6 @@ use crate::core::ocla::types::{
     OclaCapability, OclaCapabilityKind, OclaResult, ResponseOptimizationRequest,
     ResponseOptimizationResult,
 };
-use crate::core::ocla_bus::{self, OclaEvent};
 
 pub struct BuiltinResponseOptimizer;
 
@@ -26,6 +26,10 @@ impl Default for BuiltinResponseOptimizer {
 }
 
 impl OclaService for BuiltinResponseOptimizer {
+    fn manifest(&self) -> crate::core::ocla::OclaResult<lean_ctx_protocol::CapabilityManifestV1> {
+        crate::core::ocla::capability_fabric::builtin_manifest(&self.capability())
+    }
+
     fn capability(&self) -> OclaCapability {
         OclaCapability::available(OclaCapabilityKind::ResponseOptimizer)
     }
@@ -38,12 +42,6 @@ impl ResponseOptimizer for BuiltinResponseOptimizer {
         request: ResponseOptimizationRequest,
     ) -> OclaResult<ResponseOptimizationResult> {
         let decision = crate::proxy::response_optimizer::optimize_response(&request);
-
-        ocla_bus::emit(OclaEvent::ResponseOptimized {
-            cache_hit: decision.cache_hit,
-            is_duplicate: decision.is_duplicate,
-            tokens_saved: decision.tokens_saved,
-        });
 
         Ok(ResponseOptimizationResult {
             response_ref: request.response_ref.clone(),

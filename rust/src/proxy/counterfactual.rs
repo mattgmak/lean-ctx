@@ -23,7 +23,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::http::request::Parts;
+// The `http` crate's type (what axum re-exports), so the slot builds without
+// the `http-server` feature (#586).
+use http::request::Parts;
 use serde_json::Value;
 
 /// Probe timeout: `count_tokens` typically answers in well under a second; a
@@ -132,7 +134,15 @@ pub(crate) fn maybe_spawn_probe(
     {
         return None;
     }
-    let body = probe_body(original?, original_model)?;
+    // The probe is a second egress to the provider: it carries the admitted
+    // request, never content the gateway masked or withheld (G6).
+    let target = crate::core::context_admission::egress::EgressTarget {
+        provider: "Anthropic",
+        model: original_model,
+        upstream_base,
+    };
+    let admitted = crate::core::context_admission::egress::admitted_copy(original?, &target)?;
+    let body = probe_body(&admitted, original_model)?;
 
     let url = format!(
         "{}/v1/messages/count_tokens",

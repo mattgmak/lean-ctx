@@ -1066,21 +1066,27 @@ mod tests {
     }
 
     #[test]
-    fn run_project_benchmark_on_current_crate() {
-        let bench = run_project_benchmark("src");
+    fn run_project_benchmark_on_multi_language_fixture() {
+        // The shared benchmark_compare fixture exercises the same scan/measure
+        // path in milliseconds; scanning the real `src/` took ~7 s.
+        let root = crate::core::benchmark_compare::tests::fixture_root();
+        let bench = run_project_benchmark(&root.to_string_lossy());
         assert!(bench.files_measured > 0);
         assert!(bench.total_raw_tokens > 0);
         assert!(!bench.languages.is_empty());
         assert!(!bench.mode_summaries.is_empty());
 
         for lang in &bench.languages {
-            assert!(!lang.best_mode.is_empty());
+            assert!(!lang.best_mode.is_empty(), "`lang.best_mode` is empty");
             assert!(lang.best_savings_pct >= 0.0);
         }
 
         let json = format_json(&bench);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(!parsed["files"].as_array().unwrap().is_empty());
+        assert!(
+            !parsed["files"].as_array().unwrap().is_empty(),
+            "`parsed[\"files\"].as_array().unwrap()` is empty"
+        );
 
         let md = format_markdown(&bench);
         assert!(md.contains("lean-ctx Benchmark Report"));

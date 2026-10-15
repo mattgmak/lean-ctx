@@ -154,6 +154,9 @@ mod tests {
 
     #[test]
     fn publish_then_import_roundtrips() {
+        // The timeline lives under `<data_dir>`; without isolation a parallel
+        // test can swap the data dir between `import` and `load_entries`.
+        let _data = crate::core::data_dir::isolated_data_dir();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("share.ctxsnapshot.json");
         let snap = signed_snapshot();
@@ -203,6 +206,10 @@ mod tests {
 
     #[test]
     fn publish_signs_an_unsigned_snapshot() {
+        // Signing creates a key in the data dir: without isolation it resolved
+        // the dir of whichever parallel test had just set LEAN_CTX_DATA_DIR and
+        // failed with ENOENT once that test removed it.
+        let _data = crate::core::data_dir::isolated_data_dir();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("fresh.ctxsnapshot.json");
         let mut snap = ContextSnapshotV1::new("2026-06-28T00:00:00Z".into(), "9.9.9".into());

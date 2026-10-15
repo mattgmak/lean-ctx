@@ -1,8 +1,12 @@
 # LeanCTX integration guides
 
-LeanCTX is a local Context SDK for existing AI agents. It controls the context
-path before inference; it does not replace the agent or become an agent
-platform.
+**Context Gateway for AI Systems**
+
+**Control what your AI can see.**
+
+**Select → Control → Prove:** the LeanCTX Engine prepares context, applies
+supported controls and records observable evidence. The LeanCTX SDK embeds
+supported interfaces; it does not replace the agent or become an agent platform.
 
 ## Local setup
 
@@ -26,6 +30,13 @@ integration.
 - Local configuration makes context selection, representation, reuse, and
   recovery inspectable for a project.
 
+[Seeing what lean-ctx did](value-display.md) covers the status line, prompt
+segment, milestone notifications and commit trailer, including how to
+interpret each indicator, its measurement type, and its limits.
+
+[Semantic code intelligence](semantic-intelligence.md) covers language-server
+evidence on graph edges: modes, server installation, and how to read it.
+
 The generated [MCP tool inventory](../reference/generated/mcp-tools.md) and
 [configuration inventory](../reference/generated/config-keys.md) are the
 current implementation reference.
@@ -48,14 +59,14 @@ not turn a local counter or a mode description into a universal savings claim.
 
 - **Attach — Available:** CLI, MCP, hooks, or proxy around an existing coding
   agent; evidence is limited to what the integration can observe.
-- **Wrap — Preview:** declared Python SDK v1 reference-wrapper scope only; not
-  a general adapter framework.
-- **Embed — Preview:** native integration into a custom application or agent;
-  the current Engine is implementation substrate, not a general stable facade.
+- **Embed — Available:** the standalone SDK's Stable lifecycle and Agent Tools
+  interfaces, within the published compatibility and license scope.
+- **Wrap / older Embed — Preview:** historical in-tree reference wrappers and
+  embedding experiments; these do not supersede the standalone SDK manifest.
 
 ## Scope-qualified material
 
-- [Embedding reference](embed-sdk.md) — **Preview**.
+- [Embedding guide](embed-sdk.md) — Stable SDK paths and explicit **Preview** limits.
 - [Context Runtime overview](context-infrastructure.md) — current local scope.
 - [Addons](addons.md) — **Research**; no public marketplace or managed
   distribution promise.
@@ -63,5 +74,5 @@ not turn a local counter or a mode description into a universal savings claim.
   substrate; first-class Kits and hosted publication are **Research**.
 - [Hosted index runbook](hosted-index-slo.md) and [organization SSO](org-sso-setup.md) — historical, unshipped service concepts.
 
-For the governing status and product boundary, see
-`docs/internal/README.md` (internal, not in this repository).
+For status and product boundaries, see the
+[canonical positioning](../POSITIONING_CANONICAL.md) and [Vision](../../VISION.md).

@@ -145,10 +145,25 @@ pub(super) fn compress_request_body(
     // the global config flag. The header is checked in forward.rs and the
     // result is threaded through via a thread-local set by the caller.
     let _headroom_compat = config_headroom || HEADROOM_REQUEST.get();
-    let system_aggr = cfg.proxy.resolved_role_aggressiveness(ProseRole::System);
-    let user_aggr = cfg.proxy.resolved_role_aggressiveness(ProseRole::User);
-    let live_compress = cfg.proxy.live_compresses();
-    let mode = cfg.proxy.resolved_history_mode();
+    // #1905: input-compression holdout. The forward path decided the arm on the
+    // pristine body; the control arm turns off every input-compression stage so
+    // the meter sees a real uncompressed baseline. Cache-only features stay as
+    // they are in both arms, keeping the comparison about compression alone.
+    let compression_control = super::holdout::in_compression_control();
+    let system_aggr = cfg
+        .proxy
+        .resolved_role_aggressiveness(ProseRole::System)
+        .filter(|_| !compression_control);
+    let user_aggr = cfg
+        .proxy
+        .resolved_role_aggressiveness(ProseRole::User)
+        .filter(|_| !compression_control);
+    let live_compress = cfg.proxy.live_compresses() && !compression_control;
+    let mode = if compression_control {
+        HistoryMode::Off
+    } else {
+        cfg.proxy.resolved_history_mode()
+    };
     // #939: active prompt-cache breakpoint injection (opt-in, Anthropic-only).
     // Resolved up front so the meter-only short-circuit below does not skip the
     // one mutation this mode performs — its whole point is to add a cache anchor
@@ -259,6 +274,7 @@ pub(super) fn compress_request_body(
     // (`worth_repacking`). The gate is an extra AND-condition, so it can only make
     // repacking *more* conservative; default-off proxies keep the prior value.
     let repack = cfg.proxy.repacks_cold_prefix()
+        && !compression_control
         && doc
             .get("messages")
             .and_then(|m| m.as_array())
@@ -271,41 +287,76 @@ pub(super) fn compress_request_body(
     // normally, or 0 when we are intentionally repacking the cold prefix.
     let protect = if repack { 0 } else { cached };
 
-    // System prose: only when nothing is client-cached and the `system` field
-    // carries no `cache_control` of its own — otherwise it anchors the cache.
-    // A cold-prefix repack (`protect == 0` with `repack`) deliberately rewrites
-    // it to re-seed a leaner cache.
-    let model_name = doc
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("default")
-        .to_owned();
+    // System prose: compressed freely when nothing is client-cached, or when a
+    // cold-prefix repack deliberately rewrites it to re-seed a leaner cache.
+    // With a warm cached prefix the system block is part of that prefix, so
+    // mutating it busts the cache: only the cache-economics gate may approve
+    // that, priced on the whole prefix, and a per-conversation latch then keeps
+    // every later turn on the compressed prefix (#1912). A `cache_control` on
+    // `system` itself always anchors it (unless repacking).
+    let warm_gate = if system_aggr.is_some()
+        && !repack
+        && cached > 0
+        && cache_economics
+        && doc
+            .get("system")
+            .is_some_and(|s| !prose::value_has_cache_control(s))
+    {
+        let messages = doc
+            .get("messages")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        super::cold_prefix::conversation_key(messages).map(|key| {
+            (
+                key,
+                super::cache_policy::prefix_tokens(doc.get("system"), messages, cached),
+                super::cache_policy::observed_prefix_reuse(messages),
+                doc.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_owned(),
+            )
+        })
+    } else {
+        None
+    };
     if let Some(a) = system_aggr
-        && protect == 0
         && let Some(system) = doc.get_mut("system")
         && (repack || !prose::value_has_cache_control(system))
     {
-        let should_compress = if repack || cached == 0 {
-            true
-        } else {
-            let sys_tokens = prose::estimate_tokens(system) as u64;
-            let estimated_after = (sys_tokens as f64 * (1.0 - a)).max(0.0) as u64;
-            let reuse_rate = super::cache_attribution::estimated_reuse_rate();
-            let model_cost = super::cache_policy::model_cost_for(&model_name);
-            let gate = super::cache_policy::should_mutate_frozen(
-                sys_tokens,
-                estimated_after,
-                reuse_rate,
-                &model_cost,
-            );
-            matches!(gate, super::cache_policy::MutationDecision::Mutate { .. })
-        };
-        if should_compress {
-            let n = prose::compress_system_value(system, a);
-            if n > 0 {
-                prose_segments += u64::from(n);
-                modified = true;
+        let segments = if repack || cached == 0 {
+            prose::compress_system_value(system, a)
+        } else if let Some((key, prefix_before, reuse, model_name)) = warm_gate {
+            let mut candidate = system.clone();
+            let n = prose::compress_system_value(&mut candidate, a);
+            let latched = super::cold_prefix::system_compression_latched(key);
+            let approve = n > 0
+                && (latched
+                    || matches!(
+                        super::cache_policy::system_mutation_decision(
+                            prefix_before,
+                            system,
+                            &candidate,
+                            reuse,
+                            &super::cache_policy::model_cost_for(&model_name),
+                        ),
+                        super::cache_policy::MutationDecision::Mutate { .. }
+                    ));
+            if approve {
+                if !latched {
+                    super::cold_prefix::latch_system_compression(key);
+                }
+                *system = candidate;
+                n
+            } else {
+                0
             }
+        } else {
+            0
+        };
+        if segments > 0 {
+            prose_segments += u64::from(segments);
+            modified = true;
         }
     }
 
@@ -457,11 +508,13 @@ pub(super) fn compress_request_body(
 
     // Prefix replay: if this is an append-only turn, overlay the cached
     // forwarded prefix bytes with the fresh delta for byte-identical prefix.
-    let system_val_replay = doc.get("system");
+    let system_val_replay = doc.get("system").cloned();
     let msgs_replay = doc.get("messages").and_then(Value::as_array);
     let out = if let Some(msgs) = msgs_replay {
-        let conv_id = prefix_replay::conversation_id(system_val_replay, msgs);
-        if let Some(delta) = prefix_replay::detect_append_only(conv_id, msgs) {
+        let conv_id = prefix_replay::conversation_id(system_val_replay.as_ref(), msgs);
+        if let Some(delta) = prefix_replay::detect_append_only(conv_id, msgs)
+            && delta.delta_start < msgs.len()
+        {
             let delta_msgs = &msgs[delta.delta_start..];
             if let Some(replayed) = prefix_replay::overlay_prefix(&delta.prefix_bytes, delta_msgs) {
                 prefix_cache_stats::record_replay_hit();

@@ -2,7 +2,12 @@
 //! `super::*` resolves to the `bm25_index` module.
 
 use super::*;
+use crate::core::context_admission::stores::StoreAdmission;
 use tempfile::tempdir;
+
+fn admission() -> StoreAdmission {
+    StoreAdmission::current()
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -692,24 +697,80 @@ fn list_code_files_includes_extractable_pdf() {
 }
 
 #[test]
-fn list_code_files_respects_max_files_cap() {
+fn list_code_files_honors_bm25_max_files_config() {
+    // The cap is handed in as a `Config` value, not through
+    // LEAN_CTX_CONFIG_DIR: pointing the process-wide config at a
+    // `bm25_max_files = 3` file leaked that cap into every parallel test that
+    // reads the config without the env lock — e.g. the public
+    // `build_from_directory` indexed 3 files where its own listing saw 41.
     let td = tempdir().expect("tempdir");
     let root = td.path();
 
-    // Create more files than MAX_BM25_FILES wouldn't let us test easily (5000),
-    // but we can verify the cap constant exists and the function returns a bounded vec.
-    for i in 0..10 {
+    for i in 0..6 {
         std::fs::write(
             root.join(format!("f{i}.rs")),
             format!("pub fn f{i}() {{}}\n"),
         )
         .expect("write");
     }
-    let files = list_code_files(root);
-    assert!(
-        files.len() <= MAX_BM25_FILES,
-        "file count should not exceed MAX_BM25_FILES"
+
+    let cfg = crate::core::config::Config {
+        bm25_max_files: 3,
+        ..Default::default()
+    };
+    let files = list_code_files_with(root, &CorpusRules::from_config(&cfg));
+
+    assert_eq!(
+        files.len(),
+        3,
+        "bm25_max_files should bound the BM25 corpus"
     );
+}
+
+/// Regression: a semantic search scoped to a small directory of a project over
+/// the file budget failed with "source file budget exceeded" — the whole
+/// project was walked and counted before the scope was applied.
+#[test]
+fn scoped_listing_counts_only_in_scope_sources() {
+    let td = tempdir().expect("tempdir");
+    let root = td.path();
+    std::fs::create_dir_all(root.join("big")).expect("mkdir");
+    std::fs::create_dir_all(root.join("small/inner")).expect("mkdir");
+    for i in 0..6 {
+        std::fs::write(root.join(format!("big/f{i}.rs")), "pub fn f() {}\n").expect("write");
+    }
+    std::fs::write(root.join("small/a.rs"), "pub fn a() {}\n").expect("write");
+    std::fs::write(root.join("small/inner/b.py"), "def b(): pass\n").expect("write");
+
+    let cfg = crate::core::config::Config {
+        bm25_max_files: 3,
+        ..Default::default()
+    };
+    let rules = CorpusRules::from_config(&cfg);
+    let err = list_scoped_code_files(root, &rules, true, None, &|_| true)
+        .expect_err("unscoped walk is over budget and fails closed");
+    assert!(
+        err.contains("bm25_max_files"),
+        "error names the remedy: {err}"
+    );
+
+    let scoped = list_scoped_code_files(root, &rules, true, Some("small"), &|_| true)
+        .expect("a scoped walk stays within budget");
+    let scoped: Vec<String> = scoped.iter().map(|p| p.replace('\\', "/")).collect();
+    assert_eq!(
+        scoped,
+        ["small/a.rs", "small/inner/b.py"],
+        "paths stay project-relative"
+    );
+
+    let rust_only = list_scoped_code_files(root, &rules, true, None, &|p| {
+        p.starts_with("small")
+            && std::path::Path::new(p)
+                .extension()
+                .is_some_and(|e| e == "rs")
+    })
+    .expect("a filtered walk counts only matching files");
+    assert_eq!(rust_only.len(), 1);
 }
 
 #[test]
@@ -779,8 +840,8 @@ fn parallel_build_matches_sequential() {
     let files = write_parallel_corpus(root, 40);
 
     let hint = HashMap::new();
-    let seq = BM25Index::build_sequential(root, &hint, &files);
-    let par = BM25Index::build_parallel(root, &hint, &files);
+    let seq = BM25Index::build_sequential(root, &hint, &files, &admission());
+    let par = BM25Index::build_parallel(root, &hint, &files, &admission());
 
     assert!(par.doc_count > files.len(), "expected multiple chunks/file");
     assert_same_index(&seq, &par);
@@ -793,8 +854,8 @@ fn parallel_build_is_deterministic_across_runs() {
     let files = write_parallel_corpus(root, 48);
     let hint = HashMap::new();
 
-    let a = BM25Index::build_parallel(root, &hint, &files);
-    let b = BM25Index::build_parallel(root, &hint, &files);
+    let a = BM25Index::build_parallel(root, &hint, &files, &admission());
+    let b = BM25Index::build_parallel(root, &hint, &files, &admission());
     assert_same_index(&a, &b);
 }
 
@@ -808,8 +869,8 @@ fn parallel_build_batched_merge_matches_sequential() {
     let files = write_parallel_corpus(root, 40);
     let hint = HashMap::new();
 
-    let seq = BM25Index::build_sequential(root, &hint, &files);
-    let batched = BM25Index::build_parallel_batched(root, &hint, &files, 7);
+    let seq = BM25Index::build_sequential(root, &hint, &files, &admission());
+    let batched = BM25Index::build_parallel_batched(root, &hint, &files, 7, &admission());
     assert_same_index(&seq, &batched);
 }
 
@@ -828,7 +889,7 @@ fn build_from_directory_dispatches_parallel_and_matches_sequential() {
     );
 
     let public = BM25Index::build_from_directory(root);
-    let seq = BM25Index::build_sequential(root, &HashMap::new(), &files);
+    let seq = BM25Index::build_sequential(root, &HashMap::new(), &files, &admission());
     assert_same_index(&seq, &public);
 }
 
@@ -875,8 +936,10 @@ fn parallel_incremental_matches_sequential() {
         "corpus must trigger the parallel rebuild path"
     );
 
-    let seq = BM25Index::rebuild_incremental_sequential(root, &prev, &old_by_file, &files);
-    let par = BM25Index::rebuild_incremental_parallel(root, &prev, &old_by_file, &files);
+    let seq =
+        BM25Index::rebuild_incremental_sequential(root, &prev, &old_by_file, &files, &admission());
+    let par =
+        BM25Index::rebuild_incremental_parallel(root, &prev, &old_by_file, &files, &admission());
 
     // The whole contract: identical chunk order, postings, doc_freqs, file set.
     assert_same_index(&seq, &par);
@@ -918,7 +981,8 @@ fn rebuild_incremental_dispatches_parallel_and_matches_sequential() {
     assert!(files.len() >= super::build::PARALLEL_MIN_FILES);
 
     let public = BM25Index::rebuild_incremental(root, &prev);
-    let seq = BM25Index::rebuild_incremental_sequential(root, &prev, &old_by_file, &files);
+    let seq =
+        BM25Index::rebuild_incremental_sequential(root, &prev, &old_by_file, &files, &admission());
     assert_same_index(&seq, &public);
 }
 
@@ -956,13 +1020,25 @@ fn parallel_incremental_rebuild_perf_gate() {
     let best = |f: &dyn Fn() -> std::time::Duration| (0..3).map(|_| f()).min().unwrap();
     let seq = best(&|| {
         let t = std::time::Instant::now();
-        let idx = BM25Index::rebuild_incremental_sequential(root, &prev, &old_by_file, &files);
+        let idx = BM25Index::rebuild_incremental_sequential(
+            root,
+            &prev,
+            &old_by_file,
+            &files,
+            &admission(),
+        );
         std::hint::black_box(&idx);
         t.elapsed()
     });
     let par = best(&|| {
         let t = std::time::Instant::now();
-        let idx = BM25Index::rebuild_incremental_parallel(root, &prev, &old_by_file, &files);
+        let idx = BM25Index::rebuild_incremental_parallel(
+            root,
+            &prev,
+            &old_by_file,
+            &files,
+            &admission(),
+        );
         std::hint::black_box(&idx);
         t.elapsed()
     });
@@ -1000,8 +1076,8 @@ fn parallel_build_search_parity() {
     let files = write_parallel_corpus(root, 40);
     let hint = HashMap::new();
 
-    let seq = BM25Index::build_sequential(root, &hint, &files);
-    let par = BM25Index::build_parallel(root, &hint, &files);
+    let seq = BM25Index::build_sequential(root, &hint, &files, &admission());
+    let par = BM25Index::build_parallel(root, &hint, &files, &admission());
 
     let q = "process item transform";
     let rs = seq.search(q, 10);
@@ -1257,5 +1333,40 @@ fn minified_payloads_stay_out_of_the_index() {
         !index.files.contains_key("swagger-ui-bundle.js"),
         "the minified bundle must be skipped, got {:?}",
         index.files.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn persisted_chunk_count_reads_the_length_prefix_without_loading() {
+    let _data = crate::core::data_dir::isolated_data_dir();
+    let td = tempdir().expect("tempdir");
+    let root = td.path();
+    assert_eq!(
+        BM25Index::persisted_chunk_count(root),
+        None,
+        "nothing saved yet"
+    );
+
+    BM25Index::default().save(root).expect("save empty index");
+    assert_eq!(
+        BM25Index::persisted_chunk_count(root),
+        Some(0),
+        "an empty index must report zero chunks, not look ready"
+    );
+
+    let mut body = String::new();
+    for i in 0..200 {
+        body.push_str(&format!("pub fn f{i}() -> u32 {{ {i} }}\n\n"));
+    }
+    std::fs::write(root.join("many.rs"), body).expect("write");
+    let index = BM25Index::build_from_directory(root);
+    assert!(
+        index.chunks.len() > 127,
+        "fixture must need a multi-byte varint"
+    );
+    index.save(root).expect("save");
+    assert_eq!(
+        BM25Index::persisted_chunk_count(root),
+        Some(index.chunks.len() as u64)
     );
 }

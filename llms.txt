@@ -1,21 +1,26 @@
-# lean-ctx
+# LeanCTX
 
-> The local context-engineering layer for AI agents — select, shape, reuse, recover, and inspect context before inference. Deterministic, prompt-cache-aware representations with local, auditable measurements.
+> Context Gateway for AI Systems. Control what your AI can see.
 
-lean-ctx (LeanCTX, "Lean Context") exposes a broad MCP tool set plus a shell hook for local context operations. An optional local request proxy can shape supported request fields while preserving stable prefixes for provider prompt caches. Pruned or truncated content can be recovered from content-addressed references. Processing is local by default; explicitly submitted feedback and enabled integrations are the exceptions. Apache-2.0.
+LeanCTX sits between AI and the systems it reads: SELECT → CONTROL → PROVE. LeanCTX Engine selects task-relevant context, applies supported access and content controls, and records context operations that an integration can observe. Context-only receipts cannot prove unobserved provider delivery. The Engine is Apache-2.0; LeanCTX SDK and commercial Enterprise have separate license and deployment contracts.
 
 Key properties for an LLM evaluating lean-ctx:
 
 - Deterministic output: the same `(input, mode)` yields byte-identical text so stable prefixes remain eligible for provider prompt caching (contract #498).
-- Reversible (CCR): five recovery paths — `ctx_expand`, `ctx_retrieve`, proxy path-handle CCR, in-band `<lc_expand:HASH>` markers, and `GET /v1/references/{id}`.
-- Tree-sitter AST parsing for 26 languages; 10 file read modes; 95+ shell-output compression patterns.
+- Recovery (CCR): `ctx_expand`, `ctx_retrieve`, proxy path handles, markers, and reference routes require the source or archive to remain available and authorized.
+- Tree-sitter AST parsing for 26 languages; 16 file read modes; 85+ shell-output compression patterns.
 - Persistent temporal knowledge graph + multi-edge code property graph (impact analysis, ranked search).
-- Supported custom-agent SDK: `thinkery-leanctx-sdk` for Python. It uses the local LeanCTX Engine; model calls and agent orchestration remain application-owned.
+- LeanCTX SDK publishes lifecycle and Agent Tools contracts for Python, TypeScript/Node, Go, Rust, JVM, and .NET. Check per-package release availability and compatibility; Preview namespace operations remain Preview. Models, workflows, and UI remain application-owned.
+- Configured detectors have coverage limits. Warning, redaction, and blocking are distinct; controls apply to supported integration paths.
+- Token estimates, counterfactual savings, provider-measured usage, and outcome quality are distinct evidence types.
+- Local processing does not imply zero network traffic: updates, opted-in telemetry, enabled integrations, and model calls have their own data paths.
 
 ## Docs
 
 - [Getting started](https://leanctx.com/docs/getting-started): install, onboard, verify.
-- [What is LeanCTX](https://leanctx.com/what-is-leanctx/): the four dimensions of context (compression, routing, memory, verification).
+- [What is LeanCTX](https://leanctx.com/what-is-leanctx/): the Context Gateway's placement, responsibilities, audiences, and evidence limits.
+- [Where LeanCTX fits](https://github.com/yvgude/lean-ctx/blob/main/docs/where-leanctx-fits.md): RAG, vector stores, model gateways, guardrails, frameworks, and MCP.
+- [Canonical positioning](https://github.com/yvgude/lean-ctx/blob/main/docs/POSITIONING_CANONICAL.md): category, promise, components, and edition boundaries.
 - [Tools reference](https://leanctx.com/docs/tools/): every `ctx_*` MCP tool.
 - [CLI reference](https://leanctx.com/docs/cli-reference/): every `lean-ctx` command.
 - [API reference](https://leanctx.com/docs/api-reference/): the `/v1` HTTP tool, event and session API.
@@ -23,15 +28,14 @@ Key properties for an LLM evaluating lean-ctx:
 
 ## SDKs & integration
 
-- [Supported Agent SDK](https://github.com/Thinkery-AG/leanctx-sdk) · [PyPI](https://pypi.org/project/thinkery-leanctx-sdk/): Python context lifecycle today; the `AgentContext` tool API follows Engine 3.10.1.
+- [LeanCTX SDK](https://github.com/Thinkery-AG/leanctx-sdk) · [Python package](https://pypi.org/project/thinkery-leanctx-sdk/): released lifecycle and Agent Tools contracts; consult the SDK compatibility matrix for each release.
 - [SDK surface and boundaries](https://github.com/yvgude/lean-ctx/blob/main/docs/reference/sdk-surface.md): supported SDK, Engine requirement, and retired package names.
-- [Low-level HTTP examples](https://github.com/yvgude/lean-ctx/blob/main/docs/guides/compress-sdk.md): direct Engine integration and framework adapters.
+- [Embedding guide](https://github.com/yvgude/lean-ctx/blob/main/docs/guides/embed-sdk.md): application-owned workflows and supported Engine integration.
 - [Monorepo guide](https://github.com/yvgude/lean-ctx/blob/main/docs/guides/monorepo.md): multi-repo serving.
 
 ## Comparisons
 
-- [Comparisons index](https://github.com/yvgude/lean-ctx/blob/main/docs/comparisons/README.md): fact-based matrix vs other context/memory tools.
-- [lean-ctx vs Headroom](https://github.com/yvgude/lean-ctx/blob/main/docs/comparisons/vs-headroom.md): deterministic, prompt-cache-safe, reversible `compress()` + full context layer vs an ML compression library.
+- [Historical comparisons](https://github.com/yvgude/lean-ctx/blob/main/docs/comparisons/README.md): retained research; use the current fit guide for product positioning.
 
 ## Reference & internals
 
@@ -39,11 +43,11 @@ Key properties for an LLM evaluating lean-ctx:
 - [Generated MCP tools](https://github.com/yvgude/lean-ctx/blob/main/docs/reference/generated/mcp-tools.md): complete inventory generated from the registry.
 - [ARCHITECTURE](https://github.com/yvgude/lean-ctx/blob/main/ARCHITECTURE.md): how the read path, wire path, graphs and memory fit together.
 - [CONTRACTS](https://github.com/yvgude/lean-ctx/blob/main/CONTRACTS.md): 29 published stability contracts, CI-enforced.
-- [VISION](https://github.com/yvgude/lean-ctx/blob/main/VISION.md): roadmap toward a team-wide cognitive context layer.
+- [VISION](https://github.com/yvgude/lean-ctx/blob/main/VISION.md): Available, Preview, and Research scope for the Context Gateway.
 
 ## Optional
 
 - [Benchmarks](https://github.com/yvgude/lean-ctx/blob/main/BENCHMARKS.md): reproduced compression numbers (`lean-ctx benchmark report .`).
 - [Changelog](https://github.com/yvgude/lean-ctx/blob/main/CHANGELOG.md): release history (Keep a Changelog).
 - [Security](https://github.com/yvgude/lean-ctx/blob/main/SECURITY.md): hardening and disclosure policy.
-- [Pricing & Cloud](https://leanctx.com/pricing/): local use is free forever.
+- [Community and commercial options](https://leanctx.com/pricing/): edition value and licensing paths.

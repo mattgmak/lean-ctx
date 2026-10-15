@@ -35,13 +35,59 @@ pub fn canonical_body() -> String {
     )
 }
 
-/// `(relative_path, content)` for every artifact the generator writes. All
-/// artifacts share one canonical body today; the shape leaves room for
-/// per-path bodies later without changing callers.
+/// The repo-root skill (installed by `skills/lean-ctx/scripts/install.sh` and
+/// skill marketplaces) is a verbatim copy of the template `lean-ctx setup`
+/// installs, so the two can never drift apart again.
+pub const SKILL_COPY_PATH: &str = "skills/lean-ctx/SKILL.md";
+
+/// The Claude Code mod's development workspace (`claude plugin test`, `tsc`,
+/// `--plugin-dir`) mirrors the sources the binary embeds and installs
+/// (`templates/claude_mod/`), so what is tested is exactly what ships.
+pub const CLAUDE_MOD_COPIES: &[(&str, &str)] = &[
+    (
+        "integrations/claude-code-mod/hooks/register.ts",
+        crate::hooks::agents::claude_mod::REGISTER_TS,
+    ),
+    (
+        "integrations/claude-code-mod/hooks/hooks.json",
+        crate::hooks::agents::claude_mod::HOOKS_JSON,
+    ),
+    (
+        "integrations/claude-code-mod/.claude-plugin/plugin.json",
+        crate::hooks::agents::claude_mod::PLUGIN_JSON,
+    ),
+    (
+        "integrations/claude-code-mod/hooks/cockpit.tsx",
+        crate::hooks::agents::claude_mod::COCKPIT_TSX,
+    ),
+    (
+        "integrations/claude-code-mod/hooks/render.tsx",
+        crate::hooks::agents::claude_mod::RENDER_TSX,
+    ),
+    (
+        "integrations/claude-code-mod/types/index.d.ts",
+        crate::hooks::agents::claude_mod::TYPES_DTS,
+    ),
+];
+
+/// `(relative_path, content)` for every artifact the generator writes: the
+/// versioned rule artifacts (one canonical body), the skill copy, and the
+/// Claude Code mod workspace copies.
 #[must_use]
 pub fn artifacts() -> Vec<(&'static str, String)> {
     let body = canonical_body();
-    ARTIFACT_PATHS.iter().map(|p| (*p, body.clone())).collect()
+    let mut arts: Vec<(&'static str, String)> =
+        ARTIFACT_PATHS.iter().map(|p| (*p, body.clone())).collect();
+    arts.push((
+        SKILL_COPY_PATH,
+        include_str!("../templates/SKILL.md").to_string(),
+    ));
+    arts.extend(
+        CLAUDE_MOD_COPIES
+            .iter()
+            .map(|(path, content)| (*path, (*content).to_string())),
+    );
+    arts
 }
 
 #[cfg(test)]
@@ -65,10 +111,11 @@ mod tests {
     #[test]
     fn artifacts_cover_every_declared_path() {
         let arts = artifacts();
-        assert_eq!(arts.len(), ARTIFACT_PATHS.len());
-        for (path, body) in arts {
-            assert!(ARTIFACT_PATHS.contains(&path));
-            assert!(!body.is_empty());
+        for declared in ARTIFACT_PATHS.iter().chain([&SKILL_COPY_PATH]) {
+            assert!(
+                arts.iter().any(|(p, b)| p == declared && !b.is_empty()),
+                "{declared} missing from the generator output"
+            );
         }
     }
 }

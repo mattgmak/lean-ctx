@@ -1,63 +1,73 @@
 # LeanCTX Vision
 
-> **Canonical sources:**
-> [docs/internal/README.md](docs/internal/README.md) and
-> [docs/internal/vision/PRODUCT-ARCHITECTURE.md](docs/internal/vision/PRODUCT-ARCHITECTURE.md).
-> Those documents govern this summary. They win if wording or status differs.
+**Context Gateway for AI Systems**
 
-## The product
+**Control what your AI can see.**
 
-**LeanCTX is the Context SDK for AI Agents.** It sits inside or alongside an
-existing agent loop and controls how context is selected, shaped, reused,
-recovered, and measured before inference.
+LeanCTX sits between AI and the systems it reads. It selects task-relevant
+context, applies supported access and content controls before delivery, and
+records observable context operations and delivery evidence.
 
-LeanCTX does not replace the customer's agent, task logic, model choice,
-tools, or retry policy. Thinkery is the company and commercial operator; it is
-not a competing developer product.
+## Select → Control → Prove
 
-The context lifecycle is:
+Give AI useful context. Decide what may cross the boundary. Inspect what
+happened. This is one product, with three complementary responsibilities.
+
+The **LeanCTX Engine** implements the runtime capabilities. The **LeanCTX SDK**
+connects applications to supported Engine interfaces. **Context Intelligence**
+describes the retrieval, structural understanding and preparation inside the
+Gateway; it is not a separate product category.
+
+The technical context lifecycle remains:
 
 ```text
 Select → Shape → Reuse → Recover
 ```
 
-Context shapes performance. Evidence is separate: a valid gain compares the
-same workload against a known baseline and treatment, with a declared quality
-threshold and visible methodology. A cheaper failed task is not a win.
+The customer owns the application, agent loop, task logic, model and retry policy.
+Coding agents are an important adoption path alongside embedded applications.
 
-## Integration
+## Product and status boundaries
 
-| Depth | What it means | Status |
-| --- | --- | --- |
-| **Attach** | Add LeanCTX around an existing coding agent through CLI setup, MCP, or a proxy/sidecar. | **Available** locally; common v1 identity and Receipt semantics are **Preview**. |
-| **Wrap** | Use a declared SDK/client adapter around a supported agent or client. | **Preview**. |
-| **Embed** | Integrate LeanCTX natively in a custom agent or application. | **Preview**. |
+| Surface | Status and scope |
+|---|---|
+| Community Engine | **Available:** local CLI, MCP, supported hooks/proxy integrations, retrieval, structural views, compression, cache, recovery, configured controls and local evidence. Apache-2.0. |
+| Pro | **Available:** optional Personal Cloud sync/backup and hosted personal index within the selected plan's limits. This existing commercial plan does not make newer intelligence features available without a named release. |
+| Standalone LeanCTX SDK | **Available** Stable lifecycle and Agent Tools within its published compatibility contract. Separate source-available license; production/OEM rights require a commercial agreement. |
+| SDK Preview | **Preview:** workspace, checkpoint, delta, handoff and other interfaces explicitly placed in the SDK Preview namespace. |
+| Enterprise | Commercial organization controls and deployment under a licensed release and agreement. Its availability is established by Enterprise contracts, not by this OSS repository. |
+| Research directions | First-class Context Kits, universal workspace/coordination contracts, Performance Profiles as a promoted product, Performance Benchmark, AutoTune and marketplace directions remain **Research** unless individually promoted through a release gate. |
 
-Deeper integration increases observability and control; it never authorizes a
-claim that the evidence cannot support.
+The stable SDK manifest is independent of older in-tree Python wrappers and
+embedding experiments. A source directory or passing unit test does not establish
+a release. Conversely, an old OSS research note does not demote an available
+commercial capability.
 
-## Status discipline
+## Integration and visibility
 
-| Status | Meaning | Current scope |
-| --- | --- | --- |
-| **Available** | A local OSS capability has a real user path. | Runtime; CLI, MCP, proxy and local Attach paths; context selection, structural views, compression, reuse and recovery; local Receipt/evidence and offline-verification primitives. |
-| **Preview** | A narrow contract is converging and must keep explicit compatibility and evidence limits. | Python SDK v1/reference-wrapper scope; Wrap and Embed contracts; common session and Receipt convergence; explicit capability and degradation matrices. |
-| **Research** | A direction or private-commercial intent, not a public product promise. | Performance Benchmark; Performance Profiles; first-class Context Kits; canonical evidence bundle; AutoTune; organization control plane and LeanCTX Cloud; managed operation; external-capability composition; public benchmark/index; marketplace and agent-building. |
+- **Attach:** configure LeanCTX around an existing tool through a supported
+  local CLI, MCP, hook or proxy path.
+- **Embed:** use the standalone SDK's supported interfaces in your application.
+  Stable and Preview APIs retain their own compatibility guarantees.
+- **Deploy:** choose the Enterprise controls and operating model covered by
+  the licensed release and agreement.
 
-An implementation directory, a command, or an internal type is not by itself a
-public API or shipping claim.
+In context-only mode, the application receives prepared context and owns the
+model call. Model/provider execution controls apply only to supported requests
+actually routed through LeanCTX. Receipts cannot observe unrelated host actions.
 
-## Guardrails
+## Evidence before claims
 
-- Local-first and model-agnostic: LeanCTX controls context, not the customer's
-  agent or default model routing.
-- Inspectable and recoverable: an optimized representation must preserve a
-  path back to exact source when the task needs it.
-- Evidence-led: savings require a comparable baseline, quality gate, cost
-  basis, methodology, and verifiable evidence.
-- No premature platform: hosted control planes, managed execution, marketplace
-  surfaces, and autonomous tuning remain outside the current public OSS
-  product.
+Compare the same workload, baseline and treatment with declared measurement
+methods and quality criteria. Token reduction, estimated cost, provider-reported
+usage and accepted outcomes are different facts. A cheaper failed task is not a
+win, and a signed receipt is not a universal savings guarantee.
 
-Use the internal sources above for the authoritative feature map, product
-boundary, vocabulary, and release status.
+Local context remains useful without an account or hosted service. Recovery
+depends on the retained source, permission and retention policy. Security rules
+cover configured detectors and supported paths, not every possible data leak.
+
+The [canonical positioning](docs/POSITIONING_CANONICAL.md) and
+[public claims contract](docs/contracts/public-product-claims-v1.md) govern current
+public language. [What is LeanCTX?](docs/what-is-leanctx.md) explains the product;
+[architecture](ARCHITECTURE.md) maps the supported boundaries.

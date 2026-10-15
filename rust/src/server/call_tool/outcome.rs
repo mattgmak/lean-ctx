@@ -76,7 +76,10 @@ pub(in crate::server) fn finalize_call_result(
 /// as a success with a timeout marker, not as an error. The partial output is
 /// often enough to answer the question; treating it as a failure causes the
 /// client to retry the entire pipeline.
-fn is_shell_error(outcome: &crate::server::tool_trait::ShellOutcome, output: &str) -> bool {
+pub(in crate::server) fn is_shell_error(
+    outcome: &crate::server::tool_trait::ShellOutcome,
+    output: &str,
+) -> bool {
     match outcome {
         crate::server::tool_trait::ShellOutcome::Exit(0) => false,
         crate::server::tool_trait::ShellOutcome::Exit(1) => {
@@ -92,5 +95,23 @@ fn is_shell_error(outcome: &crate::server::tool_trait::ShellOutcome, output: &st
         | crate::server::tool_trait::ShellOutcome::Blocked
         | crate::server::tool_trait::ShellOutcome::BackgroundLookupError(_) => true,
         crate::server::tool_trait::ShellOutcome::Background(outcome) => outcome.is_error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::tool_trait::ShellOutcome;
+
+    /// #1881: a signal-terminated command with output used to surface as
+    /// Exit(1) and pass the grep-style exception as a success. As 128+signal
+    /// it is an error regardless of output.
+    #[test]
+    fn signal_termination_with_output_is_error() {
+        let r = finalize_call_result(
+            "partial output\n[exit:143 — SIGTERM]",
+            Some(ShellOutcome::Exit(143)),
+        );
+        assert_eq!(r.is_error, Some(true));
     }
 }

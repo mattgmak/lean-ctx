@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use lean_ctx_protocol::{
     AcceptanceState, ContextBalanceV1, EngineInvocationV1, EngineObservationV1, ExecutionPlanV1,
     ReceiptChainLinkV1, ReceiptDocumentV1, ReceiptEvidenceKindV1, ReceiptEvidenceRefV1,
@@ -12,6 +12,8 @@ use lean_ctx_protocol::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+pub use lean_ctx_ocla::ReceiptSignerAdmissionV1;
 
 use super::{
     ExecutionEvent, ExecutionLedgerError, ExecutionLedgerStore, PublishedCanonicalReceipt, Result,
@@ -33,16 +35,6 @@ pub struct CanonicalReceiptRecordV1 {
     pub signer_admission: ReceiptSignerAdmissionV1,
 }
 
-/// Server-owned trust snapshot authorizing one external receipt-signing key.
-#[derive(Debug, Clone)]
-pub struct ReceiptSignerAdmissionV1 {
-    pub key_id: String,
-    pub public_key_digest: Sha256Digest,
-    pub admitted_at: UtcTimestamp,
-    pub expires_at: UtcTimestamp,
-    pub revoked_at: Option<UtcTimestamp>,
-}
-
 /// Join, sign, durably publish, and ledger-project one real Engine observation.
 pub fn record_canonical_engine_receipt(
     task: &TaskEnvelopeV1,
@@ -60,7 +52,11 @@ pub fn record_canonical_engine_receipt(
         .validate()
         .map_err(invalid_protocol)?;
     validate_terminal_join(record.status, record.outcome.state)?;
-    validate_signer_admission(&record.signer_admission, signing_key, &record.issued_at)?;
+    validate_signer_admission(
+        &record.signer_admission,
+        &signing_key.verifying_key(),
+        &record.issued_at,
+    )?;
     invocation.validate().map_err(invalid_protocol)?;
     observation
         .validate_for(invocation)
@@ -240,25 +236,13 @@ fn persist_lineage_sidecar<T: Serialize>(value: &T, expected: &Sha256Digest) -> 
     Ok(())
 }
 
-fn validate_signer_admission(
+pub(crate) fn validate_signer_admission(
     admission: &ReceiptSignerAdmissionV1,
-    signing_key: &SigningKey,
+    verifying_key: &VerifyingKey,
     issued_at: &UtcTimestamp,
 ) -> Result<()> {
-    if admission.key_id.is_empty()
-        || digest(signing_key.verifying_key().as_bytes()) != admission.public_key_digest.as_str()
-        || issued_at.as_str() < admission.admitted_at.as_str()
-        || issued_at.as_str() >= admission.expires_at.as_str()
-        || admission
-            .revoked_at
-            .as_ref()
-            .is_some_and(|revoked| issued_at.as_str() >= revoked.as_str())
-    {
-        return Err(ExecutionLedgerError::InvalidRecord(
-            "receipt signing key is not admitted by the server trust snapshot".to_owned(),
-        ));
-    }
-    Ok(())
+    lean_ctx_ocla::validate_signer_admission(admission, verifying_key, issued_at)
+        .map_err(invalid_protocol)
 }
 
 fn validate_terminal_join(status: ReceiptTerminalStatusV1, outcome: AcceptanceState) -> Result<()> {
@@ -324,9 +308,6 @@ mod tests {
         };
         let engine = crate::core::engine_interface::NativeContextEngine::with_root(root.path())
             .expect("test root must canonicalize securely");
-        let (invocation, observation) = engine
-            .execute_ctx_read_snapshot(source.to_str().unwrap(), "stable native context", policy)
-            .unwrap();
         let task: TaskEnvelopeV1 = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "task_id": "task-1",
@@ -345,9 +326,10 @@ mod tests {
             "context_budget_tokens": 1000,
             "context_strategy": "balanced",
             "knowledge_refs": [],
-            "capability_ids": [invocation.operation.capability_id.as_str()],
-            "model": "local-engine",
-            "provider": "leanctx",
+            "capability_ids": [crate::core::engine_interface::CAPABILITY_ID],
+            "model": "local-native",
+            "provider": "local-native",
+            "capability_bindings": [{"capability_id":crate::core::engine_interface::CAPABILITY_ID,"version":"1.0.0"}],
             "reasoning_allocation_milli": 0,
             "max_retries": 0,
             "fallback_refs": [],
@@ -358,6 +340,16 @@ mod tests {
             "policy_decision_ref": "policy:fixture"
         }))
         .unwrap();
+        let canonical_source = std::fs::canonicalize(&source).unwrap();
+        let (invocation, observation) = engine
+            .execute_ctx_read_rooted_snapshot_with_plan(
+                canonical_source.to_str().unwrap(),
+                "stable native context",
+                policy,
+                &task,
+                &plan,
+            )
+            .unwrap();
         let engine_receipt = observation.receipt_link.as_ref().unwrap();
         let evidence = ReceiptEvidenceRefV1 {
             kind: ReceiptEvidenceKindV1::Measurement,
@@ -425,7 +417,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(ledger.load().unwrap().is_empty());
+        {
+            let found = &ledger.load().unwrap();
+            assert!(found.is_empty(), "{found:?}");
+        }
         let mut revoked = record.clone();
         revoked.signer_admission.revoked_at =
             Some(UtcTimestamp::new("2026-08-23T11:00:00Z").unwrap());
@@ -441,7 +436,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(ledger.load().unwrap().is_empty());
+        {
+            let found = &ledger.load().unwrap();
+            assert!(found.is_empty(), "{found:?}");
+        }
 
         let mut wrong_ref = observation.clone();
         wrong_ref.receipt_link.as_mut().unwrap().receipt_ref =
@@ -582,7 +580,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(ledger.load().unwrap().is_empty());
+        {
+            let found = &ledger.load().unwrap();
+            assert!(found.is_empty(), "{found:?}");
+        }
 
         let published = record_canonical_engine_receipt(
             &task,

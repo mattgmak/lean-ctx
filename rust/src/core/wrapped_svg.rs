@@ -196,6 +196,8 @@ mod tests {
             model_key: "claude-3.5-sonnet".into(),
             pricing_estimated: false,
             percentile: Some(99),
+            security: None,
+            speed: None,
         }
     }
 

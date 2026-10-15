@@ -26,10 +26,28 @@ pub(super) fn handle_search(
     roots_filter: Option<&[String]>,
     mode: Option<&str>,
 ) -> (String, usize) {
+    // A malformed call is answered as such, whatever the content policy state.
     let Some(query) = query else {
         return ("ERROR: query is required for search".to_string(), 0);
     };
+    crate::core::policy::runtime::with_source_view(|| {
+        if crate::core::policy::runtime::is_active() {
+            return (
+                "ERROR: cross-project search withheld under content policy until each source has verified provenance; use local ctx_search mode=bm25".into(),
+                0,
+            );
+        }
+        handle_search_in_view(query, max_results, roots_filter, mode)
+    })
+    .unwrap_or_else(|_| ("ERROR: search source authority changed or is unavailable".into(), 0))
+}
 
+fn handle_search_in_view(
+    query: &str,
+    max_results: usize,
+    roots_filter: Option<&[String]>,
+    mode: Option<&str>,
+) -> (String, usize) {
     let mode = mode.unwrap_or("hybrid").trim().to_ascii_lowercase();
     match mode.as_str() {
         "bm25" => bm25_search(query, max_results, roots_filter),
@@ -341,7 +359,7 @@ mod tests {
         let (fused, searched, warnings) = search_roots_hybrid("query", &roots, 10, 60.0);
         assert!(fused.is_empty());
         assert_eq!(searched, 0);
-        assert!(warnings.is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

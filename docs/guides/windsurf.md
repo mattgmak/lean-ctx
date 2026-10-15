@@ -4,8 +4,8 @@
 > integration promise.** Codex, Claude Code, and Cursor are the current
 > first-class local setup paths. Verify this generic Attach wiring against the
 > installed Windsurf version; compatibility alone is not a performance or
-> evidence guarantee. Product scope is governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> evidence guarantee. See the [canonical positioning](../POSITIONING_CANONICAL.md)
+> for current product scope and claim boundaries.
 
 Complete guide to setting up and optimally using lean-ctx with Windsurf (Codeium's AI-native IDE).
 
@@ -67,7 +67,7 @@ Add lean-ctx to Windsurf's MCP configuration:
 lean-ctx creates `~/.codeium/windsurf/rules/lean-ctx.md` with dedicated rules:
 
 ```markdown
-# lean-ctx — Context Engineering Layer
+# LeanCTX — Context Gateway for AI Systems
 <!-- lean-ctx-rules -->
 
 ## Mode Selection
@@ -111,17 +111,17 @@ lean-ctx init --global
 
 Windsurf's Cascade is an agentic AI that flows through your codebase. lean-ctx enhances Cascade in several ways:
 
-### Faster Context Gathering
+### Context selection
 
 Cascade reads many files to build context. With lean-ctx:
 
 ```
-# Instead of reading full file content (~2000 tokens)
-ctx_read("src/api/routes.rs", "map")        # ~400 tokens — structure + exports
-ctx_read("src/api/routes.rs", "signatures") # ~200 tokens — API surface only
+# Ask for structure or the API surface when full source is not needed
+ctx_read("src/api/routes.rs", "map")
+ctx_read("src/api/routes.rs", "signatures")
 
-# Re-reads cost ~13 tokens (cached)
-ctx_read("src/api/routes.rs", "full")       # ~13 tokens on second read
+# An eligible unchanged read may use a compact cache reference
+ctx_read("src/api/routes.rs", "full")
 ```
 
 ### Intelligent Search
@@ -183,7 +183,7 @@ Windsurf conversations can get long. Proactively manage context:
 
 ```
 ctx_compress  # Creates memory checkpoint, frees context space
-ctx_metrics   # Check current token savings
+ctx_metrics   # Inspect local token and context metrics
 ```
 
 ### 4. Use ctx_overview for Flow Starts
@@ -224,16 +224,16 @@ lean-ctx compresses 56 shell pattern modules by default. For project-specific co
 shell_activation = "always"
 ```
 
-## Token Savings Examples
+## Context measurement
 
-| Operation | Without lean-ctx | With lean-ctx | Savings |
-|-----------|-----------------|---------------|---------|
-| Read `src/main.rs` (first time) | ~2000 tokens | ~2000 tokens | 0% (first read) |
-| Read `src/main.rs` (re-read) | ~2000 tokens | ~13 tokens | 99.4% |
-| Read `src/main.rs` (map mode) | ~2000 tokens | ~400 tokens | 80% |
-| `git status` | ~800 tokens | ~120 tokens | 85% |
-| `git log -20 --oneline` | ~600 tokens | ~150 tokens | 75% |
-| `cargo test` output | ~2000 tokens | ~300 tokens | 85% |
+Read modes, focused search, and supported shell summaries can reduce the
+context emitted for a task. The effect depends on the file, mode, command,
+integration, provider route, and recovery behavior.
+
+`lean-ctx gain --live` reports local usage and token/cost estimates for
+observed activity. Provider-reported usage is available only for supported
+routed paths that record it; estimates do not establish invoice savings or
+answer quality.
 
 ## Troubleshooting
 
@@ -318,7 +318,7 @@ lean-ctx status
 # Pre-start daemon
 lean-ctx daemon start
 
-# Monitor savings
+# Inspect local usage and token/cost estimates
 lean-ctx gain --live
 ```
 

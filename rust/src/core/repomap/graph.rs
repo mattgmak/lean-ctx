@@ -36,15 +36,19 @@ impl RepoGraph {
     /// then merges their edges into a unified file-level graph.
     pub(crate) fn build(project_root: &str) -> Self {
         let (index, content_cache) = graph_index::scan_with_content_cache(project_root);
-        let cg_inputs = CallGraphInputs::from_project_index(&index);
-        let call_graph = CallGraph::load_or_build(project_root, &cg_inputs);
+        let calls = graph_call_pairs(project_root).unwrap_or_else(|| {
+            let cg_inputs = CallGraphInputs::from_project_index(&index);
+            let call_graph = CallGraph::load_or_build(project_root, &cg_inputs);
+            structural_call_pairs(&cg_inputs, &call_graph)
+        });
 
-        Self::from_index_and_calls(&index, &call_graph, &content_cache)
+        Self::from_index_and_calls(&index, &calls, &content_cache)
     }
 
+    /// `calls`: caller file → callee file pairs (see [`graph_call_pairs`]).
     fn from_index_and_calls(
         index: &ProjectIndex,
-        call_graph: &CallGraph,
+        calls: &[(String, String)],
         content_cache: &HashMap<String, String>,
     ) -> Self {
         let files: HashSet<String> = index.files.keys().cloned().collect();
@@ -61,18 +65,10 @@ impl RepoGraph {
             }
         }
 
-        // Call edges from the call graph
-        let symbols_by_name = build_symbol_location_map(index);
-        for call_edge in &call_graph.edges {
-            if let Some(target_file) = symbols_by_name.get(&call_edge.callee_name.to_lowercase())
-                && files.contains(&call_edge.caller_file)
-                && files.contains(target_file)
-                && call_edge.caller_file != *target_file
-            {
-                forward
-                    .entry(call_edge.caller_file.clone())
-                    .or_default()
-                    .push(target_file.clone());
+        // Call edges, resolved like the property graph's (never by bare name)
+        for (from, to) in calls {
+            if files.contains(from) && files.contains(to) && from != to {
+                forward.entry(from.clone()).or_default().push(to.clone());
             }
         }
 
@@ -92,14 +88,40 @@ impl RepoGraph {
     }
 }
 
-/// Map lowercase symbol name -> file path (first definition wins).
-fn build_symbol_location_map(index: &ProjectIndex) -> HashMap<String, String> {
-    let mut map: HashMap<String, String> = HashMap::with_capacity(index.symbols.len());
-    for sym in index.symbols.values() {
-        map.entry(sym.name.to_lowercase())
-            .or_insert_with(|| sym.file.clone());
+/// File-level `calls` edges of a current property graph: the same edges
+/// ranking and impact analysis use — scope-resolved, verified by a semantic
+/// backend where one answered, and without name-match guesses a backend
+/// vetoed. `None` without a current graph whose calls were consolidated (a
+/// freshly mirrored graph has none until enrichment runs). An empty edge set
+/// counts once a backend has answered for the graph: then every candidate
+/// was vetoed or ambiguous, and a fallback would resurrect the vetoed guess.
+fn graph_call_pairs(project_root: &str) -> Option<Vec<(String, String)>> {
+    use crate::core::property_graph::{CodeGraph, EdgeKind};
+    if crate::core::property_graph::engine_outdated(project_root) {
+        return None;
     }
-    map
+    let graph = CodeGraph::open(project_root).ok()?;
+    let pairs: Vec<(String, String)> = graph
+        .file_edges_of_kind(&EdgeKind::Calls)
+        .ok()?
+        .into_iter()
+        .map(|(from, to, _)| (from, to))
+        .collect();
+    (!pairs.is_empty() || graph.has_semantic_answers().unwrap_or(false)).then_some(pairs)
+}
+
+/// Without a property graph: each call bound in the caller's own scope
+/// (same file → unique import → unique in the project); an ambiguous name
+/// yields no edge rather than an arbitrary one.
+fn structural_call_pairs(
+    inputs: &CallGraphInputs,
+    call_graph: &CallGraph,
+) -> Vec<(String, String)> {
+    crate::core::call_graph::resolve_edge_callee_files(inputs, &call_graph.edges)
+        .into_iter()
+        .zip(&call_graph.edges)
+        .filter_map(|(to, edge)| Some((edge.caller_file.clone(), to?)))
+        .collect()
 }
 
 /// Build symbol definitions with compact signatures from file contents.
@@ -189,34 +211,77 @@ fn build_symbols_with_signatures(
 mod tests {
     use super::*;
 
+    /// Two files define `save`; the caller imports neither. The repo map
+    /// used to link the call to whichever definition it saw first — now an
+    /// ambiguous name yields no edge, while a scope-bound one still does.
     #[test]
-    fn symbol_location_map_uses_first_definition() {
-        let mut index = ProjectIndex::new("/tmp");
-        index.symbols.insert(
-            "a::foo".into(),
-            SymbolEntry {
-                file: "a.rs".into(),
-                name: "foo".into(),
-                kind: "fn".into(),
-                start_line: 1,
-                end_line: 10,
-                is_exported: true,
-            },
-        );
-        index.symbols.insert(
-            "b::foo".into(),
-            SymbolEntry {
-                file: "b.rs".into(),
-                name: "foo".into(),
-                kind: "fn".into(),
-                start_line: 1,
-                end_line: 5,
-                is_exported: false,
-            },
-        );
+    fn ambiguous_calls_are_not_linked_by_name() {
+        use crate::core::call_graph::{CallEdge, SymbolSpan};
+        let span = |file: &str, name: &str| SymbolSpan {
+            file: file.into(),
+            name: name.into(),
+            start_line: 1,
+            end_line: 3,
+            kind: "fn".into(),
+        };
+        let inputs = CallGraphInputs {
+            project_root: "/tmp".into(),
+            file_paths: vec!["a.rs".into(), "b.rs".into(), "app.rs".into()],
+            symbols: vec![
+                span("a.rs", "save"),
+                span("b.rs", "save"),
+                span("b.rs", "load"),
+            ],
+            import_edges: Vec::new(),
+        };
+        let call = |callee: &str| CallEdge {
+            caller_file: "app.rs".into(),
+            caller_symbol: "run".into(),
+            caller_line: 2,
+            callee_name: callee.into(),
+            ..Default::default()
+        };
+        let mut call_graph = CallGraph::new("/tmp");
+        call_graph.edges = vec![call("save"), call("load")];
 
-        let map = build_symbol_location_map(&index);
-        assert!(map.contains_key("foo"));
+        assert_eq!(
+            structural_call_pairs(&inputs, &call_graph),
+            [("app.rs".to_string(), "b.rs".to_string())],
+            "only the unique `load` binds"
+        );
+    }
+
+    /// A current graph without call edges is authoritative once a backend
+    /// answered for it (every guess was vetoed) — but not before enrichment.
+    #[test]
+    fn empty_graph_calls_count_only_after_a_semantic_answer() {
+        use crate::core::property_graph::{
+            CachedResolution, CodeGraph, GRAPH_ENGINE_VERSION, PropertyGraphMetaV1, write_meta,
+        };
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let proj = tempfile::tempdir().unwrap();
+        let root = proj.path().to_str().unwrap();
+        let meta = PropertyGraphMetaV1 {
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+            engine_version: GRAPH_ENGINE_VERSION,
+            ..Default::default()
+        };
+        write_meta(root, &meta).unwrap();
+        let graph = CodeGraph::open(root).unwrap();
+        assert_eq!(graph_call_pairs(root), None, "not consolidated yet");
+
+        let veto = CachedResolution {
+            backend: "lsp:test@1".into(),
+            outcome: "external".into(),
+            target_file: None,
+            target_line: None,
+            target_symbol: None,
+            context: String::new(),
+        };
+        graph
+            .semantic_store(("app.rs", 2, 4, "definition"), "h", &veto)
+            .unwrap();
+        assert_eq!(graph_call_pairs(root), Some(Vec::new()), "vetoed stays out");
     }
 
     #[test]
@@ -237,8 +302,7 @@ mod tests {
             weight: 1.0,
         });
 
-        let call_graph = CallGraph::new("/tmp");
-        let graph = RepoGraph::from_index_and_calls(&index, &call_graph, &HashMap::new());
+        let graph = RepoGraph::from_index_and_calls(&index, &[], &HashMap::new());
 
         let a_deps = graph.forward.get("a.rs").unwrap();
         assert_eq!(a_deps.len(), 1, "duplicate edges should be deduped");
@@ -255,8 +319,7 @@ mod tests {
             weight: 1.0,
         });
 
-        let call_graph = CallGraph::new("/tmp");
-        let graph = RepoGraph::from_index_and_calls(&index, &call_graph, &HashMap::new());
+        let graph = RepoGraph::from_index_and_calls(&index, &[], &HashMap::new());
 
         assert!(
             !graph.forward.contains_key("a.rs"),

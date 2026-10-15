@@ -93,28 +93,40 @@ impl LeanCtxServer {
                 .await?
                 .unwrap_or(p),
             Err(e) => {
-                // #899: the rejected path is dependency source in a language
-                // cache (Go module cache, cargo registry, site-packages,
-                // node_modules, …). Register its root as a session-scoped
-                // read-only root and ask the agent to retry — the next resolve
-                // sees it in the read allow-list. Stays fail-closed: this first
-                // call still errors, and writes into the cache remain denied.
-                if let Some((label, cache_root)) =
-                    crate::core::pathjail::detect_language_cache_root(&resolved)
-                    && crate::core::pathjail::register_session_read_only_root(&cache_root)
-                {
-                    return Err(format!(
-                        "Auto-detected {label} at {} — added as a read-only root for this \
-                         session. Retry the read.",
-                        cache_root.display()
-                    ));
-                }
-                if let Some(jailed) = self
+                // #899: a refused path in a language cache or an agent
+                // instruction folder is admitted read-only for the session
+                // and resolved again (see `jail_path_auto_admitting`). If it
+                // is still refused, report why — "retry" would only repeat
+                // the same refusal.
+                if crate::core::pathjail::detect_language_cache_root(&resolved).is_some() {
+                    match crate::core::pathjail::jail_path_auto_admitting(
+                        &resolved,
+                        jail_root_path,
+                        &extra_roots,
+                    ) {
+                        Ok(jailed) => jailed,
+                        Err(retry) => {
+                            crate::core::security_events::record_one(
+                                "resolve_path",
+                                "unknown",
+                                crate::core::security_events::SecurityKind::PathBlocked,
+                            );
+                            return Err(retry.to_string());
+                        }
+                    }
+                } else if let Some(jailed) = self
                     .maybe_reroot_for_absolute_path(&resolved, jail_root_path, &extra_roots)
                     .await?
                 {
                     jailed
                 } else {
+                    // Resolution runs on the async side, outside the handler's
+                    // collector, so the refusal is recorded directly.
+                    crate::core::security_events::record_one(
+                        "resolve_path",
+                        "unknown",
+                        crate::core::security_events::SecurityKind::PathBlocked,
+                    );
                     return Err(e.to_string());
                 }
             }

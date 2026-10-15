@@ -2,8 +2,6 @@ use rmcp::ErrorData;
 use rmcp::model::Tool;
 use serde_json::{Map, Value, json};
 
-use crate::core::ocla::cache_types::{CacheKeyBuilder, ShellCommandKey};
-
 use crate::server::tool_trait::{
     BackgroundJobState, BackgroundShellOutcome, McpTool, ShellOutcome, ToolContext, ToolOutput,
     get_bool, get_int, get_str,
@@ -84,6 +82,9 @@ impl McpTool for CtxShellTool {
             return Ok(ToolOutput {
                 shell_outcome: Some(outcome),
                 content_blocks: None,
+                // Looking after a running job is no new command: the session
+                // stats leave it out (`server_metrics::counts_in_session`).
+                mode: Some(crate::tools::server_metrics::BACKGROUND_POLL_MODE.to_string()),
                 ..ToolOutput::simple(text)
             });
         }
@@ -91,20 +92,54 @@ impl McpTool for CtxShellTool {
             .ok_or_else(|| ErrorData::invalid_params("command is required", None))?;
         let timeout_ms = get_int(args, "timeout_ms").and_then(|n| u64::try_from(n).ok());
 
+        // #1811: the write-doctrine guard classifies the *destination*, so a
+        // relative redirect target only means something once it is placed
+        // against the directory the command runs in. That directory is not the
+        // `cwd` argument: `effective_cwd_checked` replaces a jail-rejected one
+        // with the project root, and falls back to the session cwd when none
+        // was passed. So it is resolved once, here, and the same value feeds
+        // both the guard and the run below — resolving it twice would let the
+        // two answers drift, and a guard that judged a directory the command
+        // never ran in is exactly the bug #1811 reports.
+        let explicit_cwd = get_str(args, "cwd");
+        let had_explicit_cwd = explicit_cwd.is_some();
+        // Without a session (one-shot CLI contexts) the run directory cannot be
+        // resolved here. That is not an error yet — the cat-redirect below never
+        // needs one — so the guard is simply told nothing and keeps its stricter
+        // pre-#1811 refusal, and the session requirement is raised further down,
+        // where running the command actually depends on it.
+        let resolved_cwd = match ctx.session.as_ref() {
+            Some(session_lock) => Some(tokio::task::block_in_place(|| {
+                let guard = crate::server::bounded_lock::read_for(
+                    session_lock,
+                    "ctx_shell_cwd",
+                    SESSION_LOCK_BUDGET,
+                );
+                resolve_effective_cwd(guard, explicit_cwd.as_deref())
+            })?),
+            None => None,
+        };
+
         // The write-doctrine check (no `>`, `tee`, heredoc-to-file, curl -o, …)
         // is an MCP-payload-safety convention, not a security boundary, so it is
         // opt-out via `shell_allow_writes` (#523). The real command gating
         // (`check_shell_allowlist`, below) is NOT affected by this flag.
         let config = crate::core::config::Config::load();
-        let write_allow_paths = config.shell_write_allow_paths_effective();
-        let project_root = crate::core::config::Config::find_project_root();
+        let mut write_allow_paths = config.shell_write_allow_paths_effective();
+        // The session's project and the jail's allow entries are capture
+        // targets too, so no project root is passed as a refusal below.
+        write_allow_paths.extend(crate::tools::ctx_shell::capture_roots(
+            &ctx.project_root,
+            &ctx.extra_roots,
+            &config,
+        ));
         if !config.shell_allow_writes_effective()
-            && let Some(rejection) =
-                crate::tools::ctx_shell::validate_command_with_write_allow_paths(
-                    &command,
-                    &write_allow_paths,
-                    project_root.as_deref(),
-                )
+            && let Some(rejection) = crate::tools::ctx_shell::validate_command_in_cwd(
+                &command,
+                &write_allow_paths,
+                None,
+                resolved_cwd.as_ref().map(|(cwd, _)| cwd.as_str()),
+            )
         {
             // The command never ran — report as a tool error so MCP clients
             // (guards, retry logic) can detect it programmatically (#389).
@@ -168,16 +203,9 @@ impl McpTool for CtxShellTool {
                 .session
                 .as_ref()
                 .ok_or_else(|| ErrorData::internal_error("session not available", None))?;
-
-            let explicit_cwd = get_str(args, "cwd");
-            let had_explicit_cwd = explicit_cwd.is_some();
-            let guard = crate::server::bounded_lock::read_for(
-                session_lock,
-                "ctx_shell_cwd",
-                SESSION_LOCK_BUDGET,
-            );
-            let (effective_cwd, cwd_jail_reason) =
-                resolve_effective_cwd(guard, explicit_cwd.as_deref())?;
+            let Some((effective_cwd, cwd_jail_reason)) = resolved_cwd else {
+                return Err(ErrorData::internal_error("session not available", None));
+            };
             // A `cwd` rejected by the project-root jail is silently replaced with
             // the root (deliberate sandboxing). Surface that swap as a one-line
             // hint so the caller does not mistake the run dir for the requested
@@ -214,11 +242,7 @@ impl McpTool for CtxShellTool {
                     let output = redact_shell_output_secrets(&raw_output);
                     // Keep failure reporting consistent on this degraded path:
                     // same [exit:N] footer and the same structured outcome (#389).
-                    let exit_suffix = match exit_code {
-                        0 => String::new(),
-                        124 => "\n[exit:124 — command timed out]".to_string(),
-                        _ => format!("\n[exit:{exit_code}]"),
-                    };
+                    let exit_suffix = crate::shell::exit_status::exit_footer(exit_code);
                     return Ok(ToolOutput {
                         shell_outcome: Some(ShellOutcome::Exit(exit_code)),
                         content_blocks: None,
@@ -281,54 +305,6 @@ impl McpTool for CtxShellTool {
             };
 
             let inline = get_bool(args, "inline").unwrap_or(false);
-            let shell_cache_key = shell_cache_key(&cmd_clone, &cwd_clone, &extra_env);
-            if !raw
-                && !inline
-                && crate::core::config::Config::load()
-                    .cache
-                    .shell_cache_enabled
-                && let Some(key) = shell_cache_key.as_ref()
-                && let Some(cached) = crate::core::ocla::shell_cache_allowlist::SHELL_RESULT_CACHE
-                    .get(&key.cache_key())
-                    .map(|r| r.clone())
-                && let Ok(value) = serde_json::from_str::<Value>(&cached)
-                && let (Some(text), Some(exit_code)) = (
-                    value.get("text").and_then(Value::as_str),
-                    value.get("exit_code").and_then(Value::as_i64),
-                )
-            {
-                return Ok(ToolOutput {
-                    text: text.to_string(),
-                    original_tokens: crate::core::tokens::count_tokens(text),
-                    saved_tokens: 0,
-                    mode: Some("cross-agent-cache".to_string()),
-                    path: None,
-                    changed: false,
-                    shell_outcome: Some(ShellOutcome::Exit(exit_code as i32)),
-                    content_blocks: None,
-                });
-            }
-
-            // Cross-process delivery: check daemon for results from other IDE tabs
-            if let Some(ref key) = shell_cache_key {
-                let ck = key.cache_key();
-                let validator = key.validator();
-                if let Some(entry) =
-                    crate::core::ocla::cache_delivery::check(&ck, &validator, "ctx_shell")
-                {
-                    let stub = crate::core::ocla::cache_delivery::stub(&entry, "shell command");
-                    return Ok(ToolOutput {
-                        text: stub,
-                        original_tokens: entry.token_count as usize,
-                        saved_tokens: entry.token_count as usize,
-                        mode: Some("cross-agent-cache".to_string()),
-                        path: None,
-                        changed: false,
-                        shell_outcome: None,
-                        content_blocks: None,
-                    });
-                }
-            }
 
             let auto_background = should_auto_background(&cmd_clone, timeout_ms);
             if get_bool(args, "run_in_background").unwrap_or(false) || auto_background {
@@ -436,6 +412,11 @@ impl McpTool for CtxShellTool {
             crate::core::diagnostics_store::record_from_shell(&cmd_clone, &raw_output, exit_code);
 
             let output = redact_shell_output_secrets(&raw_output);
+            let output = if raw {
+                crate::server::walk_hint::strip_walk_hint(&output).to_string()
+            } else {
+                output
+            };
 
             let (result_out, original, saved, tee_hint) = if raw || inline {
                 let tokens = crate::core::tokens::count_tokens(&output);
@@ -462,7 +443,9 @@ impl McpTool for CtxShellTool {
                 ) {
                     crate::shell::save_tee(&cmd_clone, &output)
                         .map(|p| {
-                            if matches!(cfg.tee_mode, crate::core::config::TeeMode::HighCompression)
+                            if crate::cli::enforce_protected_store_path(std::path::Path::new(&p)).is_err() {
+                                format!("\n[full output: ctx_expand(id=\"{p}\", search=\"…\"|head=N|json_path=\"…\")]")
+                            } else if matches!(cfg.tee_mode, crate::core::config::TeeMode::HighCompression)
                             {
                                 let pct = crate::shell::tee_policy::savings_pct(original, sent);
                                 // Recovery grammar is path-first: agents without ctx_expand
@@ -500,11 +483,7 @@ impl McpTool for CtxShellTool {
             // #815: exit 124 = timeout signal (from timeout(1) / lean-ctx
             // shell timeout). Make it explicit so agents don't confuse a
             // timed-out command with a successful empty result.
-            let exit_suffix = match exit_code {
-                0 => String::new(),
-                124 => "\n[exit:124 — command timed out]".to_string(),
-                _ => format!("\n[exit:{exit_code}]"),
-            };
+            let exit_suffix = crate::shell::exit_status::exit_footer(exit_code);
             let nudge = if raw { "" } else { search_tool_nudge(&command) };
             let final_out = format!(
                 "{result_out}{tee_hint}{shell_mismatch}{cwd_jail_hint}{nudge}{exit_suffix}"
@@ -514,27 +493,6 @@ impl McpTool for CtxShellTool {
             } else {
                 final_out
             };
-
-            if !raw
-                && !inline
-                && crate::core::config::Config::load()
-                    .cache
-                    .shell_cache_enabled
-                && let Some(key) = shell_cache_key
-            {
-                let cached = json!({ "text": final_out, "exit_code": exit_code }).to_string();
-                crate::core::ocla::shell_cache_allowlist::SHELL_RESULT_CACHE
-                    .insert(key.cache_key(), cached);
-                // Propagate to cross-process daemon cache
-                crate::core::ocla::cache_delivery::record(
-                    key.cache_key(),
-                    crate::core::ocla::cache_types::DeliveryKind::ShellCommand,
-                    key.validator(),
-                    None,
-                    &final_out,
-                    "ctx_shell",
-                );
-            }
 
             Ok(ToolOutput {
                 text: final_out,
@@ -548,34 +506,6 @@ impl McpTool for CtxShellTool {
             })
         })
     }
-}
-
-fn shell_cache_key(
-    command: &str,
-    cwd: &str,
-    env: &std::collections::HashMap<String, String>,
-) -> Option<ShellCommandKey> {
-    if !crate::core::ocla::shell_cache_allowlist::is_cacheable_command(command) {
-        return None;
-    }
-    let mut env_pairs = env.iter().collect::<Vec<_>>();
-    env_pairs.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    let mut canonical_env = String::new();
-    for (name, value) in env_pairs {
-        canonical_env.push_str(name);
-        canonical_env.push('=');
-        canonical_env.push_str(value);
-        canonical_env.push('\n');
-    }
-    Some(ShellCommandKey {
-        command_normalized: crate::core::ocla::shell_cache_allowlist::normalize_command(command),
-        cwd: if std::path::Path::new(cwd).is_absolute() {
-            "$PROJECT_ROOT".to_string()
-        } else {
-            cwd.to_string()
-        },
-        env_hash: blake3::hash(canonical_env.as_bytes()).to_hex().to_string(),
-    })
 }
 
 /// Deny shell execution for explicitly restricted MCP clients. Missing client
@@ -1181,11 +1111,7 @@ fn handle_interpreter_heredoc_reroute(
         crate::tools::ctx_shell::handle(&rest_cmd, &shell_output, shell_exit, ctx.crp_mode)
     };
     let shell_text = crate::core::redaction::redact_text_if_enabled(&shell_text);
-    let exit_suffix = match shell_exit {
-        0 => String::new(),
-        124 => "\n[exit:124 — command timed out]".to_string(),
-        _ => format!("\n[exit:{shell_exit}]"),
-    };
+    let exit_suffix = crate::shell::exit_status::exit_footer(shell_exit);
 
     let combined = format!(
         "{exec_text}{reroute_note}\n\n[heredoc remainder via ctx_shell]\n{shell_text}{exit_suffix}"

@@ -1,13 +1,10 @@
 # lean-ctx-client
 
-> **Status: Local runtime contract — not the public LeanCTX SDK promise.**
-> LeanCTX is **The Context SDK for AI Agents**, a local context-performance
-> layer for existing agents. The currently declared SDK path is Python SDK v1
-> and its OpenAI Agents reference wrapper (**Preview**). This Rust client is a
-> narrow local HTTP/MCP integration surface; it does not make a hosted service,
-> generic agent platform, remote execution, or organization product available.
-> Product scope and status are governed by
-> [`docs/internal/README.md`](../../../docs/internal/README.md).
+> **Status: local Engine client.** LeanCTX is the **Context Gateway for AI Systems**.
+> **Control what your AI can see.** This crate is a narrow client for LeanCTX
+> Engine's local HTTP/MCP contract. The separate [LeanCTX SDK](https://github.com/Thinkery-AG/leanctx-sdk)
+> publishes language-native stable and Preview surfaces under its own license.
+> See [current positioning](../../../docs/POSITIONING_CANONICAL.md).
 
 A thin Rust client for the local lean-ctx `/v1` HTTP contract. Talk to a
 running local Runtime from your own program without linking the engine. Discover

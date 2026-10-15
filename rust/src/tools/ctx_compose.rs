@@ -7,7 +7,7 @@
 //! lean-ctx already has the building blocks as separate tools; this composes
 //! them into one response for a natural-language task:
 //!   1. extracted keywords,
-//!   2. semantically ranked files (BM25 / hybrid),
+//!   2. locally ranked files (admitted BM25),
 //!   3. exact match locations (index-backed `ctx_search`),
 //!   4. the body of the most relevant symbol, inline.
 
@@ -19,19 +19,34 @@ use crate::core::graph_provider;
 use crate::core::tokens::count_tokens;
 use crate::tools::CrpMode;
 
+#[path = "ctx_compose_selection.rs"]
+pub(crate) mod selection;
+
 /// Wall-time budget for the semantic-ranking stage. The exact-match and symbol
 /// stages are index-backed and cheap; only semantic ranking can hit a cold
 /// `O(corpus)` BM25 build. We never let that block the agent loop: past the
-/// budget (4s, tuned for cold-start coverage #902) we return what we have and let the detached worker finish warming the
-/// resident cache for the next call. Override via `LEAN_CTX_COMPOSE_BUDGET_MS`.
+/// budget (4s, tuned for cold-start coverage #902) we return the independently
+/// admitted sections. Late ranking output is discarded; no legacy index is used
+/// as a fallback. Override via `LEAN_CTX_COMPOSE_BUDGET_MS`.
 const DEFAULT_SEMANTIC_BUDGET_MS: u64 = 4000;
+/// A one-shot `lean-ctx call` has no agent loop to keep responsive, and its
+/// caller asked for this result: discarding a ranking after 4s only wasted it
+/// (#2049). Its own watchdog bounds the whole call.
+const ONE_SHOT_SEMANTIC_BUDGET_MS: u64 = 120_000;
+// A timed-out worker retains its permit until it actually finishes. Repeated
+// requests cannot accumulate an unbounded set of fresh corpus scans.
+static RANKING_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 fn semantic_budget() -> Duration {
     let ms = std::env::var("LEAN_CTX_COMPOSE_BUDGET_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_SEMANTIC_BUDGET_MS);
+        .unwrap_or(if crate::core::conversation::is_one_shot_process() {
+            ONE_SHOT_SEMANTIC_BUDGET_MS
+        } else {
+            DEFAULT_SEMANTIC_BUDGET_MS
+        });
     Duration::from_millis(ms)
 }
 
@@ -46,6 +61,13 @@ fn symbol_budget_tokens() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_SYMBOL_BUDGET_TOKENS)
+}
+
+pub(crate) fn kernel_supplement_budget(project_root: &str) -> usize {
+    let config = crate::core::context_kernel::activation::load_config(project_root);
+    (symbol_budget_tokens() / 5).min(crate::core::context_kernel::activation::supplement_budget(
+        &config,
+    ))
 }
 
 /// Wall-time budget for the associative (graph spreading-activation) stage.
@@ -307,28 +329,49 @@ fn resident_index(
     crate::core::bm25_cache::get_or_background(&cache, std::path::Path::new(project_root))
 }
 
-/// Run the semantic ranking stage under a wall-time budget. Returns the ranked
-/// block on time, or a short "deferred" note if the (cold) build overruns —
-/// in which case the detached worker keeps running to warm the resident cache.
+/// Run admitted local ranking under the caller's source authority and deadline.
+/// The inherited view closes with the owning request, so a late worker cannot
+/// switch to an unprotected policy or role while finishing.
 fn ranked_files_budgeted(task: &str, project_root: &str, crp_mode: CrpMode) -> String {
-    let shared_cache = crate::tools::ctx_semantic_search::get_thread_cache();
+    ranked_files_with_slots(task, project_root, crp_mode, &RANKING_WORKERS)
+}
+
+fn ranked_files_with_slots(
+    task: &str,
+    project_root: &str,
+    crp_mode: CrpMode,
+    slots: &'static tokio::sync::Semaphore,
+) -> String {
+    // Admit in the caller's scope: a role that denies ctx_search must not
+    // obtain ranked source through compose, whatever the worker inherits.
+    let role = crate::core::roles::active_role();
+    if role
+        .tools
+        .denied
+        .iter()
+        .any(|denied| denied == "ctx_search")
+    {
+        return "ERR: source search is not authorized".into();
+    }
+    let Ok(slot) = slots.try_acquire() else {
+        return "(local BM25 ranking busy: retry after active requests finish. Other sections are independently admitted.)".into();
+    };
     let (tx, rx) = mpsc::channel::<String>();
     let task_owned = task.to_string();
     let root_owned = project_root.to_string();
 
-    std::thread::spawn(move || {
-        if let Some(cache) = shared_cache {
-            crate::tools::ctx_semantic_search::set_thread_cache(cache);
-        }
+    crate::core::task_spine::TaskSpine::spawn_thread(move || {
+        let _slot = slot;
         let ranked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::tools::ctx_semantic_search::handle(
+            crate::tools::ctx_semantic_search::handle_for_tool(
+                "ctx_compose",
                 &task_owned,
                 &root_owned,
                 8,
                 crp_mode,
                 None,
                 None,
-                None,
+                Some("bm25"),
                 Some(false),
                 Some(false),
             )
@@ -337,56 +380,23 @@ fn ranked_files_budgeted(task: &str, project_root: &str, crp_mode: CrpMode) -> S
             tracing::warn!("[ctx_compose: semantic ranking panicked; omitting section]");
             String::new()
         });
-        // Receiver may be gone (we timed out); dropping the result is fine —
-        // the cache warming already happened as a side effect of the build.
+        // A timed-out receiver drops the result. This fresh view is never
+        // persisted or substituted with a legacy shared index.
         let _ = tx.send(ranked);
     });
 
     match rx.recv_timeout(semantic_budget()) {
         Ok(ranked) => ranked.trim().to_string(),
-        Err(_) => deferred_ranking_note(project_root),
+        Err(_) => deferred_ranking_note().to_string(),
     }
 }
 
-/// Honest, state-aware note when semantic ranking overruns its wall-time budget.
-///
-/// The old message always promised ranking would be "instant on the next call".
-/// That is a lie when the index build *failed* or the index is too large to
-/// persist — in those cases every call rebuilds and the promise never comes
-/// true (issue #249: "keeps saying it's warming up … but it never happens").
-/// We now read the real orchestrator state and tell the agent exactly what is
-/// happening and what to do about it.
-fn deferred_ranking_note(project_root: &str) -> String {
-    let exact = "the exact matches below are authoritative for this call";
-    let s = crate::core::index_orchestrator::bm25_summary(project_root);
-    match s.state {
-        "failed" => {
-            let why = s
-                .last_error
-                .or(s.note)
-                .unwrap_or_else(|| "unknown error".to_string());
-            format!(
-                "(semantic ranking unavailable — index build FAILED: {why}. {exact}. \
-                 Inspect with `ctx_index status` / `lean-ctx doctor`, then `lean-ctx reindex`)"
-            )
-        }
-        "building" => format!(
-            "(deferred — semantic index is building; {exact}, \
-             and ranking becomes available once the build finishes)"
-        ),
-        // ready/idle: this call's cold build just overran the budget. If the
-        // index could not be persisted (too large), surface that — otherwise it
-        // silently rebuilds on every cold start and never gets faster.
-        _ => match s.note {
-            Some(note) if note.contains("NOT persisted") => {
-                format!("(semantic ranking deferred — {note} {exact}.)")
-            }
-            _ => format!(
-                "(deferred — semantic index is warming; {exact}, \
-                 and ranking will be fast on the next call once the index is cached)"
-            ),
-        },
-    }
+/// Do not replay unadmitted index diagnostics or promise a warmed cache: each
+/// local ranking view is freshly admitted, including after a timeout.
+fn deferred_ranking_note() -> &'static str {
+    "(local BM25 ranking deferred: source admission did not finish within this call's budget; \
+     late ranking output is discarded. Other sections are independently admitted. \
+     LEAN_CTX_COMPOSE_BUDGET_MS raises the budget.)"
 }
 
 /// Append IB intent-specific query terms to `keywords` when basic science is on.
@@ -428,14 +438,90 @@ fn enrich_keywords_with_ib_intent(task: &str, keywords: Vec<String>) -> Vec<Stri
     })
 }
 
+/// Prose and documentation formats. An identifier's mentions there rank below
+/// its definition and its uses in code.
+const PROSE_GLOBS: &str = "*.{md,mdx,markdown,rst,txt,adoc}";
+
+/// Exact-match evidence for `primary`, best first: definitions, then uses in
+/// code, and prose mentions only when code has none. A single capped search in
+/// walk order used to fill all ten slots with whatever came first — root-level
+/// docs and agent rule files — so the code the task asked about never showed.
+fn exact_matches_section(
+    primary: &str,
+    project_root: &str,
+    crp_mode: CrpMode,
+    allow_secret: bool,
+) -> String {
+    let search = |pattern: &str, max: usize, exclude: Option<&str>| {
+        crate::tools::ctx_search::handle_filtered(
+            pattern,
+            project_root,
+            None,
+            max,
+            crp_mode,
+            true,
+            allow_secret,
+            false,
+            exclude,
+            None,
+        )
+        .text
+    };
+    let found = |text: &str| {
+        let t = text.trim_start();
+        !(t.is_empty() || t.starts_with("0 matches") || t.starts_with("ERR"))
+    };
+    let mut out = String::new();
+    let definition = format!(
+        r"\b(?:fn|struct|enum|trait|type|const|static|mod|class|interface|def|func|function)\s+{}\b",
+        regex::escape(primary)
+    );
+    let defs = search(&definition, 5, None);
+    if found(&defs) {
+        out.push_str("Definitions:\n");
+        out.push_str(defs.trim());
+        out.push('\n');
+    }
+    let code = search(primary, 10, Some(PROSE_GLOBS));
+    if found(&code) {
+        out.push_str("Uses in code:\n");
+        out.push_str(code.trim());
+        out.push('\n');
+    } else {
+        out.push_str(search(primary, 10, None).trim());
+        out.push('\n');
+    }
+    out
+}
+
 /// Compose a single rich response for `task`.
 pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usize) {
+    crate::core::policy::runtime::with_project_source_view(project_root, || {
+        handle_in_view(task, project_root, crp_mode)
+    })
+    .unwrap_or_else(|reason| {
+        (
+            format!(
+                "ERROR: context withheld: source authority changed or could not be verified \
+                 ({reason})"
+            ),
+            0,
+        )
+    })
+}
+
+fn handle_in_view(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usize) {
     let task = task.trim();
     if task.is_empty() {
         return ("ERROR: task is required".to_string(), 0);
     }
 
-    let keywords = enrich_keywords_with_ib_intent(task, extract_keywords(task, 6));
+    let protected = crate::core::policy::runtime::is_active();
+    let keywords = if protected {
+        extract_keywords(task, 6)
+    } else {
+        enrich_keywords_with_ib_intent(task, extract_keywords(task, 6))
+    };
     let allow_secret = crate::core::roles::active_role().io.allow_secret_paths;
 
     let mut out = String::new();
@@ -446,36 +532,40 @@ pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usi
         out.push_str(&format!("KEYWORDS: {}\n", keywords.join(", ")));
     }
 
-    // 1. Semantically ranked files for the whole task — budgeted so a cold
-    //    BM25 build can never stall the agent loop (hardening H1). The worker
-    //    inherits the resident cache, so a build that overruns the budget still
-    //    warms the cache for the next call rather than being wasted.
-    out.push_str("\n## Ranked files (semantic)\n");
-    out.push_str(&ranked_files_budgeted(task, project_root, crp_mode));
+    // 1. Fresh source admission precedes ranking under the same pinned view as
+    //    the rest of this response, including in the bounded worker.
+    out.push_str("\n## Ranked files (local BM25)\n");
+    {
+        let _phase = crate::core::phase_timing::enter("ctx_compose: ranking");
+        out.push_str(&ranked_files_budgeted(task, project_root, crp_mode));
+    }
+    if protected {
+        // These legacy stores do not retain enough original-source provenance
+        // to reauthorize derived records after a policy or rights change.
+        out.push_str("\nStored graph and memory enrichment withheld: source authorization is unavailable. Fresh exact matches and symbols follow.");
+    }
     out.push('\n');
 
     // 2. Exact match locations for the most specific identifier-shaped keyword.
     // Broad prose words and acronyms create repository-wide README/Dockerfile
     // noise. Within identifiers, the resident index ranks the rarest one first.
-    let ranked_keywords = order_by_specificity(&keywords, project_root);
+    let exact_phase = crate::core::phase_timing::enter("ctx_compose: exact matches");
+    let ranked_keywords = if protected {
+        keywords.clone()
+    } else {
+        order_by_specificity(&keywords, project_root)
+    };
     if let Some(primary) = ranked_keywords
         .iter()
         .find(|keyword| is_code_identifier(keyword))
     {
-        let grep = crate::tools::ctx_search::handle(
+        out.push_str(&format!("\n## Exact matches: '{primary}'\n"));
+        out.push_str(&exact_matches_section(
             primary,
             project_root,
-            None,
-            10,
             crp_mode,
-            true,
             allow_secret,
-            false,
-        )
-        .text;
-        out.push_str(&format!("\n## Exact matches: '{primary}'\n"));
-        out.push_str(grep.trim());
-        out.push('\n');
+        ));
     }
 
     // 3. Inline the symbol bodies that best cover the task keywords. Rather
@@ -483,7 +573,9 @@ pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usi
     //    with maximal keyword coverage under a token budget via submodular
     //    greedy (1−1/e optimal). Two keywords resolving to the same symbol, or
     //    a symbol whose body adds no new keyword, are naturally pruned.
-    use crate::core::context_packing::{CoverageItem, greedy_max_coverage};
+    drop(exact_phase);
+    let symbols_phase = crate::core::phase_timing::enter("ctx_compose: symbol bodies");
+    use crate::core::context_packing::CoverageItem;
     let mut snippets: Vec<String> = Vec::new();
     let mut items: Vec<CoverageItem> = Vec::new();
     for kw in &keywords {
@@ -499,6 +591,10 @@ pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usi
                     terms.insert(other.clone());
                 }
             }
+            if let Some(index) = snippets.iter().position(|snippet| snippet == &rendered) {
+                items[index].terms.extend(terms);
+                continue;
+            }
             items.push(CoverageItem {
                 terms,
                 cost: toks.max(1),
@@ -507,10 +603,14 @@ pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usi
         }
     }
     if !items.is_empty() {
-        let chosen = greedy_max_coverage(&items, symbol_budget_tokens(), |_| 1.0);
+        let selected = crate::core::context_packing::greedy_max_coverage(
+            &items,
+            symbol_budget_tokens(),
+            |_| 1.0,
+        );
         let mut seen = std::collections::HashSet::new();
         let mut header_written = false;
-        for idx in chosen {
+        for idx in selected {
             let rendered = snippets[idx].trim();
             if rendered.is_empty() || !seen.insert(rendered.to_string()) {
                 continue;
@@ -527,20 +627,20 @@ pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usi
     // 4. Associative neighbours via spreading activation over the import/call
     //    graph unified with the learned Hebbian co-access graph (budgeted,
     //    additive — surfaces structurally-close files lexical search misses).
-    out.push_str(&associative_block_budgeted(project_root, &keywords));
+    drop(symbols_phase);
+    if !protected {
+        let _phase = crate::core::phase_timing::enter("ctx_compose: associative graph");
+        out.push_str(&associative_block_budgeted(project_root, &keywords));
+    }
 
     // 5. Context Kernel enrichment — cross-store context from Knowledge,
     //    Episodic, and Procedural memory that the lexical pipeline misses.
     //    Budget: 20% of symbol budget. Graceful no-op if kernel returns None.
-    {
-        use crate::core::context_kernel::activation::{load_config, supplement_budget};
+    if !protected {
         use crate::core::context_kernel::context_dedup::dedup_kernel_blocks;
+        let _phase = crate::core::phase_timing::enter("ctx_compose: kernel enrichment");
 
-        let config = load_config(project_root);
-        let budget = symbol_budget_tokens() / 5;
-        let budget = budget
-            .min(config.max_supplement_tokens)
-            .min(supplement_budget(&config));
+        let budget = kernel_supplement_budget(project_root);
         if let Some(enrichment) =
             crate::core::context_kernel::bridge::kernel_enrich(task, project_root, budget)
                 .filter(|enrichment| !enrichment.blocks.is_empty())
@@ -562,6 +662,68 @@ pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranking_worker_keeps_original_source_policy_and_full_role() {
+        let _env = crate::core::data_dir::test_env_lock();
+        let policy = crate::core::policy::load(
+            "name = \"compose-worker\"\nversion = \"1.0.0\"\ndescription = \"test\"\n\
+             [filters]\nclassification = \"block\"\nblocked_labels = [\"CONFIDENTIAL\"]\n\
+             [redaction]\ncustomer = \"ACC-1234\"\n",
+        )
+        .unwrap();
+        let _policy = crate::core::policy::runtime::TestPolicyOverride::set(Some(policy));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("public.rs"),
+            "fn authenticate() { let customer = \"ACC-1234\"; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("private.rs"),
+            "// CONFIDENTIAL\nfn authenticate_private() { let hidden = \"CLASSIFIED_CANARY\"; }\n",
+        )
+        .unwrap();
+        let root = dir.path().to_str().unwrap();
+        let rank = || {
+            crate::core::policy::runtime::with_project_source_view(root, || {
+                ranked_files_budgeted("authenticate", root, CrpMode::Off)
+            })
+            .unwrap()
+        };
+        let role = crate::core::roles::load_role("coder").unwrap();
+        crate::core::roles::with_test_active_role(role.clone(), || {
+            let ranked = rank();
+            assert!(ranked.contains("public.rs"), "{ranked}");
+            assert!(ranked.contains("REDACTED"), "{ranked}");
+            assert!(!ranked.contains("ACC-1234"));
+            assert!(!ranked.contains("private.rs"));
+            assert!(!ranked.contains("CLASSIFIED_CANARY"));
+            static ONE_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+            let occupied = ONE_SLOT.try_acquire().unwrap();
+            let rank_with_limit = || {
+                crate::core::policy::runtime::with_project_source_view(root, || {
+                    ranked_files_with_slots("authenticate", root, CrpMode::Off, &ONE_SLOT)
+                })
+                .unwrap()
+            };
+            let busy = rank_with_limit();
+            assert!(busy.contains("ranking busy"));
+            assert!(!busy.contains("public.rs"));
+            drop(occupied);
+            let recovered = rank_with_limit();
+            assert!(recovered.contains("public.rs"));
+            assert!(recovered.contains("REDACTED"));
+            assert!(!recovered.contains("CLASSIFIED_CANARY"));
+        });
+        let mut denied = role;
+        denied.tools.denied.push("ctx_search".into());
+        crate::core::roles::with_test_active_role(denied, || {
+            let ranked = rank();
+            assert!(ranked.starts_with("ERR:"), "{ranked}");
+            assert!(!ranked.contains("public.rs"));
+        });
+    }
 
     #[test]
     fn rank_by_doc_freq_puts_rare_identifier_first() {
@@ -654,6 +816,50 @@ mod tests {
         assert!(prose.iter().all(|keyword| !is_code_identifier(keyword)));
     }
 
+    /// Regression: root-level docs that mention the identifier came first in
+    /// walk order and filled every slot; the definition in code never showed.
+    #[test]
+    fn exact_matches_rank_definition_and_code_above_prose() {
+        // The source view re-verifies policy and role after the search; a
+        // parallel test switching either (Windows CI) would void it.
+        let _env = crate::core::data_dir::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("AGENTS.md"), "use widget_factory\n".repeat(30)).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn widget_factory() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() { lib::widget_factory(); }\n",
+        )
+        .unwrap();
+        let root_str = root.to_str().unwrap();
+        let out = crate::core::policy::runtime::with_project_source_view(root_str, || {
+            exact_matches_section("widget_factory", root_str, CrpMode::Off, false)
+        })
+        .expect("source view");
+
+        let defs = out.find("Definitions:").expect("definition section");
+        let uses = out.find("Uses in code:").expect("code section");
+        assert!(defs < uses, "{out}");
+        assert!(out.contains("lib.rs:1"), "definition found: {out}");
+        assert!(out.contains("main.rs:1"), "use found: {out}");
+        assert!(
+            !out.contains("AGENTS.md"),
+            "prose only when code has none: {out}"
+        );
+
+        let prose_only = crate::core::policy::runtime::with_project_source_view(root_str, || {
+            exact_matches_section("use", root_str, CrpMode::Off, false)
+        })
+        .expect("source view");
+        assert!(prose_only.contains("AGENTS.md"), "{prose_only}");
+    }
+
     #[test]
     fn empty_task_is_rejected() {
         let (out, tok) = handle("   ", "/tmp", CrpMode::Off);
@@ -662,22 +868,26 @@ mod tests {
     }
 
     #[test]
-    fn handle_includes_context_kernel_section_when_available() {
-        let (output, tokens) = handle("find authentication bugs", "/tmp/nonexistent", CrpMode::Tdd);
-        // The kernel may or may not produce output for a nonexistent project,
-        // but handle() must not panic.
-        assert!(tokens > 0);
-        assert!(output.contains("TASK:"));
+    fn handle_withholds_context_when_project_authority_cannot_be_verified() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing-project");
+        let (output, tokens) = handle(
+            "find authentication bugs",
+            missing.to_str().unwrap(),
+            CrpMode::Tdd,
+        );
+        assert_eq!(tokens, 0);
+        assert!(output.starts_with("ERROR"));
+        assert!(output.contains("source authority"));
+        assert!(!output.contains("TASK:"));
     }
 
     #[test]
     fn deferred_ranking_note_is_deterministic_and_has_no_timing() {
         // Issue #498 / #1366: elapsed_ms must never appear in the note — it
         // varies between calls and defeats provider prompt caching.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_string_lossy();
-        let a = deferred_ranking_note(root.as_ref());
-        let b = deferred_ranking_note(root.as_ref());
+        let a = deferred_ranking_note();
+        let b = deferred_ranking_note();
         assert_eq!(a, b, "deferred note must be byte-stable across calls");
         assert!(
             !a.contains("elapsed"),
@@ -686,23 +896,11 @@ mod tests {
     }
 
     #[test]
-    fn deferred_note_for_idle_index_is_optimistic_but_honest() {
-        // Unknown project → orchestrator state is idle. The note must NOT promise
-        // "instant on the next call" (the dishonest wording from #249); it should
-        // explain the index is warming and will be fast once cached.
-        let tmp = tempfile::tempdir().unwrap();
-        let note = deferred_ranking_note(tmp.path().to_string_lossy().as_ref());
-        assert!(
-            note.contains("warming") || note.contains("building"),
-            "note: {note}"
-        );
-        assert!(
-            note.contains("authoritative"),
-            "note must reassure that exact matches are authoritative: {note}"
-        );
-        assert!(
-            !note.contains("instant on the next call"),
-            "must not repeat the dishonest 'instant next call' promise: {note}"
-        );
+    fn deferred_note_does_not_promise_cached_or_late_delivery() {
+        let note = deferred_ranking_note();
+        assert!(note.contains("late ranking output is discarded"));
+        assert!(note.contains("independently admitted"));
+        assert!(!note.contains("warming"));
+        assert!(!note.contains("next call"));
     }
 }

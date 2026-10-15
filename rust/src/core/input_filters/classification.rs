@@ -29,6 +29,9 @@ pub const DEFAULT_LABELS: &[&str] = &[
 pub struct Matcher {
     banner: Regex,
     value: Regex,
+    /// Any label anywhere, unbounded: both detection paths need one, so text
+    /// without a hit cannot be marked (no false negatives, e.g. `__SECRET__`).
+    any_label: Regex,
 }
 
 fn field_re() -> &'static Regex {
@@ -59,7 +62,12 @@ impl Matcher {
         let banner = Regex::new(&format!(r"(?im)^[\s*#/\-_=]*({alt})[\s*#/\-_=!.]*$"))
             .expect("valid banner regex");
         let value = Regex::new(&format!(r"(?i)\b({alt})\b")).expect("valid value regex");
-        Self { banner, value }
+        let any_label = Regex::new(&format!(r"(?i){alt}")).expect("valid label prefilter");
+        Self {
+            banner,
+            value,
+            any_label,
+        }
     }
 
     /// Distinct classification labels found (uppercased), or empty if the
@@ -67,6 +75,9 @@ impl Matcher {
     #[must_use]
     pub fn detect(&self, text: &str) -> Vec<String> {
         let mut found: BTreeSet<String> = BTreeSet::new();
+        if !self.any_label.is_match(text) {
+            return Vec::new();
+        }
         for caps in self.banner.captures_iter(text) {
             if let Some(m) = caps.get(1) {
                 found.insert(m.as_str().trim().to_ascii_uppercase());
@@ -121,15 +132,29 @@ mod tests {
         let m = Matcher::new(&["TS//SCI".to_string()]);
         assert_eq!(m.detect("TS//SCI\nbody"), vec!["TS//SCI".to_string()]);
         // Default labels are not used when a custom list is provided.
-        assert!(m.detect("CONFIDENTIAL\nbody").is_empty());
+        {
+            let found = &m.detect("CONFIDENTIAL\nbody");
+            assert!(found.is_empty(), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn prefilter_never_hides_an_underscore_decorated_banner() {
+        assert_eq!(
+            default_matcher().detect("__CONFIDENTIAL__\nbody"),
+            vec!["CONFIDENTIAL"]
+        );
+        {
+            let found = &default_matcher().detect("fn main() {}\n");
+            assert!(found.is_empty(), "{found:?}");
+        }
     }
 
     #[test]
     fn public_field_value_does_not_gate() {
-        assert!(
-            default_matcher()
-                .detect("Classification: public")
-                .is_empty()
-        );
+        {
+            let found = &default_matcher().detect("Classification: public");
+            assert!(found.is_empty(), "{found:?}");
+        }
     }
 }

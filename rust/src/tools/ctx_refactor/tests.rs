@@ -76,7 +76,7 @@ fn unknown_action_help_lists_declaration() {
     let abs = file.to_string_lossy().to_string();
 
     let _stub = crate::lsp::router::stub_test_lock();
-    crate::lsp::router::seed_stub_backend("rust", Box::new(StubBackend));
+    crate::lsp::router::seed_stub_backend(&root, "rust", Box::new(StubBackend));
 
     let args = json!({"action": "definitely_bogus", "path": "x.rs", "line": 1});
     let out = super::handle(&args, &root, &abs);
@@ -430,6 +430,12 @@ fn resolve_name_path_ambiguous_trait_impls() {
 fn file_scope_disambiguates_ambiguous_symbol() {
     let _env_lock = crate::core::data_dir::test_env_lock();
     let dir = tempfile::tempdir().unwrap();
+    // Own data dir, like its neighbours: against the shared one, after the
+    // rest of a sequential release run, the index build came back empty
+    // (NO_SYMBOL on macos-15-intel).
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    crate::test_env::set_var("LEAN_CTX_DATA_DIR", data.to_string_lossy().to_string());
     let proj = dir.path().join("proj845");
     std::fs::create_dir_all(proj.join("src")).unwrap();
 
@@ -448,6 +454,17 @@ fn file_scope_disambiguates_ambiguous_symbol() {
     )
     .unwrap();
     let root = proj.to_string_lossy().to_string();
+
+    // Build the index explicitly so a failure names its cause. Late in a
+    // sequential release run the lazy build twice came back empty (NO_SYMBOL on
+    // macos-15-intel, then windows-msvc) while the parallel suite passed.
+    let index = crate::core::graph_index::scan(&root);
+    assert!(
+        index.files.len() >= 2,
+        "fixture index must cover both files: root={root} safe={} files={:?}",
+        crate::core::graph_index::is_safe_scan_root_public(&root),
+        index.files.keys().collect::<Vec<_>>()
+    );
 
     // Without file_scope: ambiguous (2 matches).
     let err = super::resolve_name_path("RenderBridge/execute", &root)
@@ -600,7 +617,7 @@ fn references_output_surfaces_truncation_note() {
         }
     }
     let _stub = crate::lsp::router::stub_test_lock();
-    crate::lsp::router::seed_stub_backend("rust", Box::new(TruncBackend));
+    crate::lsp::router::seed_stub_backend("/proj", "rust", Box::new(TruncBackend));
     let uri = crate::lsp::client::file_path_to_uri("/proj/a.rs").unwrap();
     let out = super::handle_references(
         "/proj/a.rs",
@@ -683,7 +700,7 @@ fn inspections_run_and_list_dispatch_and_truncation() {
         }
     }
     let _stub = crate::lsp::router::stub_test_lock();
-    crate::lsp::router::seed_stub_backend("rust", Box::new(InspBackend));
+    crate::lsp::router::seed_stub_backend("/proj", "rust", Box::new(InspBackend));
     let uri = crate::lsp::client::file_path_to_uri("/proj/a.rs").unwrap();
 
     // run mode (default): formats path:line SEVERITY message + truncation note

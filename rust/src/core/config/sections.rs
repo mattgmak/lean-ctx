@@ -102,7 +102,6 @@ pub struct CacheConfig {
     pub l2_ttl_secs: u64,
     pub l3_max_bytes: u64,
     pub l3_gc_threshold: f64,
-    pub shell_cache_enabled: bool,
     pub compose_cache_enabled: bool,
 }
 
@@ -115,7 +114,6 @@ impl Default for CacheConfig {
             l2_ttl_secs: 3_600,
             l3_max_bytes: 500_000_000,
             l3_gc_threshold: 0.9,
-            shell_cache_enabled: false,
             compose_cache_enabled: true,
         }
     }
@@ -128,16 +126,16 @@ mod cache_config_tests {
     #[test]
     fn cache_defaults_match_delivery_budget() {
         assert_eq!(CacheConfig::default().l3_max_bytes, 500_000_000);
-        assert!(!CacheConfig::default().shell_cache_enabled);
         assert!(CacheConfig::default().compose_cache_enabled);
     }
 
     #[test]
     fn cache_config_deserializes_partial_overrides() {
+        // `shell_cache_enabled` was removed (#1980); configs that still set it
+        // must keep loading.
         let parsed: CacheConfig =
             serde_json::from_str(r#"{"l1_max_entries": 12, "shell_cache_enabled": true}"#).unwrap();
         assert_eq!(parsed.l1_max_entries, 12);
-        assert!(parsed.shell_cache_enabled);
         assert_eq!(parsed.l2_ttl_secs, 3_600);
     }
 }
@@ -159,17 +157,27 @@ pub struct AgentsConfig {
     pub scratchpad_default_ttl_hours: u64,
     /// Logical session timeout (seconds).
     pub logical_session_ttl_seconds: u64,
-    /// Machine-wide cap for simultaneously admitted MCP workers (1–15).
+    /// Legacy registration-cap setting retained for config compatibility only.
+    /// Presence registration ignores this value; WorkGraph execution has its
+    /// own concurrency, lease, and budget admission checks.
     pub max_concurrent_workers: usize,
-    /// Machine-wide cap for workers whose role can mutate project state.
+    /// Legacy mutating-slot cap retained for config compatibility only.
+    /// Presence registration ignores this value, so no session is refused or
+    /// demoted to read-only (#1765); builds and tests stay serialized below.
     pub max_concurrent_mutating_workers: usize,
     /// Active worker lease. Missing heartbeats release capacity automatically.
     pub active_worker_lease_seconds: u64,
-    /// Serialize build/test commands across all lean-ctx sessions.
+    /// Opt-in: let only one cargo/npm build or test run at a time across all
+    /// lean-ctx sessions on this machine (ctx_shell waits for the slot).
+    /// Off by default — it queued every user's builds behind other sessions.
     pub serialize_build_commands: bool,
-    /// Cargo compiler processes per admitted build.
+    /// Opt-in: `CARGO_BUILD_JOBS` for builds run through ctx_shell. `0`
+    /// (default) leaves cargo's own setting alone.
     pub cargo_build_jobs: usize,
-    /// Reuse one machine-wide Cargo target directory across agent sessions.
+    /// Opt-in: point builds run through ctx_shell at one machine-wide
+    /// `CARGO_TARGET_DIR` (`<data dir>/build-cache/cargo-target`). Off by
+    /// default: when on, `./target` stops receiving the output, so a binary
+    /// run from there is stale.
     pub shared_cargo_target: bool,
     /// Max scratchpad entries before oldest are evicted.
     pub max_scratchpad_entries: usize,
@@ -186,9 +194,9 @@ impl Default for AgentsConfig {
             max_concurrent_workers: 12,
             max_concurrent_mutating_workers: 4,
             active_worker_lease_seconds: 120,
-            serialize_build_commands: true,
-            cargo_build_jobs: 3,
-            shared_cargo_target: true,
+            serialize_build_commands: false,
+            cargo_build_jobs: 0,
+            shared_cargo_target: false,
             max_scratchpad_entries: 200,
         }
     }
@@ -209,9 +217,11 @@ mod agents_config_tests {
         assert_eq!(cfg.max_concurrent_workers, 12);
         assert_eq!(cfg.max_concurrent_mutating_workers, 4);
         assert_eq!(cfg.active_worker_lease_seconds, 120);
-        assert!(cfg.serialize_build_commands);
-        assert_eq!(cfg.cargo_build_jobs, 3);
-        assert!(cfg.shared_cargo_target);
+        // Builds are the user's own: lean-ctx neither queues, throttles nor
+        // relocates them unless asked (a shared target made `./target` stale).
+        assert!(!cfg.serialize_build_commands);
+        assert_eq!(cfg.cargo_build_jobs, 0);
+        assert!(!cfg.shared_cargo_target);
         assert_eq!(cfg.max_scratchpad_entries, 200);
     }
 
@@ -262,6 +272,12 @@ pub struct SetupConfig {
     /// Register lean-ctx as an MCP server in editor configs.
     #[serde(default = "serde_defaults::default_true")]
     pub auto_update_mcp: bool,
+    /// Keep already-installed agent hooks current on MCP server start (#1879).
+    /// `false` leaves hook entries, `permissions.deny` and the status line in
+    /// agent settings exactly as the user wrote them; only an explicit
+    /// `lean-ctx setup` / `init --agent` / `doctor --fix` writes them.
+    #[serde(default = "serde_defaults::default_true")]
+    pub manage_hooks: bool,
 }
 
 impl Default for SetupConfig {
@@ -270,6 +286,7 @@ impl Default for SetupConfig {
             auto_inject_rules: None,
             auto_inject_skills: None,
             auto_update_mcp: true,
+            manage_hooks: true,
         }
     }
 }
@@ -610,6 +627,10 @@ pub struct UpdatesConfig {
     pub auto_update: bool,
     pub check_interval_hours: u64,
     pub notify_only: bool,
+    /// Persistent release pin used by manual and scheduled update checks.
+    /// `None` follows the latest release; values are normalized without `v`.
+    #[serde(default)]
+    pub pinned_version: Option<String>,
 }
 
 impl Default for UpdatesConfig {
@@ -618,6 +639,7 @@ impl Default for UpdatesConfig {
             auto_update: false,
             check_interval_hours: 6,
             notify_only: false,
+            pinned_version: None,
         }
     }
 }
@@ -787,19 +809,68 @@ impl AutonomyConfig {
     }
 }
 
-/// Anonymous opt-in telemetry heartbeat settings.
+/// Persisted telemetry choice. This distinguishes the v4 default from a user
+/// choice so upgrades never erase an earlier opt-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryPreference {
+    #[default]
+    DefaultOn,
+    ExplicitlyEnabled,
+    ExplicitlyDisabled,
+}
+
+/// Privacy-safe product telemetry settings.
 ///
-/// When enabled, lean-ctx sends a daily heartbeat to `api.leanctx.com` containing
-/// only: a random installation ID (UUID v4), the lean-ctx version, OS, and CPU
-/// architecture. No code, filenames, usage patterns, or personal data — ever.
-/// Disabled by default; enable during setup or with `lean-ctx telemetry on`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// When enabled, lean-ctx sends cumulative daily aggregates to `api.leanctx.com`
+/// several times per day: a random installation ID (UUID v4), version, OS,
+/// setup profile and counters. No code, filenames, prompts, or personal data.
+/// Enabled by default (accepted at install); `lean-ctx telemetry off`,
+/// `DO_NOT_TRACK=1` and `LEAN_CTX_TELEMETRY=off` opt out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
-    /// Master switch for the anonymous heartbeat. Off by default (opt-in).
+    /// Master switch for privacy-safe product telemetry.
     pub enabled: bool,
-    /// Daily debounce: YYYY-MM-DD of the last successful heartbeat.
+    /// Whether the state came from the v4 default or an explicit user choice.
+    pub preference: TelemetryPreference,
+    /// YYYY-MM-DD of the last successful telemetry send.
     pub last_heartbeat: Option<String>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            preference: TelemetryPreference::DefaultOn,
+            last_heartbeat: None,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    #[must_use]
+    pub fn environment_disables(do_not_track: Option<&str>, env_override: Option<&str>) -> bool {
+        do_not_track.is_some_and(|value| value.trim() == "1")
+            || env_override.is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "off" | "false" | "0" | "no"
+                )
+            })
+    }
+
+    #[must_use]
+    pub fn explicitly_disabled(&self) -> bool {
+        !self.enabled || self.preference == TelemetryPreference::ExplicitlyDisabled
+    }
+
+    #[must_use]
+    pub fn send_eligible(&self, do_not_track: Option<&str>, env_override: Option<&str>) -> bool {
+        self.enabled
+            && self.preference != TelemetryPreference::ExplicitlyDisabled
+            && !Self::environment_disables(do_not_track, env_override)
+    }
 }
 
 /// Cloud sync and contribution settings (pattern sharing, model pulls).
@@ -1212,9 +1283,11 @@ impl Default for LoopDetectionConfig {
 
 /// Semantic-embedding engine settings.
 ///
-/// `model` selects which local ONNX embedding model lean-ctx downloads and uses for
-/// `ctx_semantic_search`. Accepts the same aliases as the `LEAN_CTX_EMBEDDING_MODEL` env
-/// var: `minilm` (all-MiniLM-L6-v2, 384d — the default), `nomic` (768d) — or any
+/// `model` selects which local embedding model lean-ctx downloads and uses for
+/// `ctx_semantic_search`. Unset, it is `minilm` where ONNX Runtime is installed and
+/// `potion-code` otherwise (see `model_registry::default_model`). Accepts the same
+/// aliases as the `LEAN_CTX_EMBEDDING_MODEL` env var: `minilm` (all-MiniLM-L6-v2,
+/// 384d), `potion-code` (potion-code-16M, 256d static, pure Rust), `nomic` (768d) — or any
 /// HuggingFace repo with an ONNX export via `hf:org/repo[@revision]` (GL #397), e.g.
 /// `hf:jinaai/jina-embeddings-v2-base-code` for code-specialized embeddings. When the
 /// env var is set it takes precedence; an
@@ -1597,9 +1670,11 @@ mod telemetry_tests {
     use super::*;
 
     #[test]
-    fn telemetry_config_defaults_to_disabled() {
+    fn telemetry_config_defaults_on_and_send_eligible() {
         let cfg = TelemetryConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
+        assert_eq!(cfg.preference, TelemetryPreference::DefaultOn);
+        assert!(cfg.send_eligible(None, None));
         assert!(cfg.last_heartbeat.is_none());
     }
 
@@ -1616,7 +1691,15 @@ last_heartbeat = "2026-07-30"
         }
         let wrap: Wrap = toml::from_str(toml_str).expect("parse telemetry config");
         assert!(wrap.telemetry.enabled);
+        assert_eq!(wrap.telemetry.preference, TelemetryPreference::DefaultOn);
         assert_eq!(wrap.telemetry.last_heartbeat.as_deref(), Some("2026-07-30"));
+    }
+
+    #[test]
+    fn a_retired_notice_key_in_an_existing_config_still_parses() {
+        let cfg: TelemetryConfig =
+            toml::from_str("enabled = true\nnotice_shown = false").expect("pre-removal config");
+        assert!(cfg.send_eligible(None, None));
     }
 
     #[test]
@@ -1628,7 +1711,24 @@ last_heartbeat = "2026-07-30"
             telemetry: TelemetryConfig,
         }
         let wrap: Wrap = toml::from_str(toml_str).expect("parse empty config");
-        assert!(!wrap.telemetry.enabled);
+        assert!(wrap.telemetry.enabled);
+        assert_eq!(wrap.telemetry.preference, TelemetryPreference::DefaultOn);
         assert!(wrap.telemetry.last_heartbeat.is_none());
+    }
+
+    #[test]
+    fn legacy_false_remains_an_explicit_opt_out() {
+        let cfg: TelemetryConfig = toml::from_str("enabled = false").expect("legacy config");
+        assert!(cfg.explicitly_disabled());
+    }
+
+    #[test]
+    fn send_honors_the_explicit_and_both_environment_opt_outs() {
+        let mut cfg = TelemetryConfig::default();
+        assert!(cfg.send_eligible(None, None));
+        assert!(!cfg.send_eligible(Some("1"), None));
+        assert!(!cfg.send_eligible(None, Some("OFF")));
+        cfg.preference = TelemetryPreference::ExplicitlyDisabled;
+        assert!(!cfg.send_eligible(None, None));
     }
 }

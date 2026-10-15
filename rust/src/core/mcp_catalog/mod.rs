@@ -17,9 +17,14 @@ pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod memento;
+/// Browser OAuth for HTTP servers (#1391); needs the reqwest client that ships
+/// with `http-server`.
+#[cfg(feature = "http-server")]
+pub(crate) mod oauth;
 pub mod pool;
 pub mod postprocess;
 pub mod router;
+pub mod runtime;
 
 pub use catalog::Catalog;
 pub use config::{

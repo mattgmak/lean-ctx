@@ -1,8 +1,9 @@
 # Cognition Lab Plan v1 (privacy-first, SSOT, CI-gated)
 
-> **Status: research plan — not a current LeanCTX product or capability
-> commitment.** LeanCTX is **The Context SDK for AI Agents**; current scope and
-> status are governed by `docs/internal/README.md` (internal, not in this repository).
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 Tracked in GitLab: `#2344`.
 

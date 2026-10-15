@@ -117,11 +117,12 @@ fn handle_analyze(path: Option<&str>, root: &str, max_depth: usize, fmt: OutputF
 
     // 1) Direct file-node match — the documented contract (a file path).
     if graph.get_node_by_path(&rel_target).ok().flatten().is_some() {
+        let semantic = verify_references(&graph, root, std::slice::from_ref(&rel_target));
         let impact = match graph.impact_analysis(&rel_target, max_depth) {
             Ok(r) => r,
             Err(e) => return format!("Impact analysis failed: {e}"),
         };
-        return format_impact(&impact, &rel_target, root, fmt);
+        return format_impact(&impact, &rel_target, root, fmt, semantic.as_ref());
     }
 
     // 2) Symbol-name fallback (GH #398): callers — and LLMs — routinely ask for
@@ -140,6 +141,114 @@ fn handle_analyze(path: Option<&str>, root: &str, max_depth: usize, fmt: OutputF
     // 3) Neither a file nor a known symbol: an actionable diagnostic beats a
     //    false "no impact".
     analyze_unresolved(&graph, target, &rel_target, root, fmt)
+}
+
+/// Outcome of the on-demand semantic check of who uses the changed files.
+struct ReferencesCheck {
+    /// Files the backend verified as users (sorted).
+    users: BTreeSet<String>,
+    /// Every symbol of every checked file got a definitive answer.
+    complete: bool,
+    backend: Option<String>,
+}
+
+impl ReferencesCheck {
+    fn text_line(&self) -> String {
+        let via = self
+            .backend
+            .as_deref()
+            .map_or_else(String::new, |b| format!(" via {b}"));
+        let partial = if self.complete {
+            ""
+        } else {
+            " (partial: budget or backend limits)"
+        };
+        format!(
+            "Semantic check: {} direct user file(s) verified by references{via}{partial}\n",
+            self.users.len()
+        )
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "verified_users": self.users,
+            "complete": self.complete,
+            "backend": self.backend,
+        })
+    }
+}
+
+/// Verifies who really uses `files` (at most three): one `references`
+/// question per symbol they declare, bounded and cached per project
+/// revision, recorded as verified `references` edges — so the propagation
+/// that follows rests on facts wherever the backend can provide them.
+/// Skipped (`None`) when no backend could answer without starting one, or
+/// none answered.
+fn verify_references(graph: &CodeGraph, root: &str, files: &[String]) -> Option<ReferencesCheck> {
+    use crate::core::call_graph::{CallGraphInputs, current_file_hashes};
+    use crate::core::config::SemanticMode;
+    use crate::core::semantic::relations::{Relation, RelationBudget, resolve_relation_edges};
+    use crate::lsp::router::StartPolicy;
+
+    let mode = SemanticMode::for_project(root);
+    let policy = match mode {
+        SemanticMode::Off => return None,
+        SemanticMode::Auto => StartPolicy::ReuseOnly,
+        SemanticMode::Eager => StartPolicy::Lazy,
+    };
+    let files: Vec<&String> = files
+        .iter()
+        .take(3)
+        .filter(|f| crate::core::semantic::resolve::backend_may_answer(root, f, policy))
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let inputs = CallGraphInputs::open(root);
+    let inputs_ms = started.elapsed().as_millis();
+    let hashes = current_file_hashes(&inputs);
+    let prepared_ms = started.elapsed().as_millis();
+    let mut check = ReferencesCheck {
+        users: BTreeSet::new(),
+        complete: true,
+        backend: None,
+    };
+    let mut answered = false;
+    for file in files {
+        let pass = resolve_relation_edges(
+            graph,
+            root,
+            &inputs,
+            &hashes,
+            mode,
+            Relation::References,
+            Some(file),
+            RelationBudget::INTERACTIVE,
+        );
+        let settled = pass.settled.contains(file.as_str());
+        answered |= pass.answered > 0;
+        check.complete &= settled;
+        crate::core::graph_enricher::apply_relation_edges(
+            graph,
+            Relation::References,
+            &pass,
+            |_, _| false,
+        )
+        .ok()?;
+        for e in pass.edges {
+            check.backend.get_or_insert(e.backend);
+            check.users.insert(e.from);
+        }
+    }
+    tracing::debug!(
+        target: "lean_ctx::semantic",
+        "ctx_impact references: inputs {inputs_ms} ms, +hashes {prepared_ms} ms, total {} ms, {} users, complete {}",
+        started.elapsed().as_millis(),
+        check.users.len(),
+        check.complete
+    );
+    answered.then_some(check)
 }
 
 /// Reduce a user-supplied target to a bare symbol name for the #398 fallback:
@@ -179,6 +288,7 @@ fn analyze_symbol(
     let mut affected: BTreeSet<String> = BTreeSet::new();
     let mut max_depth_reached = 0usize;
     let mut edges_traversed = 0usize;
+    let semantic = verify_references(graph, root, def_files);
     for f in def_files {
         if let Ok(r) = graph.impact_analysis(f, max_depth) {
             max_depth_reached = max_depth_reached.max(r.max_depth_reached);
@@ -215,22 +325,27 @@ fn analyze_symbol(
                 "edges_traversed": edges_traversed,
                 "affected_files_total": total,
                 "affected_files": sorted,
+                "semantic_references": semantic.as_ref().map(ReferencesCheck::json),
                 "truncated": truncated
             });
             serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string())
         }
         OutputFormat::Text => {
             let defined = def_files.join(", ");
+            let semantic_line = semantic
+                .as_ref()
+                .map(ReferencesCheck::text_line)
+                .unwrap_or_default();
             if total == 0 {
                 let result = format!(
-                    "No files depend on {symbol} (defined in {defined}); it is a leaf in the dependency graph."
+                    "No files depend on {symbol} (defined in {defined}); it is a leaf in the dependency graph.\n{semantic_line}"
                 );
                 let tokens = count_tokens(&result);
-                return format!("{result}\n[ctx_impact: {tokens} tok]");
+                return format!("{}\n[ctx_impact: {tokens} tok]", result.trim_end());
             }
             let mut result = format!(
                 "Impact of changing {symbol} (defined in {defined}): {total} affected files \
-                 (depth: {max_depth_reached}, edges traversed: {edges_traversed})\n"
+                 (depth: {max_depth_reached}, edges traversed: {edges_traversed})\n{semantic_line}"
             );
             for file in &sorted {
                 result.push_str(&format!("  {file}\n"));
@@ -284,7 +399,13 @@ fn analyze_unresolved(
     }
 }
 
-fn format_impact(impact: &ImpactResult, target: &str, root: &str, fmt: OutputFormat) -> String {
+fn format_impact(
+    impact: &ImpactResult,
+    target: &str,
+    root: &str,
+    fmt: OutputFormat,
+    semantic: Option<&ReferencesCheck>,
+) -> String {
     let mut sorted = impact.affected_files.clone();
     sorted.sort();
 
@@ -297,6 +418,11 @@ fn format_impact(impact: &ImpactResult, target: &str, root: &str, fmt: OutputFor
 
     match fmt {
         OutputFormat::Json => {
+            // Bounded like `affected_files`: only the returned files' marks.
+            let weak: Vec<&String> = sorted
+                .iter()
+                .filter(|f| impact.weak_files.binary_search(f).is_ok())
+                .collect();
             let v = json!({
                 "schema_version": crate::core::contracts::GRAPH_REPRODUCIBILITY_V1_SCHEMA_VERSION,
                 "tool": "ctx_impact",
@@ -309,25 +435,34 @@ fn format_impact(impact: &ImpactResult, target: &str, root: &str, fmt: OutputFor
                 "edges_traversed": impact.edges_traversed,
                 "affected_files_total": total,
                 "affected_files": sorted,
+                "weak_files_total": impact.weak_files.len(),
+                "weak_files": weak,
+                "semantic_references": semantic.map(ReferencesCheck::json),
                 "truncated": truncated
             });
             serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string())
         }
         OutputFormat::Text => {
+            let semantic_line = semantic.map(ReferencesCheck::text_line).unwrap_or_default();
             if total == 0 {
-                let result =
-                    format!("No files depend on {target} (leaf node in the dependency graph).");
+                let result = format!(
+                    "No files depend on {target} (leaf node in the dependency graph).\n{semantic_line}"
+                );
                 let tokens = count_tokens(&result);
-                return format!("{result}\n[ctx_impact: {tokens} tok]");
+                return format!("{}\n[ctx_impact: {tokens} tok]", result.trim_end());
             }
 
             let mut result = format!(
-                "Impact of changing {target}: {total} affected files (depth: {}, edges traversed: {})\n",
+                "Impact of changing {target}: {total} affected files (depth: {}, edges traversed: {})\n{semantic_line}",
                 impact.max_depth_reached, impact.edges_traversed
             );
 
             for file in &sorted {
-                result.push_str(&format!("  {file}\n"));
+                if impact.weak_files.binary_search(file).is_ok() {
+                    result.push_str(&format!("  {file}  (name match only)\n"));
+                } else {
+                    result.push_str(&format!("  {file}\n"));
+                }
             }
             if truncated {
                 result.push_str(&format!("  ... +{} more\n", total - limit));

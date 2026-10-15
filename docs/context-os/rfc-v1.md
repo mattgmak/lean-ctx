@@ -11,14 +11,10 @@
 
 ---
 
-> This RFC preserves a broad Context OS / commercial-plane proposal. It is not
-> current product documentation and does not make universal agent infrastructure,
-> Team/Cloud, extension marketplaces, or any hosted capability available.
-> LeanCTX is **The Context SDK for AI Agents**: a local context-performance layer
-> for existing agents. Current scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository); Python SDK v1 and its
-> declared OpenAI Agents wrapper are **Preview**, while the broader surfaces in
-> this RFC are **Research** or deferred.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 ## 1. Summary
 

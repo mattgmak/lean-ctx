@@ -37,8 +37,15 @@ impl McpTool for CtxGlobTool {
         args: &Map<String, Value>,
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ErrorData> {
+        // `glob` is the name other agents' file-finding tools use.
         let pattern = get_str(args, "pattern")
-            .ok_or_else(|| ErrorData::invalid_params("pattern is required", None))?;
+            .or_else(|| get_str(args, "glob"))
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "pattern is required. Example: ctx_glob(pattern=\"**/*.rs\")",
+                    None,
+                )
+            })?;
         let resolved = crate::server::multi_path::resolve_tool_paths(args, ctx)
             .map_err(|e| ErrorData::invalid_params(format!("ERROR: {e}"), None))?;
         let max = (get_int(args, "max_results").unwrap_or(200) as usize).min(500);
@@ -60,7 +67,8 @@ impl McpTool for CtxGlobTool {
                 respect,
                 allow_secret_paths,
                 max,
-            );
+            )
+            .map(|output| resolved.annotate(output));
         }
 
         let _mode_guard = crate::core::savings_footer::ModeGuard::new("glob");
@@ -238,8 +246,16 @@ fn cached_or_walk(
 mod tests {
     use super::*;
 
+    /// The cross-agent cache serves no stub while any policy is active, and
+    /// policy tests set one process-wide under the test env lock. Tests that
+    /// assert a cache hit take the same lock so they never run inside one.
+    fn no_policy_window() -> crate::core::data_dir::TestEnvGuard {
+        crate::core::data_dir::test_env_lock()
+    }
+
     #[test]
     fn glob_adapter_records_then_serves_a_cross_agent_reference() {
+        let _window = no_policy_window();
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("cached.rs"), "fn cached() {}\n").unwrap();
         let path = directory.path().to_string_lossy();
@@ -289,6 +305,7 @@ mod tests {
     /// for the dedup mechanism itself).
     #[test]
     fn same_pattern_repeated_uses_cache() {
+        let _window = no_policy_window();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("x.ts"), "export {}").unwrap();
         let path = dir.path().to_string_lossy();

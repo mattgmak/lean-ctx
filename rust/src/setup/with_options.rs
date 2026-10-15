@@ -1,7 +1,7 @@
 use chrono::Utc;
 
 use crate::core::editor_registry::{EditorTarget, WriteAction, WriteOptions};
-use crate::core::portable_binary::resolve_portable_binary;
+use crate::core::portable_binary::resolve_agent_binary;
 use crate::core::setup_report::{PlatformInfo, SetupItem, SetupReport, SetupStepReport};
 use crate::hooks::{HookMode, recommend_hook_mode};
 
@@ -15,7 +15,7 @@ pub fn run_setup_with_options(opts: SetupOptions) -> Result<SetupReport, String>
     let started_at = Utc::now();
     let home = crate::core::home::resolve_home_dir()
         .ok_or_else(|| "Cannot determine home directory".to_string())?;
-    let binary = resolve_portable_binary();
+    let binary = resolve_agent_binary();
     let home_str = home.to_string_lossy().to_string();
 
     // Commit to the XDG layout (and drain any residual ~/.lean-ctx) so a stray
@@ -54,10 +54,14 @@ pub fn run_setup_with_options(opts: SetupOptions) -> Result<SetupReport, String>
     }
 
     steps.extend([
+        super::intelligence::report(),
         build_tool_profile_step(),
         build_proxy_step(opts, &home),
         build_doctor_compact_step(),
     ]);
+    if let Some(step) = build_claude_mod_step(opts, &targets) {
+        steps.push(step);
+    }
 
     maybe_add_project_root_warning(&mut steps);
     maybe_spawn_background_index();
@@ -65,6 +69,25 @@ pub fn run_setup_with_options(opts: SetupOptions) -> Result<SetupReport, String>
 
     let report = build_setup_report(started_at, steps);
     persist_setup_report(&report)?;
+    if report.success {
+        let successful_names = report
+            .steps
+            .iter()
+            .filter(|step| step.name == "editors")
+            .flat_map(|step| &step.items)
+            .filter(|item| matches!(item.status.as_str(), "created" | "updated" | "already"))
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        let integrations = targets
+            .iter()
+            .filter(|target| successful_names.contains(&target.name))
+            .map(|target| target.agent_key.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = crate::core::telemetry_aggregate::record_setup_completion(integrations)
+        {
+            tracing::debug!("telemetry setup aggregate unavailable: {error}");
+        }
+    }
 
     Ok(report)
 }
@@ -90,8 +113,9 @@ fn build_shell_hook_step(opts: SetupOptions, _binary: &str) -> SetupStepReport {
         crate::shell_hook::install_all(opts.json);
         #[cfg(not(windows))]
         {
-            let binary = _binary;
-            let hook_content = crate::cli::generate_hook_posix(binary);
+            // Same stable PATH entry `init` embeds in the hook (#1851).
+            let binary = crate::core::portable_binary::stable_shell_binary(_binary);
+            let hook_content = crate::cli::generate_hook_posix(&binary);
             if crate::shell::is_container() {
                 crate::cli::write_env_sh_for_containers(&hook_content);
                 shell_step.items.push(SetupItem {
@@ -440,6 +464,63 @@ fn build_agent_hooks_step(
     (!hooks_step.items.is_empty()).then_some(hooks_step)
 }
 
+/// The lean-ctx Claude Code mod (cockpit, wake, a focused tool surface) is set
+/// up wherever Claude Code can host it — by setup and by the post-update rewire
+/// alike — and an installed one is rolled forward to this engine. It runs
+/// inside Claude Code, so the report says what was installed and how to remove
+/// it, and a removal (`lean-ctx claude-mod uninstall`) is never undone here.
+fn build_claude_mod_step(opts: SetupOptions, targets: &[EditorTarget]) -> Option<SetupStepReport> {
+    use crate::hooks::agents::claude_mod::{self, ModStatus};
+    let claude_present = targets
+        .iter()
+        .any(|t| t.agent_key == "claude" && t.detect_path.exists());
+    if !claude_present {
+        return None;
+    }
+    let mut step = setup_step("claude_mod");
+    let item = |status: &str, note: String| SetupItem {
+        name: claude_mod::PLUGIN_ID.to_string(),
+        status: status.to_string(),
+        path: claude_mod::marketplace_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string()),
+        note: Some(note),
+    };
+    let quiet = opts.json;
+    match claude_mod::status() {
+        status @ (ModStatus::ClaudeMissing(_) | ModStatus::ClaudeTooOld(_)) => {
+            step.items.push(item("skipped", status.describe()));
+        }
+        ModStatus::Current(v) => step.items.push(item("already", v)),
+        ModStatus::Stale(_) => match claude_mod::install() {
+            Ok(msg) => step.items.push(item("updated", msg)),
+            Err(e) => {
+                step.warnings
+                    .push(format!("claude mod refresh failed: {e}"));
+                step.items.push(item("error", e));
+            }
+        },
+        ModStatus::NotInstalled if claude_mod::auto_install_declined() => step.items.push(item(
+            "skipped",
+            "removed by you — bring it back with: lean-ctx claude-mod install".to_string(),
+        )),
+        ModStatus::NotInstalled => match claude_mod::install() {
+            Ok(msg) => {
+                if !quiet {
+                    println!("\n  {}", claude_mod::INSTALLED_NOTICE);
+                }
+                step.items.push(item("created", msg));
+            }
+            Err(e) => {
+                step.warnings
+                    .push(format!("claude mod install failed: {e}"));
+                step.items.push(item("error", e));
+            }
+        },
+    }
+    Some(step)
+}
+
 fn build_tool_profile_step() -> SetupStepReport {
     let mut tool_profile_step = setup_step("tool_profile");
     let cfg = crate::core::config::Config::load();
@@ -635,6 +716,15 @@ fn persist_setup_report(report: &SetupReport) -> Result<(), String> {
 mod rule_steering_policy_tests {
     use super::*;
 
+    /// `rules_injection_effective` prefers `LEAN_CTX_RULES_INJECTION` over the
+    /// config, and other tests set it concurrently. Hold the env lock and
+    /// clear it so the config under test decides.
+    fn without_rules_injection_env() -> crate::core::data_dir::TestEnvGuard {
+        let guard = crate::core::data_dir::test_env_lock();
+        crate::test_env::remove_var("LEAN_CTX_RULES_INJECTION");
+        guard
+    }
+
     #[test]
     fn editor_step_respects_commandcode_rule_steering_policy() {
         let tmp = tempfile::tempdir().unwrap();
@@ -680,6 +770,7 @@ mod rule_steering_policy_tests {
 
     #[test]
     fn explicit_auto_false_declines_setup_steering() {
+        let _env = without_rules_injection_env();
         let mut cfg = crate::core::config::Config::default();
         cfg.setup.auto_inject_rules = Some(false);
 
@@ -688,6 +779,7 @@ mod rule_steering_policy_tests {
 
     #[test]
     fn force_overrides_auto_false_but_not_rules_off() {
+        let _env = without_rules_injection_env();
         let force = SetupOptions {
             force_inject_rules: true,
             ..Default::default()
@@ -711,6 +803,7 @@ mod rule_steering_policy_tests {
 
     #[test]
     fn skip_rules_wins_over_force() {
+        let _env = without_rules_injection_env();
         let opts = SetupOptions {
             skip_rules: true,
             force_inject_rules: true,
@@ -724,6 +817,7 @@ mod rule_steering_policy_tests {
 
     #[test]
     fn default_none_and_explicit_true_allow_setup_steering() {
+        let _env = without_rules_injection_env();
         let default_cfg = crate::core::config::Config::default();
 
         assert!(should_allow_rule_steering(

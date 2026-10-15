@@ -170,6 +170,10 @@ pub fn start_daemon(args: &[String]) -> Result<()> {
         anyhow::bail!("Daemon process exited immediately:\n{stderr_trimmed}");
     }
 
+    if let Err(error) = crate::core::enterprise_handshake::notify_configured_runtime() {
+        eprintln!("enterprise runtime handshake unavailable: {error}");
+    }
+
     let addr = daemon_addr();
     if crate::core::protocol::meta_visible() {
         eprintln!(
@@ -228,12 +232,12 @@ pub fn stop_daemon() -> Result<()> {
     ipc::cleanup(&daemon_addr());
     eprintln!("lean-ctx daemon stopped (PID {pid}).");
 
-    let orphans = ipc::process::find_pids_by_name("lean-ctx");
-    if !orphans.is_empty() {
-        eprintln!("  Cleaning up {} orphan process(es)…", orphans.len());
-        ipc::process::kill_all_by_name("lean-ctx");
-    }
-
+    // #1292: stopping one daemon ends that daemon only. A machine-wide
+    // `kill_all_by_name` here reached every other lean-ctx process — the real
+    // user's daemon and proxy under a sandbox HOME, other worktrees' daemons,
+    // other agents' `lean-ctx -c` commands — from `setup`, `daemon stop` and
+    // `serve`. The commands that mean "stop everything" (`stop`, `restart`,
+    // `config apply`, `uninstall`, `dev-install`) sweep explicitly themselves.
     Ok(())
 }
 

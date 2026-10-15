@@ -11,6 +11,7 @@ mod overhead;
 mod report;
 mod workspace_scope;
 
+pub(crate) use checks::configured_host_coverage;
 #[allow(clippy::wildcard_imports)]
 use checks::*;
 #[allow(clippy::wildcard_imports)]
@@ -348,10 +349,20 @@ fn run_inner(json: bool) -> u32 {
     // pins a stale LEAN_CTX_DATA_DIR (which would make that editor's MCP server
     // read a different config.toml than this CLI), and print the resolved path.
     board.check(&config_parity_outcome());
+    board.check(&project_pin_outcome());
 
     // 5b) Shell allowlist (effective runtime view + silent-parse-error trap, #341)
     let allowlist_outcome = shell_allowlist_outcome();
     board.check(&allowlist_outcome);
+
+    // 5b1) GH #1419 follow-up: upgrade advisory + shadowing advisory, both
+    // read-only and silent when there's nothing to report.
+    if let Some(upgrade) = shell_allowlist_upgrade_advisory_outcome() {
+        board.check(&upgrade);
+    }
+    if let Some(shadowing) = shell_allowlist_shadowing_outcome() {
+        board.check(&shadowing);
+    }
 
     // 5b2) Path jail (effective state + dead allow_paths entries, GH #392)
     let path_jail = path_jail_outcome();
@@ -365,6 +376,8 @@ fn run_inner(json: bool) -> u32 {
     // of the jail + shell gating above (#507).
     let secret_detection = secret_detection_outcome();
     board.check(&secret_detection);
+    let context_gateway = context_gateway_outcome();
+    board.check(&context_gateway);
 
     // 5b3c) Managed addon binaries (GH #725): receipt path + sha256 pin +
     // revocation, so binhash-gate refusals surface here instead of at first
@@ -373,8 +386,8 @@ fn run_inner(json: bool) -> u32 {
         board.check(&managed_bins);
     }
 
-    // 5b3d) Managed ONNX Runtime (GH #732): present + readable on
-    // embedding-enabled builds. Silent when not provisioned (opt-in).
+    // 5b3d) Managed ONNX Runtime (GH #732). The managed runtime was removed;
+    // stays silent (embeddings are opt-in).
     if let Some(managed_ort) = managed_ort_outcome() {
         board.check(&managed_ort);
     }
@@ -424,6 +437,11 @@ fn run_inner(json: bool) -> u32 {
     // 9) SKILL.md
     let skill = skill_files_outcome();
     board.check(&skill);
+
+    // 9a) Optional Claude Code mod (informational; never fails doctor).
+    if let Some(claude_mod) = checks::claude_mod_outcome() {
+        board.check(&claude_mod);
+    }
 
     // 9b) Output triage (#1534): the 3.9.19 filter ran invisibly while doctor
     // reported all green — its state stays on the board whether on or off.
@@ -615,11 +633,11 @@ fn run_inner(json: bool) -> u32 {
     let stats_quarantine = stats_quarantine_outcome();
     board.check(&stats_quarantine);
 
-    // 15a) Semantic index runtime status (state/timing/persistence) for the
-    // active project — surfaces a stuck "warming" index (issue #249).
-    let semantic_index = semantic_index_outcome();
-    if let Some(ref check) = semantic_index {
-        board.check(check);
+    // 15a) Search indexes for the active project: the BM25 runtime status
+    // (surfaces a stuck "warming" index, #249) and the dense vector index
+    // on disk — reported separately so neither masquerades as the other (#1887).
+    for check in search_index_outcomes() {
+        board.check(&check);
     }
 
     // 15b) Archive FTS footprint
@@ -672,6 +690,16 @@ fn run_inner(json: bool) -> u32 {
         board.check(check);
     }
 
+    // 21a) Removed automatic model routing: a leftover tier table routes nothing.
+    if let Some(ref check) = removed_routing_tiers_outcome() {
+        board.check(check);
+    }
+
+    // 21b) Context gateway coverage per configured host (G7): enforced only
+    // where model traffic is proxy-routed; never claims more than it sees.
+    let coverage_check = gateway_coverage_outcome();
+    board.check(&coverage_check);
+
     // 22) Deprecation register (CONTRACTS.md policy, GL #394): warn about
     // every surface this build deprecates, with replacement and removal floor.
     let deprecation_check = deprecations::deprecations_outcome();
@@ -683,11 +711,17 @@ fn run_inner(json: bool) -> u32 {
 
     // LSP servers (optional, informational)
     if !json {
-        println!("\n  {BOLD}{WHITE}LSP (optional — for ctx_refactor):{RST}");
+        println!(
+            "\n  {BOLD}{WHITE}Semantic intelligence (optional — ctx_refactor + verified graph edges):{RST}"
+        );
     }
+    board.info(&semantic_mode_outcome());
     let lsp_outcomes = lsp_server_outcomes();
     for lsp_check in &lsp_outcomes {
         board.info(lsp_check);
+    }
+    for coverage in semantic_coverage_outcomes() {
+        board.info(&coverage);
     }
 
     // Shadow mode status. #1280: the old single line claimed "native tools

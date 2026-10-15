@@ -378,18 +378,12 @@ pub mod tests {
         let _env_lock = crate::core::data_dir::test_env_lock();
         let t = BudgetTracker::new();
         t.record_cost_usd(6.0);
-        // SAFETY: single-threaded test — no concurrent env access.
-        unsafe {
-            std::env::set_var("LEAN_CTX_COST_CAP_OVERRIDE", "1");
-        }
+        crate::test_env::set_var("LEAN_CTX_COST_CAP_OVERRIDE", "1");
         assert!(
             t.cost_cap_message().is_none(),
             "override=1 must bypass cost cap"
         );
-        // SAFETY: single-threaded test — no concurrent env access.
-        unsafe {
-            std::env::remove_var("LEAN_CTX_COST_CAP_OVERRIDE");
-        }
+        crate::test_env::remove_var("LEAN_CTX_COST_CAP_OVERRIDE");
     }
 
     #[test]

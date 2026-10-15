@@ -1,15 +1,13 @@
-//! BuiltinUsageSink — records token usage and emits RequestCompleted events.
+// SPDX-License-Identifier: Apache-2.0
+//! BuiltinUsageSink — accumulates measured token usage.
 //!
 //! Wraps the existing `proxy/usage_sink.rs` / `proxy/usage.rs` path behind
-//! the OCLA trait interface. Each `record_usage` call emits a RequestCompleted
-//! OclaEvent with the measured token counts.
+//! the OCLA trait interface.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use crate::core::ocla::traits::{OclaService, UsageSink};
 use crate::core::ocla::types::{OclaCapability, OclaCapabilityKind, OclaResult, UsageRecord};
-use crate::core::ocla_bus::{self, OclaEvent};
 
 pub struct BuiltinUsageSink {
     total_input: AtomicU64,
@@ -48,6 +46,10 @@ impl Default for BuiltinUsageSink {
 }
 
 impl OclaService for BuiltinUsageSink {
+    fn manifest(&self) -> crate::core::ocla::OclaResult<lean_ctx_protocol::CapabilityManifestV1> {
+        crate::core::ocla::capability_fabric::builtin_manifest(&self.capability())
+    }
+
     fn capability(&self) -> OclaCapability {
         OclaCapability::available(OclaCapabilityKind::UsageSink)
     }
@@ -56,7 +58,6 @@ impl OclaService for BuiltinUsageSink {
 #[async_trait::async_trait]
 impl UsageSink for BuiltinUsageSink {
     async fn record_usage(&self, usage: UsageRecord) -> OclaResult<()> {
-        let started_at = Instant::now();
         self.total_input
             .fetch_add(usage.input_tokens, Ordering::Relaxed);
         self.total_output
@@ -64,15 +65,6 @@ impl UsageSink for BuiltinUsageSink {
         self.total_billed
             .fetch_add(usage.provider_billed_tokens, Ordering::Relaxed);
         self.record_count.fetch_add(1, Ordering::Relaxed);
-        let duration_ms = started_at.elapsed().as_millis() as u64;
-
-        ocla_bus::emit(OclaEvent::RequestCompleted {
-            model: usage.model,
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            duration_ms,
-            session_id: Some(usage.context.session_id),
-        });
 
         Ok(())
     }

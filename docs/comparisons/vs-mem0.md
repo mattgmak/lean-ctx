@@ -1,9 +1,9 @@
 # LeanCTX and Mem0
 
-> **Status: historical comparison note — not canonical product copy.** Current
-> LeanCTX scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository). This note makes no
-> statement that either memory approach benefits every agent or workload.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 Mem0 and LeanCTX serve different design questions. LeanCTX's current local
 Runtime works around an existing coding agent and project context; it is not a

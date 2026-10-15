@@ -1,6 +1,7 @@
 //! Telemetry and metrics collection following OpenTelemetry GenAI conventions.
 //!
-//! Provides lock-free, zero-allocation metrics collection for:
+//! Provides zero-allocation metrics collection with a short consistency lock
+//! around tool-call counters so daily snapshots cannot lose partial updates:
 //! - Token usage (input, output, saved, compression ratio)
 //! - Tool call latency and success rates
 //! - Search quality metrics (latency, result counts)
@@ -10,11 +11,47 @@
 //! Naming follows the OpenTelemetry GenAI Semantic Conventions:
 //! <https://opentelemetry.io/docs/specs/semconv/gen-ai/>
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+pub(crate) const TOOL_LATENCY_BUCKET_UPPER_MS: [u64; 9] =
+    [10, 50, 100, 250, 500, 1_000, 5_000, 60_000, i64::MAX as u64];
+
+/// Distinct (tool, failure template) pairs one process keeps.
+pub(crate) const MAX_FAILURE_TEMPLATES: usize = 256;
+
+/// Calls, failures and summed latency of one tool since process start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolCallCounter {
+    pub calls: u64,
+    pub failures: u64,
+    pub latency_us: u64,
+    /// Failures by [`crate::core::telemetry_failure::FAILURE_KINDS`] index.
+    pub failure_kinds: [u64; crate::core::telemetry_failure::FAILURE_KINDS.len()],
+    /// Class of the most recent call's failure; `None` after a success.
+    pub last_failure: Option<crate::core::telemetry_failure::FailureKind>,
+    /// Calls made right after a failed call of the same tool, and how many
+    /// of those failed again.
+    pub retries: u64,
+    pub retry_failures: u64,
+}
+
+/// How the agent session served by this process went so far, from the
+/// in-process counters only. Feeds the session-end tally in
+/// `core::telemetry_features`; nothing here leaves the machine as is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionOutcome {
+    pub calls: u64,
+    pub failures: u64,
+    /// Failure classes of tools whose last call failed.
+    pub unresolved: Vec<crate::core::telemetry_failure::FailureKind>,
+    pub retries: u64,
+    pub retry_failures: u64,
+}
 
 pub fn global_metrics() -> &'static Metrics {
     METRICS.get_or_init(Metrics::new)
@@ -22,6 +59,12 @@ pub fn global_metrics() -> &'static Metrics {
 
 #[derive(Debug)]
 pub struct Metrics {
+    /// Guards the tool-call counters so a daily snapshot never sees a
+    /// half-applied call, and holds the per-tool counts. Keys are the static
+    /// names of the built-in tool registry, never caller-supplied strings.
+    tool_call_consistency: std::sync::Mutex<BTreeMap<&'static str, ToolCallCounter>>,
+    /// Scrubbed failure templates per built-in tool since process start.
+    failure_templates: std::sync::Mutex<BTreeMap<(&'static str, String), u64>>,
     // gen_ai.usage.input_tokens / gen_ai.usage.output_tokens
     pub tokens_input: AtomicU64,
     pub tokens_output: AtomicU64,
@@ -30,6 +73,7 @@ pub struct Metrics {
     pub tool_calls_total: AtomicU64,
     pub tool_calls_error: AtomicU64,
     pub tool_call_latency_sum_us: AtomicU64,
+    tool_call_latency_buckets: [AtomicU64; TOOL_LATENCY_BUCKET_UPPER_MS.len()],
 
     pub search_queries_total: AtomicU64,
     pub search_latency_sum_us: AtomicU64,
@@ -52,12 +96,15 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
+            tool_call_consistency: std::sync::Mutex::new(BTreeMap::new()),
+            failure_templates: std::sync::Mutex::new(BTreeMap::new()),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             tokens_saved: AtomicU64::new(0),
             tool_calls_total: AtomicU64::new(0),
             tool_calls_error: AtomicU64::new(0),
             tool_call_latency_sum_us: AtomicU64::new(0),
+            tool_call_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             search_queries_total: AtomicU64::new(0),
             search_latency_sum_us: AtomicU64::new(0),
             search_results_total: AtomicU64::new(0),
@@ -80,9 +127,87 @@ impl Metrics {
     }
 
     pub fn record_tool_call(&self, latency_us: u64, success: bool) {
+        let guard = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record_tool_call_locked(latency_us, success);
+        drop(guard);
+    }
+
+    /// Record a call of a built-in tool: the totals and the tool's own counter
+    /// move together under one lock.
+    pub fn record_named_tool_call(&self, tool: &'static str, latency_us: u64, success: bool) {
+        self.record_named_tool_outcome(
+            tool,
+            latency_us,
+            (!success).then_some(crate::core::telemetry_failure::FailureKind::Other),
+        );
+    }
+
+    /// Like [`Self::record_named_tool_call`], with the class of a failure.
+    pub fn record_named_tool_outcome(
+        &self,
+        tool: &'static str,
+        latency_us: u64,
+        failure: Option<crate::core::telemetry_failure::FailureKind>,
+    ) {
+        let mut per_tool = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record_tool_call_locked(latency_us, failure.is_none());
+        let counter = per_tool.entry(tool).or_default();
+        counter.calls = counter.calls.saturating_add(1);
+        counter.latency_us = counter.latency_us.saturating_add(latency_us);
+        if counter.last_failure.is_some() {
+            counter.retries = counter.retries.saturating_add(1);
+            if failure.is_some() {
+                counter.retry_failures = counter.retry_failures.saturating_add(1);
+            }
+        }
+        counter.last_failure = failure;
+        if let Some(kind) = failure {
+            counter.failures = counter.failures.saturating_add(1);
+            let slot = &mut counter.failure_kinds[kind.index()];
+            *slot = slot.saturating_add(1);
+        }
+    }
+
+    /// Like [`Self::record_named_tool_outcome`], also counting the failure's
+    /// scrubbed template. Templates are bounded per process.
+    pub fn record_named_tool_failure(
+        &self,
+        tool: &'static str,
+        latency_us: u64,
+        failure: Option<crate::core::telemetry_failure::Failure>,
+    ) {
+        let template = failure
+            .as_ref()
+            .and_then(|failure| failure.template.clone());
+        self.record_named_tool_outcome(tool, latency_us, failure.map(|failure| failure.kind));
+        let Some(template) = template else { return };
+        let mut templates = self
+            .failure_templates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (tool, template);
+        if templates.len() < MAX_FAILURE_TEMPLATES || templates.contains_key(&key) {
+            let count = templates.entry(key).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn record_tool_call_locked(&self, latency_us: u64, success: bool) {
         self.tool_calls_total.fetch_add(1, Ordering::Relaxed);
         self.tool_call_latency_sum_us
             .fetch_add(latency_us, Ordering::Relaxed);
+        let latency_ms = latency_us / 1_000;
+        let bucket = TOOL_LATENCY_BUCKET_UPPER_MS
+            .iter()
+            .position(|upper| latency_ms <= *upper)
+            .unwrap_or(TOOL_LATENCY_BUCKET_UPPER_MS.len() - 1);
+        self.tool_call_latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
         if !success {
             self.tool_calls_error.fetch_add(1, Ordering::Relaxed);
         }
@@ -178,6 +303,43 @@ impl Metrics {
         }
     }
 
+    pub(crate) fn daily_telemetry_snapshot(&self) -> DailyTelemetrySnapshot {
+        let per_tool = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        DailyTelemetrySnapshot {
+            per_tool: per_tool.clone(),
+            tool_calls: self.tool_calls_total.load(Ordering::Relaxed),
+            tool_failures: self.tool_calls_error.load(Ordering::Relaxed),
+            tool_latency_buckets: std::array::from_fn(|index| {
+                self.tool_call_latency_buckets[index].load(Ordering::Relaxed)
+            }),
+            session_uptime_secs: self.session_start.elapsed().as_secs(),
+            tokens_input: self.tokens_input.load(Ordering::Relaxed),
+            tokens_output: self.tokens_output.load(Ordering::Relaxed),
+            failure_templates: self
+                .failure_templates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
+    }
+
+    pub(crate) fn session_outcome(&self) -> SessionOutcome {
+        let per_tool = self
+            .tool_call_consistency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SessionOutcome {
+            calls: self.tool_calls_total.load(Ordering::Relaxed),
+            failures: self.tool_calls_error.load(Ordering::Relaxed),
+            unresolved: per_tool.values().filter_map(|c| c.last_failure).collect(),
+            retries: per_tool.values().map(|c| c.retries).sum(),
+            retry_failures: per_tool.values().map(|c| c.retry_failures).sum(),
+        }
+    }
+
     /// Format as OpenTelemetry-compatible attributes for logging.
     pub fn to_otel_attributes(&self) -> Vec<(&'static str, String)> {
         let snap = self.snapshot();
@@ -227,6 +389,20 @@ impl Metrics {
             ),
         ]
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DailyTelemetrySnapshot {
+    pub tool_calls: u64,
+    pub tool_failures: u64,
+    pub tool_latency_buckets: [u64; TOOL_LATENCY_BUCKET_UPPER_MS.len()],
+    pub session_uptime_secs: u64,
+    pub per_tool: BTreeMap<&'static str, ToolCallCounter>,
+    /// Tokens tool output would have cost uncompressed vs. what was delivered.
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    /// Scrubbed failure templates by (tool, template).
+    pub failure_templates: BTreeMap<(&'static str, String), u64>,
 }
 
 /// Point-in-time snapshot of all metrics.
@@ -561,6 +737,98 @@ mod tests {
         assert_eq!(snap.tool_calls_total, 2);
         assert_eq!(snap.tool_calls_error, 1);
         assert!(snap.tool_call_avg_latency_ms > 0.0);
+    }
+
+    #[test]
+    fn named_tool_call_moves_totals_and_per_tool_counter_together() {
+        let m = Metrics::new();
+        m.record_named_tool_call("ctx_read", 1_000, true);
+        m.record_named_tool_call("ctx_read", 2_000, false);
+        m.record_named_tool_call("ctx_shell", 3_000, true);
+
+        let snap = m.daily_telemetry_snapshot();
+        assert_eq!(snap.tool_calls, 3);
+        assert_eq!(snap.tool_failures, 1);
+        assert_eq!(
+            snap.per_tool.get("ctx_read"),
+            Some(&ToolCallCounter {
+                calls: 2,
+                failures: 1,
+                latency_us: 3_000,
+                failure_kinds: {
+                    let mut kinds = [0; crate::core::telemetry_failure::FAILURE_KINDS.len()];
+                    kinds[crate::core::telemetry_failure::FailureKind::Other.index()] = 1;
+                    kinds
+                },
+                last_failure: Some(crate::core::telemetry_failure::FailureKind::Other),
+                retries: 0,
+                retry_failures: 0,
+            })
+        );
+        assert_eq!(
+            snap.per_tool.get("ctx_shell"),
+            Some(&ToolCallCounter {
+                calls: 1,
+                failures: 0,
+                latency_us: 3_000,
+                ..ToolCallCounter::default()
+            })
+        );
+    }
+
+    #[test]
+    fn session_outcome_tracks_retries_and_unresolved_tools() {
+        use crate::core::telemetry_failure::FailureKind;
+        let m = Metrics::new();
+        m.record_named_tool_outcome("ctx_read", 1, Some(FailureKind::NotFound));
+        m.record_named_tool_outcome("ctx_read", 1, Some(FailureKind::NotFound));
+        m.record_named_tool_outcome("ctx_read", 1, None);
+        m.record_named_tool_outcome("ctx_shell", 1, None);
+        m.record_named_tool_outcome("ctx_shell", 1, Some(FailureKind::Timeout));
+
+        assert_eq!(
+            m.session_outcome(),
+            SessionOutcome {
+                calls: 5,
+                failures: 3,
+                unresolved: vec![FailureKind::Timeout],
+                retries: 2,
+                retry_failures: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn concurrent_daily_snapshot_never_observes_partial_tool_call() {
+        let metrics = std::sync::Arc::new(Metrics::new());
+        let writers = (0..4)
+            .map(|worker| {
+                let metrics = std::sync::Arc::clone(&metrics);
+                std::thread::spawn(move || {
+                    for call in 0..1_000 {
+                        metrics.record_tool_call((call + 1) * 1_000, (call + worker) % 3 != 0);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let snapshot = metrics.daily_telemetry_snapshot();
+            assert_eq!(
+                snapshot.tool_latency_buckets.iter().sum::<u64>(),
+                snapshot.tool_calls
+            );
+            assert!(snapshot.tool_failures <= snapshot.tool_calls);
+        }
+        for writer in writers {
+            writer.join().expect("writer");
+        }
+        let snapshot = metrics.daily_telemetry_snapshot();
+        assert_eq!(snapshot.tool_calls, 4_000);
+        assert_eq!(
+            snapshot.tool_latency_buckets.iter().sum::<u64>(),
+            snapshot.tool_calls
+        );
+        assert!(snapshot.tool_failures <= snapshot.tool_calls);
     }
 
     #[test]

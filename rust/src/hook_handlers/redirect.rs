@@ -116,7 +116,8 @@ pub(super) enum EditRiskClass {
 /// Default is `SafeToCompress`: the 4-layer safety net (marker guard,
 /// snapshot store, quality escalation, auto-recovery) prevents corruption.
 /// `should_passthrough()` already filters .cursorrules, .env, AGENTS.md,
-/// binaries, and Claude auto-memory paths before this function runs.
+/// binaries, Claude auto-memory and user-excluded paths before this function
+/// runs; instruction files such as CLAUDE.md resolve to full in `-m auto`.
 pub(super) fn edit_risk_class(path: &str) -> EditRiskClass {
     if is_instruction_override(path) {
         return EditRiskClass::NeverCompress;
@@ -739,6 +740,12 @@ pub(super) fn should_passthrough(path: &str) -> bool {
     let p = path.to_lowercase();
 
     if PASSTHROUGH_SUBSTRINGS.iter().any(|s| p.contains(s)) {
+        return true;
+    }
+
+    // #60: paths the user excluded (`redirect_exclude` / LEAN_CTX_HOOK_EXCLUDE)
+    // stay on the native tool.
+    if crate::tools::ctx_read::is_user_excluded(path) {
         return true;
     }
 

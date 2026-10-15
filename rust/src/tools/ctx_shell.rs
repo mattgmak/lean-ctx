@@ -10,10 +10,83 @@ pub fn validate_command(command: &str) -> Option<String> {
     validate_command_with_write_allow_paths(command, &write_allow_paths, project_root.as_deref())
 }
 
+/// Validate without knowing where the command will run.
+///
+/// A relative redirect target cannot be placed, so it is refused — the
+/// conservative reading. Callers that know the working directory should use
+/// [`validate_command_in_cwd`] instead, which resolves the destination first.
 pub(crate) fn validate_command_with_write_allow_paths(
     command: &str,
     write_allow_paths: &[String],
     project_root: Option<&str>,
+) -> Option<String> {
+    validate_command_in_cwd(command, write_allow_paths, project_root, None)
+}
+
+/// The capture rule as the guard applies it, shared by the redirect and `tee`
+/// refusals so the two cannot drift apart. #1946: both used to call the rule
+/// "output capture into a project path", but a destination outside the
+/// project — and outside every root — is refused just the same. A caller who
+/// took that wording at its word tried another non-project path and was
+/// refused again with the identical text.
+const CAPTURE_RULE: &str = "The rule: output capture (`>`, `>>`, `| tee`) may go to the \
+     session's project, a directory in `allow_paths` / `extra_roots`, a directory listed in \
+     `write_allow_paths` in config.toml, or a scratch path (/tmp, /var/tmp, $TMPDIR). Every \
+     other destination is refused. Commands that do not capture output are not restricted.";
+
+/// Directories ctx_shell output capture may write besides `write_allow_paths`
+/// and the scratch paths: the session's project, its host-declared roots and
+/// the jail's explicit allow entries — the places lean-ctx's own edit tools may
+/// write (owner decision 2026-10-08: refusing `> out.txt` inside the project
+/// while `allow_paths` was ignored read as a bug). Broad roots (`/`, `~`, temp
+/// parents) and anything under `read_only_roots` are never included.
+pub(crate) fn capture_roots(
+    project_root: &str,
+    session_extra_roots: &[String],
+    cfg: &crate::core::config::Config,
+) -> Vec<String> {
+    std::iter::once(project_root.to_string())
+        .chain(session_extra_roots.iter().cloned())
+        .chain(cfg.allow_paths.iter().cloned())
+        .chain(cfg.extra_roots.iter().cloned())
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| crate::core::pathjail::expand_user_path(&raw))
+        .filter(|path| {
+            let contains_home = dirs::home_dir().is_some_and(|home| home.starts_with(path));
+            path.is_absolute()
+                && !contains_home
+                && !crate::core::pathutil::is_broad_or_unsafe_root(path)
+                && !crate::core::pathjail::is_read_only_path(path)
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Why the capture rule exists, shared by every write refusal (#1992). The
+/// refusals used to say ctx_shell's compression could land in the file as
+/// markers. That stopped being true with #1303 (v3.9.14): the child shell
+/// performs the redirect, so the file receives the command's own bytes and
+/// only the MCP return channel is compressed. A caller who knew their output
+/// was tiny plain text read the old rationale as a risk that did not apply to
+/// them and retried with `raw=true` or a smaller command — neither changes
+/// the verdict, because the reason is the write path, not the bytes.
+const WRITE_REASON: &str = "Files you keep are written with ctx_patch or the native Write/Edit \
+     tool, so the read-before-write gate and the edit checks apply to them; ctx_shell does not \
+     write them through output capture. This is unconditional: the redirect itself is not \
+     compressed, so a smaller command or `raw=true` does not change the verdict.";
+
+/// Validate against the directory the command will actually run in (#1811).
+///
+/// The write guard classifies the *destination*, so a relative redirect target
+/// has to be placed before it can be judged. Without a `cwd` it cannot be, and
+/// every relative target was refused — which made `cwd=<scratch> … > probe.txt`
+/// fail while the identical absolute path succeeded, under a message promising
+/// that the destination decides.
+pub(crate) fn validate_command_in_cwd(
+    command: &str,
+    write_allow_paths: &[String],
+    project_root: Option<&str>,
+    cwd: Option<&str>,
 ) -> Option<String> {
     if command.len() > MAX_COMMAND_BYTES {
         return Some(format!(
@@ -28,28 +101,30 @@ pub(crate) fn validate_command_with_write_allow_paths(
     // #931: strip heredoc bodies before the redirect scanner — a `>` inside a
     // heredoc body is opaque data, not a file-write redirect.
     let cmd_no_heredoc = crate::core::shell_allowlist::strip_all_heredoc_bodies(command);
+    // #1850: a relative target lands where its own command runs, and a `cd`
+    // earlier in the line moves that. Judging every target against the call's
+    // `cwd` blocked `cd /tmp && echo x > out.txt` and let `cd <project> && echo
+    // x > f` from a scratch cwd write straight into the project. Each segment
+    // is judged against its own directory; where that cannot be known, a
+    // relative target is refused.
+    let segments = segments_in_cwd(&cmd_no_heredoc, cwd);
     // #1768: the rule is the destination, not the size of the payload. The
     // refusal used to justify itself with "MCP protocol corruption on large
     // payloads" while the guard allows a megabyte into /tmp and blocks two
     // bytes into a project file — so the stated reason argued *against* the
     // verdict in both directions, and steered callers to retry smaller (no
-    // effect) or to avoid the sanctioned scratch capture. The reasons that
-    // actually hold are the ones #1303 and #1142 established: ctx_shell
-    // compresses what it returns, so output redirected into a file you keep
-    // can land there with compression markers instead of the command's own
-    // bytes; and a scratch capture is precisely how a large payload stays out
-    // of the MCP channel.
-    if let Some(target) =
-        disallowed_write_redirect_target(&cmd_no_heredoc, write_allow_paths, project_root)
-    {
+    // effect) or to avoid the sanctioned scratch capture. #1992: the
+    // compression-marker rationale that replaced it was stale too — see
+    // WRITE_REASON for the reason that holds.
+    if let Some(target) = segments.iter().find_map(|(segment, here)| {
+        disallowed_write_redirect_target(segment, write_allow_paths, project_root, here.as_deref())
+    }) {
         return Some(format!(
             "ERROR: ctx_shell refuses the redirect into `{target}` — the destination decides, \
-             not the size of the output. ctx_shell compresses what it returns, so a redirect \
-             into a file you keep can write compression markers instead of the command's own \
-             bytes, and ctx_shell never modifies project files. \
-             Use the native Write tool or ctx_patch for project files. \
-             Capturing output to a scratch path (/tmp, /var/tmp, $TMPDIR) is allowed — that \
-             keeps the output out of the MCP channel entirely."
+             not the size or content of the output. {WRITE_REASON} {CAPTURE_RULE} \
+             Write the file with ctx_patch or the native Write tool, or capture to a scratch \
+             path.{}",
+            relative_target_note(&target)
         ));
     }
 
@@ -63,24 +138,24 @@ pub(crate) fn validate_command_with_write_allow_paths(
     // because an alternative was offered, and closed a review with no findings.
     // Naming the pipe also sent callers off to restructure their pipeline,
     // which cannot help: `… | tee FILE | wc -l` is judged identically.
-    if let Some(target) = disallowed_tee_target(&cmd_no_heredoc, write_allow_paths, project_root) {
+    if let Some(target) = segments.iter().find_map(|(segment, here)| {
+        disallowed_tee_target(segment, write_allow_paths, project_root, here.as_deref())
+    }) {
         return Some(format!(
-            "ERROR: ctx_shell refuses `tee {target}` — the destination is inside the \
-             project, and ctx_shell is ONLY for reading command output. \
-             Piping makes no difference: the destination decides. \
-             Use the native Write tool to create/modify project files, or tee to a \
-             scratch path (/tmp, /var/tmp, $TMPDIR), which is allowed."
+            "ERROR: ctx_shell refuses `tee {target}`. Piping makes no difference: the \
+             destination decides. {WRITE_REASON} {CAPTURE_RULE} \
+             Write the file with ctx_patch or the native Write tool, or tee to a scratch \
+             path.{}",
+            relative_target_note(&target)
         ));
     }
 
-    if is_heredoc_file_write(command, write_allow_paths, project_root) {
-        return Some(
-            "ERROR: ctx_shell detected a heredoc writing to a file. \
-             Use the native Write tool to create/modify files. \
-             ctx_shell is ONLY for reading command output. \
+    if is_heredoc_file_write(command, &segments, write_allow_paths, project_root) {
+        return Some(format!(
+            "ERROR: ctx_shell detected a heredoc writing to a file. {WRITE_REASON} \
+             Create the file with ctx_patch (op=create) or the native Write tool. \
              Note: heredocs for input piping (e.g. psql <<EOF) are allowed."
-                .to_string(),
-        );
+        ));
     }
 
     // #1672: on the heredoc-stripped text, for the same reason as #931 and
@@ -88,19 +163,65 @@ pub(crate) fn validate_command_with_write_allow_paths(
     // commit message, a doc, a fixture — and refusing the call for it blocks
     // writing about the guard at all. This detector was simply never switched
     // over when the other two were.
-    if let Some(reason) = download_to_file_reason(&cmd_no_heredoc) {
+    //
+    // #2080: the refusal used to say "the capture rule applies to them as
+    // well" and that "a literal path" would do. Neither was true — `>` may
+    // write into the project and the configured roots, a download only into
+    // a scratch path — so a caller followed it to a project path and was
+    // refused again with the identical text. It now states the rule it applies.
+    //
+    // Owner decision 2026-10-15: a download may write wherever `>` output
+    // capture may. Scratch-only made agents fetch a model or an asset into
+    // /tmp and `mv` it, and they retried project paths in a loop before
+    // finding that route; the rule is a payload convention, not a boundary.
+    if let Some(reason) = disallowed_download(&cmd_no_heredoc, write_allow_paths, project_root, cwd)
+    {
         return Some(format!(
-            "ERROR: ctx_shell detected a file download/write ({reason}). \
-             ctx_shell is ONLY for reading command output — redirect-free flags bypass \
-             this doctrine, so they are blocked too (GH #391). \
-             For text, fetch to stdout: curl <url> / wget -qO- <url>. \
-             For a binary (image, PDF, archive) neither stdout nor the editor's Write \
-             tool can carry the bytes — download to an absolute scratch path instead, \
-             e.g. curl -sL -o /tmp/shot.png <url>, which is permitted (GH #1661)."
+            "ERROR: ctx_shell refuses the download ({reason}) — the destination decides. \
+             A download (curl -o/-O, wget, dd of=) may write where output capture may: the \
+             session's project, a directory in `allow_paths` / `extra_roots`, a directory \
+             listed in `write_allow_paths` in config.toml, or a scratch path (/tmp, \
+             /var/tmp, $TMPDIR). The target must be one that can be placed: an absolute \
+             path, $TMPDIR/…, a variable this same command set to a literal path \
+             (D=/x; curl -o $D/f), or a relative name in the directory its command runs in \
+             (the call's `cwd`, moved by a plain `cd`). Any other variable cannot be \
+             resolved here and is refused. A binary (image, PDF, archive) downloads to such \
+             a path directly, e.g. curl -sL -o /tmp/shot.png <url>; for text, fetch to \
+             stdout: curl <url> / wget -qO- <url>."
         ));
     }
 
     None
+}
+
+/// How a relative target is placed — said when one is refused, because the
+/// answer is usually to say where it should go (#1850).
+fn relative_target_note(target: &str) -> &'static str {
+    let t = target
+        .trim_start_matches(['>', '&', '|'])
+        .trim_matches(['"', '\'']);
+    if t.starts_with('/') || std::path::Path::new(t).is_absolute() {
+        return "";
+    }
+    " A relative target is placed in the directory its own command runs in: the call's \
+     `cwd`, moved by a plain `cd <dir> &&` before it. Where that directory cannot be \
+     known — a `cd` through a variable, `pushd`, a subshell, a `cd` that may not have \
+     run — a relative target is refused; give an absolute path."
+}
+
+/// Each segment of the heredoc-stripped command with the directory it runs in,
+/// as a string for the path checks. An empty `cwd` is no `cwd`.
+fn segments_in_cwd(command: &str, cwd: Option<&str>) -> Vec<(String, Option<String>)> {
+    let base = cwd
+        .filter(|c| !c.trim().is_empty())
+        .map(std::path::Path::new);
+    crate::core::command_cwd::segments_with_cwd(command, base)
+        .into_iter()
+        .map(|s| {
+            let here = s.cwd.map(|p| p.to_string_lossy().into_owned());
+            (s.segment, here)
+        })
+        .collect()
 }
 
 /// Well-known Unix scratch prefixes that agents use on every platform.
@@ -138,7 +259,24 @@ fn is_scratch_path(path: &str) -> bool {
 
 /// (`curl -o`, `wget` default mode, `dd of=`) — the redirect-free equivalent of
 /// `> file`, reported as a `validate_command` bypass in GH #391.
+///
+/// Test convenience: no capture roots and no `cwd`, so only scratch passes.
+#[cfg(test)]
 fn download_to_file_reason(command: &str) -> Option<String> {
+    disallowed_download(command, &[], None, None)
+}
+
+/// The first download whose target may not be written, as the refusal's
+/// reason. A target passes where `>` output capture may write (scratch, the
+/// capture roots in `write_allow_paths`), judged where it lands: relative to
+/// the directory its own command runs in, through variables the command set
+/// to a literal. A variable that cannot be followed is refused.
+fn disallowed_download(
+    command: &str,
+    write_allow_paths: &[String],
+    project_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Option<String> {
     // #1661: the scratch carve-out is written in absolute paths, but agents
     // reach a scratch directory the way a person would — `cd <scratchpad> &&
     // curl -o shot.png …`. Judged as the bare string `shot.png`, a target that
@@ -146,10 +284,23 @@ fn download_to_file_reason(command: &str) -> Option<String> {
     // write and was blocked, leaving no in-tool way to fetch a binary at all.
     // Segments are paired with the directory they actually run in so a relative
     // target is judged where it lands.
-    for seg_cwd in crate::core::command_cwd::segments_with_cwd(command, None) {
+    //
+    // #1953: likewise a target spelled through a variable the same command set
+    // to a literal (`D=/tmp/x; curl -o $D/f`) is judged where it lands; any
+    // other variable stays unresolved and is refused as before.
+    let base = cwd
+        .filter(|c| !c.trim().is_empty())
+        .map(std::path::Path::new);
+    let segments = crate::core::command_cwd::segments_with_cwd(command, base);
+    let known_vars =
+        crate::core::command_vars::literal_assignments_before_each_segment(command, segments.len());
+    for (index, seg_cwd) in segments.into_iter().enumerate() {
         let seg = seg_cwd.segment;
         let here = seg_cwd.cwd;
+        let vars = &known_vars[index];
         let resolve = |path: &str| -> String {
+            let expanded = crate::core::command_vars::expand_leading_variable(path, vars);
+            let path = expanded.as_deref().unwrap_or(path);
             let p = std::path::Path::new(path);
             // `starts_with('/')`: shell text, so a Unix-absolute target is
             // absolute on Windows too, where `is_absolute` disagrees (#1467).
@@ -164,6 +315,21 @@ fn download_to_file_reason(command: &str) -> Option<String> {
                     .into_owned(),
                 None => path.to_string(),
             }
+        };
+        // Where `>` capture may write. A target still holding an expansion
+        // after `resolve` is refused wherever it sits — `$UNSET/f` under a
+        // project cwd would otherwise read as a project path — so the capture
+        // guard's `$…` escape hatch (#989) never reaches downloads.
+        let allowed = |path: &str| -> bool {
+            let target = resolve(path);
+            !target.contains(['$', '`'])
+                && (is_scratch_path(&target)
+                    || is_write_allowed_redirect_target(
+                        &target,
+                        write_allow_paths,
+                        project_root,
+                        None,
+                    ))
         };
         let tokens = crate::core::shell_allowlist::shell_tokenize(seg.trim());
         let Some(first) = tokens.first() else {
@@ -199,33 +365,27 @@ fn download_to_file_reason(command: &str) -> Option<String> {
                         None
                     };
                     if let Some(path) = target {
-                        if is_scratch_path(&resolve(path)) {
+                        if allowed(path) {
                             continue;
                         }
-                        return Some(format!("curl {tok}"));
+                        return Some(format!("curl {tok} {path}"));
                     }
                 }
             }
             "wget" => {
-                // wget writes a file BY DEFAULT; only stdout/no-download modes pass.
-                let to_stdout = tokens[1..].iter().enumerate().any(|(i, tok)| {
-                    tok == "--output-document=-"
-                        || tok == "-O-"
-                        || (tok.starts_with('-') && !tok.starts_with("--") && tok.ends_with("O-"))
-                        || ((tok == "-O" || tok == "--output-document")
-                            && tokens.get(i + 2).map(std::string::String::as_str) == Some("-"))
-                        || tok == "--spider"
-                });
-                if !to_stdout {
-                    return Some(
-                        "wget downloads to a file by default; use wget -qO- <url> for stdout"
-                            .to_string(),
-                    );
+                if let Some(target) = wget_targets(&tokens[1..])
+                    .into_iter()
+                    .find(|target| !allowed(target))
+                {
+                    return Some(format!("wget writes {target}"));
                 }
             }
             "dd" => {
                 for tok in &tokens[1..] {
-                    if tok.starts_with("of=") && !tok.starts_with("of=/dev/null") {
+                    if let Some(target) = tok.strip_prefix("of=")
+                        && target != "/dev/null"
+                        && !allowed(target)
+                    {
                         return Some(format!("dd {tok}"));
                     }
                 }
@@ -236,10 +396,75 @@ fn download_to_file_reason(command: &str) -> Option<String> {
     None
 }
 
+/// Every file a wget call writes: the document (`-O`/`--output-document`,
+/// else the URL's name in `-P`/`--directory-prefix` or the current directory)
+/// and a log (`-o`/`-a`). `-O -` and `--spider` write no document.
+fn wget_targets(args: &[String]) -> Vec<String> {
+    let mut document: Option<String> = None;
+    let mut prefix: Option<String> = None;
+    let mut logs = Vec::new();
+    let mut spider = false;
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        let next = || args.get(i + 1).cloned();
+        let mut takes_next = false;
+        if tok == "--spider" {
+            spider = true;
+        } else if let Some((flag, value)) = tok.split_once('=').filter(|_| tok.starts_with("--")) {
+            match flag {
+                "--output-document" => document = Some(value.to_string()),
+                "--directory-prefix" => prefix = Some(value.to_string()),
+                "--output-file" | "--append-output" => logs.push(value.to_string()),
+                _ => {}
+            }
+        } else if matches!(
+            tok,
+            "--output-document" | "--directory-prefix" | "--output-file" | "--append-output"
+        ) {
+            takes_next = true;
+            let value = next();
+            match tok {
+                "--output-document" => document = value,
+                "--directory-prefix" => prefix = value,
+                _ => logs.extend(value),
+            }
+        } else if let Some(cluster) = tok.strip_prefix('-').filter(|c| !c.starts_with('-')) {
+            // A short-option cluster: the first value-taking letter takes the
+            // rest of the token, or the next token when nothing follows it.
+            if let Some(pos) = cluster.find(['O', 'P', 'o', 'a']) {
+                let rest = &cluster[pos + 1..];
+                let value = if rest.is_empty() {
+                    takes_next = true;
+                    next()
+                } else {
+                    Some(rest.to_string())
+                };
+                match &cluster[pos..=pos] {
+                    "O" => document = value,
+                    "P" => prefix = value,
+                    _ => logs.extend(value),
+                }
+            }
+        }
+        i += if takes_next { 2 } else { 1 };
+    }
+    let mut targets = logs;
+    match document.as_deref() {
+        Some("-") => {}
+        Some(file) => targets.push(file.to_string()),
+        None if !spider => targets.push(prefix.unwrap_or_else(|| ".".to_string())),
+        None => {}
+    }
+    targets
+}
+
 /// Returns true only for heredocs that redirect to files (the dangerous pattern).
 /// Legitimate heredoc uses (input piping, inline scripts) are allowed through.
+/// `segments` is the heredoc-stripped command with each segment's directory.
 fn is_heredoc_file_write(
     command: &str,
+    segments: &[(String, Option<String>)],
     write_allow_paths: &[String],
     project_root: Option<&str>,
 ) -> bool {
@@ -253,10 +478,12 @@ fn is_heredoc_file_write(
     if !has_known_heredoc {
         return false;
     }
-    // #931: strip heredoc bodies so `>` / `>>` inside the body are not
-    // mistaken for file-write redirects.
-    let stripped = crate::core::shell_allowlist::strip_all_heredoc_bodies(command);
-    disallowed_write_redirect_target(&stripped, write_allow_paths, project_root).is_some()
+    // #931: the segments come from the heredoc-stripped text, so `>` / `>>`
+    // inside the body are not mistaken for file-write redirects.
+    segments.iter().any(|(segment, here)| {
+        disallowed_write_redirect_target(segment, write_allow_paths, project_root, here.as_deref())
+            .is_some()
+    })
 }
 
 /// Detects shell redirect operators (`>` or `>>`) that write to files.
@@ -270,13 +497,16 @@ fn is_heredoc_file_write(
 /// not file authoring.
 pub fn is_temp_redirect_target(target: &str) -> bool {
     let write_allow_paths = crate::core::config::default_shell_write_allow_paths();
-    is_write_allowed_redirect_target(target, &write_allow_paths, None)
+    // No cwd here: this public helper judges a target in isolation, so a
+    // relative one stays unplaceable and therefore not allowed (#1811).
+    is_write_allowed_redirect_target(target, &write_allow_paths, None, None)
 }
 
 fn is_write_allowed_redirect_target(
     target: &str,
     write_allow_paths: &[String],
     project_root: Option<&str>,
+    cwd: Option<&str>,
 ) -> bool {
     // `>|` is the noclobber-override form of `>`; the `|` is not part of the path.
     let t = target.trim_start_matches(['>', '&', '|']);
@@ -296,10 +526,29 @@ fn is_write_allowed_redirect_target(
         return true;
     }
 
+    // #1811: a relative target is a destination like any other — it just needs
+    // placing first. The guard used to refuse every relative target outright,
+    // so `cwd=<scratch> … > probe.txt` was blocked while the identical
+    // `> <scratch>/probe.txt` was allowed, and the refusal said "the
+    // destination decides" about a destination it had not resolved.
+    //
+    // Resolving narrows as often as it widens: a relative target under a
+    // project cwd now resolves *into* the project and is refused on the same
+    // rule as an absolute one, instead of by accident of its spelling.
+    //
+    // `cwd` is the directory the target's own command runs in — the call's
+    // `cwd` moved by any `cd` before it (#1850, `command_cwd`), or `None` when
+    // that cannot be known, which refuses a relative target below.
     let path = std::path::Path::new(t);
-    if !path.is_absolute() {
+    let resolved_input;
+    let path = if path.is_absolute() {
+        path
+    } else if let Some(base) = cwd.filter(|c| !c.trim().is_empty()) {
+        resolved_input = std::path::Path::new(base).join(path);
+        resolved_input.as_path()
+    } else {
         return false;
-    }
+    };
     let resolved = resolve_path_for_comparison(path);
     if project_root.is_some_and(|root| {
         resolved.starts_with(resolve_path_for_comparison(std::path::Path::new(root)))
@@ -381,10 +630,11 @@ fn disallowed_tee_target(
     command: &str,
     write_allow_paths: &[String],
     project_root: Option<&str>,
+    cwd: Option<&str>,
 ) -> Option<String> {
     tee_targets(command).into_iter().find(|target| {
         !target.is_empty()
-            && !is_write_allowed_redirect_target(target, write_allow_paths, project_root)
+            && !is_write_allowed_redirect_target(target, write_allow_paths, project_root, cwd)
     })
 }
 
@@ -400,7 +650,10 @@ fn has_file_write_redirect(
     write_allow_paths: &[String],
     project_root: Option<&str>,
 ) -> bool {
-    disallowed_write_redirect_target(command, write_allow_paths, project_root).is_some()
+    // No cwd: these assertions pin the target-spelling rules, where a relative
+    // target is unplaceable and therefore refused (#1811). The cwd-resolution
+    // behaviour has its own tests that call the public entry point.
+    disallowed_write_redirect_target(command, write_allow_paths, project_root, None).is_some()
 }
 
 /// The first redirect target that is **not** write-allowed, or `None` when the
@@ -415,6 +668,7 @@ fn disallowed_write_redirect_target(
     command: &str,
     write_allow_paths: &[String],
     project_root: Option<&str>,
+    cwd: Option<&str>,
 ) -> Option<String> {
     let bytes = command.as_bytes();
     let len = bytes.len();
@@ -491,7 +745,7 @@ fn disallowed_write_redirect_target(
             }
             // #848: allow redirects to temp directories — agents capture
             // build output for grepping, not writing persistent files.
-            if is_write_allowed_redirect_target(&target, write_allow_paths, project_root) {
+            if is_write_allowed_redirect_target(&target, write_allow_paths, project_root, cwd) {
                 i += 1;
                 continue;
             }
@@ -577,7 +831,7 @@ mod kernel_tests {
     #[test]
     fn handle_with_context_does_not_panic_on_short_output() {
         let result = handle_with_context("ls", "file.txt", 0, CrpMode::Tdd, Some("/tmp"));
-        assert!(!result.is_empty());
+        assert!(!result.is_empty(), "`result` is empty");
     }
 }
 

@@ -20,16 +20,6 @@ pub(super) struct CepComputedStats {
     pub(super) cache_hits: u64,
     pub(super) total_reads: u64,
     pub(super) tool_call_count: u64,
-    pub(super) adoption: AdoptionMetrics,
-}
-
-/// Measures lean-ctx adoption: what fraction of tool calls went through MCP
-/// rather than falling through to native/shell passthrough.
-#[derive(Default, Clone)]
-pub(super) struct AdoptionMetrics {
-    pub(super) ctx_tool_calls: u64,
-    pub(super) native_passthrough: u64,
-    pub(super) adoption_pct: u32,
 }
 
 pub use crate::core::protocol::CrpMode;
@@ -37,17 +27,14 @@ pub use crate::core::protocol::CrpMode;
 // Re-exported here for backward compatibility.
 
 impl CrpMode {
-    /// Effective CRP mode: explicit env var wins; otherwise derived from CompressionLevel.
+    /// Effective CRP mode for the active profile — see [`CrpMode::resolve`].
     pub fn effective() -> Self {
-        if let Ok(v) = std::env::var("LEAN_CTX_CRP_MODE")
-            && !v.trim().is_empty()
-        {
-            return Self::parse(&v).unwrap_or(Self::Off);
-        }
-        let config = crate::core::config::Config::load();
-        let level = crate::core::config::CompressionLevel::effective(&config);
-        let (_, _, crp_str, _) = level.to_components();
-        Self::parse(crp_str).unwrap_or(Self::Off)
+        Self::resolve(
+            crate::core::profiles::active_profile()
+                .compression
+                .crp_mode
+                .as_deref(),
+        )
     }
 
     /// Returns true if the mode is TDD (maximum compression).
@@ -103,21 +90,32 @@ pub struct LeanCtxServer {
     pub session: Arc<RwLock<SessionState>>,
     pub tool_calls: Arc<RwLock<Vec<ToolCallRecord>>>,
     pub call_count: Arc<AtomicUsize>,
+    /// Every tool call, counted unconditionally at the top of
+    /// `call_tool_guarded`.
+    ///
+    /// `call_count` only advances inside `record_checkpoint`, which returns
+    /// early whenever checkpointing is skipped — and `minimal_overhead`
+    /// (default `true`) skips it for every tool. Anything scheduled off
+    /// `call_count` therefore never runs in a default install. The daily
+    /// telemetry flush was scheduled that way and consequently never sent.
+    pub background_tick: Arc<AtomicUsize>,
     pub pro_trigger_check_count: Arc<AtomicUsize>,
     pub cache_ttl_secs: u64,
     pub last_call: Arc<RwLock<Instant>>,
     pub agent_id: Arc<RwLock<Option<String>>>,
     pub task_envelope: Arc<RwLock<Option<lean_ctx_protocol::TaskEnvelopeV1>>>,
+    /// Installed by the trusted host before serving; never sourced from tool arguments.
+    pub(crate) native_receipt_authority:
+        Option<Arc<crate::core::execution_ledger::host::HostReceiptAuthority>>,
     pub(crate) presence_agent_id: Arc<RwLock<Option<String>>>,
+    /// Single-flight for the fail-closed presence retry: concurrent first
+    /// calls register once instead of racing N writers on the registry lock.
+    pub(crate) presence_init: Arc<tokio::sync::Mutex<()>>,
     /// The role this session resolved at `initialize` (#1766). The fail-closed
     /// presence retry re-registers with it instead of the construction-time
-    /// `context-engine` placeholder, which silently moved a `reviewer` (or a
-    /// `coder`) out of worker-capacity accounting.
+    /// `context-engine` placeholder, which silently turned a `reviewer` (or a
+    /// `coder`) into a context engine.
     pub(crate) presence_role: Arc<RwLock<Option<String>>>,
-    /// True while the session is admitted read-only because the machine-wide
-    /// mutating cap was full when it registered (#1765). Read-only tools run;
-    /// the first mutating call retries the real role.
-    pub(crate) presence_read_only: Arc<std::sync::atomic::AtomicBool>,
     pub client_name: Arc<RwLock<String>>,
     pub autonomy: Arc<crate::core::autonomy::AutonomyState>,
     pub loop_detector: Arc<RwLock<crate::core::loop_detection::LoopDetector>>,

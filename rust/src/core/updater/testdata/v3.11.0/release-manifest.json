@@ -1,0 +1,158 @@
+{
+  "artifacts": {
+    "LICENSE.md": {
+      "kind": "supplemental",
+      "sha256": "e4f77f5ec9d509f0014ddefe2b81afac9a7d095cdff283348c680fb207d95746",
+      "size": 2133,
+      "source_path": "LICENSE.md"
+    },
+    "LICENSES-Apache-2.0.txt": {
+      "kind": "supplemental",
+      "sha256": "16cbd2ce016ef3b37cb2dc50db37cba7c46a186b51a3f1ff3460fd2fad05f8f9",
+      "size": 10763,
+      "source_path": "LICENSES/Apache-2.0.txt"
+    },
+    "SBOM.cdx.json": {
+      "kind": "supplemental",
+      "sha256": "0340707e27976af0cb67d49928f13129e4b21dcbea6ebdb11c23f795d90cb1df",
+      "size": 660373,
+      "source_path": "SBOM.cdx.json"
+    },
+    "THIRD_PARTY_NOTICES": {
+      "kind": "supplemental",
+      "sha256": "f8bbaf6b694b2ff30ef57f73634005a3cabb4a95c4d0df6c2765b4dcffda0454",
+      "size": 331166,
+      "source_path": "THIRD_PARTY_NOTICES"
+    },
+    "lean-ctx-3.11.0-source.tar.gz": {
+      "kind": "source",
+      "sha256": "0f07b81bf3111fcc75e37eecfa9bcb8ef1edae6c664016280645ce08f14546f5",
+      "size": 20030442
+    },
+    "lean-ctx-aarch64-apple-darwin.tar.gz": {
+      "kind": "binary",
+      "payload_sha256": "d98f177a90a174021c60164ef8a72c5223d9898b8a70bc1024c7d5ed380e9992",
+      "sha256": "7f062bd66efb33d0220fca0ee68b5f6561fc1b763d133df44ea0e11daa824c77",
+      "size": 26615205
+    },
+    "lean-ctx-aarch64-unknown-linux-gnu.tar.gz": {
+      "kind": "binary",
+      "payload_sha256": "4033c8c5e53a90c7a192c3de7a95e7e108040921b6f00c7d482a9b9a69b410e4",
+      "sha256": "50f8853646820f90a908f5530fa4566aca6c49b4e4e33aae384be282a402d7d1",
+      "size": 27833142
+    },
+    "lean-ctx-aarch64-unknown-linux-musl.tar.gz": {
+      "kind": "binary",
+      "payload_sha256": "28c5eb49e8c0bae62a3a53eeaaf62dc8bc2b75e114f82d636acf7e9fa700682a",
+      "sha256": "5fa0af3438c40d3017bcf4207f4dd42a0e3d596d183fe39783fb11f852974328",
+      "size": 27404968
+    },
+    "lean-ctx-x86_64-apple-darwin.tar.gz": {
+      "kind": "binary",
+      "payload_sha256": "2153f9970a62c11e4ea8db9b4c00945dab0c5292d342f8ed54fde7e6d1ab9196",
+      "sha256": "a84e724822c4c925d424744eaf9df17c55886ececf5482bdced0799dedcd1054",
+      "size": 27616826
+    },
+    "lean-ctx-x86_64-pc-windows-gnu.zip": {
+      "kind": "binary",
+      "payload_sha256": "4ecef5d99d186817e28baf95ceb33e92d78b8753825bd48e8485c12fbf5299cf",
+      "sha256": "06ed04b2de1db3ecc0695468354ddb14328271e528b49b98a3d2243a6254004a",
+      "size": 27731741
+    },
+    "lean-ctx-x86_64-pc-windows-msvc-cuda.zip": {
+      "kind": "binary",
+      "payload_sha256": "5b68c08dfa2ef70276448f7c64d83d09b55e03c1c7579bbf865529a41d3319b2",
+      "sha256": "6c2a9a4d427e81bccfc328aeacbcbac7fd911ba4dd9ca1da7cee55b2e840c799",
+      "size": 29948094
+    },
+    "lean-ctx-x86_64-pc-windows-msvc.zip": {
+      "kind": "binary",
+      "payload_sha256": "049adb73fb5a33c5b74aab1435e8eca8d77e84e0600d31b752deceb86ae91598",
+      "sha256": "883a8ae902bf7bbc0887a6bfd74ff11ea41ef03cf67236a4f17a9a28d2f95d5b",
+      "size": 29941565
+    },
+    "lean-ctx-x86_64-unknown-linux-gnu-cuda.tar.gz": {
+      "kind": "binary",
+      "payload_sha256": "5157c73a30cd0650abc8ac952ed5dcd6f02518b96df0c9c47393553aecc07214",
+      "sha256": "e6410419c584a8f84f0c294358f5496f4ba766f8756fb90550c338c39155dde3",
+      "size": 28880916
+    },
+    "lean-ctx-x86_64-unknown-linux-gnu.tar.gz": {
+      "kind": "binary",
+      "payload_sha256": "1cb085b4e5bbaf19317c2f97084b95fd96061e605ab5498e998bcb14b786f1f7",
+      "sha256": "32004ef3e8bea38e8f9b6effcb34ace3243c35a520d39cfc7ebbfce322790c0d",
+      "size": 28875747
+    },
+    "lean-ctx-x86_64-unknown-linux-musl.tar.gz": {
+      "kind": "binary",
+      "payload_sha256": "aaa37c14b2d1cce4f8dcb00da56f479f8286851563443cb6cb56ed9c2e557bd7",
+      "sha256": "fe532fef2564709a711b6eafc9404ba84f7d313ff02b32750c79006cfbc9f556",
+      "size": 28851582
+    },
+    "thinkery_leanctx_engine-3.11.0-py3-none-macosx_11_0_arm64.whl": {
+      "kind": "binary",
+      "payload_sha256": "d98f177a90a174021c60164ef8a72c5223d9898b8a70bc1024c7d5ed380e9992",
+      "sha256": "76da308827679a3512f857d5d59f4709afb4891de3f07d2cf187b3cc221809f0",
+      "size": 26497841
+    },
+    "thinkery_leanctx_engine-3.11.0-py3-none-macosx_11_0_x86_64.whl": {
+      "kind": "binary",
+      "payload_sha256": "2153f9970a62c11e4ea8db9b4c00945dab0c5292d342f8ed54fde7e6d1ab9196",
+      "sha256": "c1adba2199ff19414679980eb306ed6e07c5d6397fd23ae10607edec81b6130d",
+      "size": 27453722
+    },
+    "thinkery_leanctx_engine-3.11.0-py3-none-manylinux_2_35_aarch64.whl": {
+      "kind": "binary",
+      "payload_sha256": "4033c8c5e53a90c7a192c3de7a95e7e108040921b6f00c7d482a9b9a69b410e4",
+      "sha256": "58c43f870e64327bab2645f8f02b2026947136792bc9e6021fa0601ebeaa3b34",
+      "size": 27678296
+    },
+    "thinkery_leanctx_engine-3.11.0-py3-none-manylinux_2_35_x86_64.whl": {
+      "kind": "binary",
+      "payload_sha256": "1cb085b4e5bbaf19317c2f97084b95fd96061e605ab5498e998bcb14b786f1f7",
+      "sha256": "277688a3f27079ee19021b96bde52d6cc1f49ca30b4baf7152d9fa6222dd5a21",
+      "size": 28641239
+    },
+    "thinkery_leanctx_engine-3.11.0-py3-none-musllinux_1_2_aarch64.whl": {
+      "kind": "binary",
+      "payload_sha256": "28c5eb49e8c0bae62a3a53eeaaf62dc8bc2b75e114f82d636acf7e9fa700682a",
+      "sha256": "09b8cab0b6f9ea3c228682d85321199b0b6adae1d17a90ef0f25ade86f778f19",
+      "size": 27239122
+    },
+    "thinkery_leanctx_engine-3.11.0-py3-none-musllinux_1_2_x86_64.whl": {
+      "kind": "binary",
+      "payload_sha256": "aaa37c14b2d1cce4f8dcb00da56f479f8286851563443cb6cb56ed9c2e557bd7",
+      "sha256": "7773f74ad337692ade858804ac7780ead9c445d757ea9353d982f981fce0ab16",
+      "size": 28621133
+    },
+    "thinkery_leanctx_engine-3.11.0-py3-none-win_amd64.whl": {
+      "kind": "binary",
+      "payload_sha256": "049adb73fb5a33c5b74aab1435e8eca8d77e84e0600d31b752deceb86ae91598",
+      "sha256": "c4633c8475dce662f5a78293d440d0a066eb43c2afe70a798cae947a3b58670a",
+      "size": 28768823
+    },
+    "thinkery_leanctx_engine_cuda-3.11.0-py3-none-manylinux_2_35_x86_64.whl": {
+      "kind": "binary",
+      "payload_sha256": "5157c73a30cd0650abc8ac952ed5dcd6f02518b96df0c9c47393553aecc07214",
+      "sha256": "ce7b9779ac3eb97eaedf3d2f123bd9c19da79ef0c5aacd66e13e9bd4da8fee32",
+      "size": 28650024
+    },
+    "thinkery_leanctx_engine_cuda-3.11.0-py3-none-win_amd64.whl": {
+      "kind": "binary",
+      "payload_sha256": "5b68c08dfa2ef70276448f7c64d83d09b55e03c1c7579bbf865529a41d3319b2",
+      "sha256": "fed5d185a712881bce69f3261363f7ffd237b3a684fc0ffd4c29968f08c995f9",
+      "size": 28780133
+    },
+    "thinkery_leanctx_engine_windows_gnu-3.11.0-py3-none-win_amd64.whl": {
+      "kind": "binary",
+      "payload_sha256": "4ecef5d99d186817e28baf95ceb33e92d78b8753825bd48e8485c12fbf5299cf",
+      "sha256": "609e859a7c31b90a82a4665e9408ec20ed619ef469a1a1eb54c8eb87d4c082e4",
+      "size": 26814711
+    }
+  },
+  "checksums_sha256": "1d7961945b69242f7095a960009b004d59f23da14e950a83af351ded05a44ac6",
+  "commit": "32d72de1f503646deefdb009227333c8c97bba5d",
+  "sbom_sha256": "0340707e27976af0cb67d49928f13129e4b21dcbea6ebdb11c23f795d90cb1df",
+  "schema_version": "leanctx.release-manifest/v1",
+  "tag": "v3.11.0"
+}

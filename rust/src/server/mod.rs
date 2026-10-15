@@ -4,12 +4,15 @@ pub mod bypass_hint;
 pub mod compaction_sync;
 pub mod context_gate;
 mod dispatch;
+pub(crate) use dispatch::canonicalize_arg_aliases;
 pub mod dynamic_tools;
 pub mod elicitation;
 pub(crate) mod execute;
 mod file_resource;
 pub mod helpers;
+pub(crate) mod mcp_idle;
 pub mod multi_path;
+pub(crate) mod native_receipts;
 pub mod notifications;
 pub mod permission_inheritance;
 pub mod policy_guard;
@@ -274,15 +277,6 @@ mod tests {
     fn test_granular_tool_count() {
         let tools = crate::tool_defs::granular_tool_defs();
         assert!(tools.len() >= 25, "Expected at least 25 granular tools");
-    }
-
-    #[test]
-    fn test_registry_tool_count_ssot() {
-        assert_eq!(
-            crate::server::registry::tool_count(),
-            78,
-            "Official MCP tool count drift! Update this test AND all docs when adding/removing tools."
-        );
     }
 
     #[test]

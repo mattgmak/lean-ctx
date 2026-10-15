@@ -1,8 +1,8 @@
 <!-- lean-ctx-owned: PROJECT-LEAN-CTX.md v1 -->
 <!-- lean-ctx-rules -->
-<!-- version: 9 -->
+<!-- version: 11 -->
 
-CRITICAL: ALWAYS use lean-ctx ctx_* tools instead of native equivalents. This is NOT optional.
+CRITICAL: ALWAYS use lean-ctx ctx_* tools as mapped below.
 
 ACTUALLY EMIT the ctx_* tool call (ctx_compose first) — describing a tool is not calling it.
 
@@ -13,7 +13,7 @@ MANDATORY MAPPING:
 • Glob/find -> ctx_glob(pattern)
 • ls/find -> ctx_tree(path, depth)
 
-NEVER use native Read/Grep/Shell/Glob when a ctx_* equivalent exists. SELF-CORRECT: the moment you reach for one, stop and call the ctx_* tool instead.
+NEVER use built-in Read/Grep/Shell/Glob for these jobs. SELF-CORRECT: the moment you reach for one, stop and call the ctx_* tool instead. Other MCP servers keep their own jobs.
 
 Tool selection by intent:
 • Orient / understand code (call FIRST) -> ctx_compose
@@ -47,7 +47,7 @@ Long shell jobs: ctx_shell(run_in_background=true), then poll job_id. ctx_sessio
 
 RECOVER: compressed output is reversible — never re-read line-by-line. Need full/exact? Read the shown file path with any tool (no MCP), or ctx_read(mode=full|raw=true); [Archived]/tee/firewall → ctx_expand(id=...).
 
-ROOTS: ctx_* refuses paths outside project root + allow_paths. Use native Read for out-of-root; `lean-ctx doctor` shows effective roots.
+ROOTS: ctx_* read ~ projects, write the active one; ~/.ssh etc. closed. Use native Read for out-of-root; `lean-ctx doctor` shows effective roots.
 
 CEP v1: 1.ACT FIRST 2.DELTA ONLY (Fn refs) 3.STRUCTURED (+/-/~) 4.ONE LINE PER ACTION 5.QUALITY ANCHOR
 

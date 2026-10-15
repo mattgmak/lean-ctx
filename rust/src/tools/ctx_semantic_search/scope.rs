@@ -24,11 +24,48 @@ pub(crate) fn resolve_search_root(path: &str) -> Result<(PathBuf, Option<String>
     } else {
         raw
     };
-    let root = PathBuf::from(crate::core::protocol::detect_project_root_or_cwd(
-        &raw_dir.to_string_lossy(),
-    ));
+    if let Some(authority) = crate::core::policy::runtime::REQUEST_PROJECT
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+    {
+        let root = authority
+            .canonicalize()
+            .map_err(|_| "source authority unavailable")?;
+        let requested = raw_dir
+            .canonicalize()
+            .map_err(|_| "source path unavailable")?;
+        if !requested.starts_with(&root) {
+            return Err("source path is outside the request authority".into());
+        }
+        let subdir = search_subdir_filter(&root, &requested);
+        return Ok((root, subdir));
+    }
+    // A local default only claims paths inside it; request authority above
+    // remains binding even when the caller supplies another project (#1875).
+    let raw_str = raw_dir.to_string_lossy();
+    let root = match pinned_project_root() {
+        Some(pinned) if !path_is_within(raw_dir, Path::new(&pinned)) => {
+            crate::core::protocol::detect_project_root(&raw_str).unwrap_or_else(|| raw_str.into())
+        }
+        _ => crate::core::protocol::detect_project_root_or_cwd(&raw_str),
+    };
+    let root = PathBuf::from(root);
     let subdir = search_subdir_filter(&root, raw_dir);
     Ok((root, subdir))
+}
+
+fn pinned_project_root() -> Option<String> {
+    std::env::var("LEAN_CTX_PROJECT_ROOT")
+        .ok()
+        .or_else(|| crate::core::config::Config::load().project_root)
+        .filter(|r| !r.trim().is_empty())
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let path = crate::core::pathutil::safe_canonicalize_or_self(path);
+    let root = crate::core::pathutil::safe_canonicalize_or_self(root);
+    path.starts_with(root)
 }
 
 /// Project-relative prefix (forward slashes, no leading/trailing slash) for
@@ -77,6 +114,12 @@ impl SearchFilter {
     pub(crate) fn with_subdir(mut self, subdir: Option<String>) -> Self {
         self.subdir = subdir.filter(|s| !s.is_empty());
         self
+    }
+
+    /// The project-relative subdirectory the search is scoped to, if any —
+    /// where a scoped corpus walk can start.
+    pub(crate) fn subdir(&self) -> Option<&str> {
+        self.subdir.as_deref()
     }
 
     pub(crate) fn is_active(&self) -> bool {

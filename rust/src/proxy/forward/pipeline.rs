@@ -13,12 +13,12 @@ use crate::{
     },
     proxy::{
         adaptive_policy::select_policy,
-        dedup::ContentAddressedDedup,
+        dedup::dedup_tool_outputs,
         determinism_guard,
-        effort_routing::score_complexity,
+        effort_routing::score_session_complexity,
         live_zone::{compress_live_only, detect_live_zone},
         pre_optimize::classify_task,
-        prose_compress::compress_prose,
+        prose_compress::{CompressionStrategy, ProseCompressor},
     },
 };
 
@@ -41,10 +41,21 @@ pub struct PipelineReport {
 }
 
 impl PipelineReport {
-    pub(crate) fn apply_effort_budget(&self, request: &mut Value) {
-        if let Some(complexity) = self.effort_complexity {
-            crate::proxy::effort_routing::apply_effort_budget(request, complexity);
-        }
+    /// Applies the scored effort budget; returns whether the request changed.
+    pub(crate) fn apply_effort_budget(&self, request: &mut Value) -> bool {
+        self.effort_complexity.is_some_and(|complexity| {
+            crate::proxy::effort_routing::inject_effort_budget(request, complexity).1
+        })
+    }
+
+    /// Tokens the in-request tool-output dedup stage saved (0 when reverted).
+    pub(crate) fn dedup_tokens_saved(&self) -> usize {
+        self.stages_run
+            .iter()
+            .find(|stage| stage.name == "dedup")
+            .map_or(0, |stage| {
+                usize::try_from(stage.tokens_saved).unwrap_or(usize::MAX)
+            })
     }
 
     pub(crate) fn apply_response_headers(&self, headers: &mut axum::http::HeaderMap) {
@@ -111,22 +122,6 @@ impl CompressionPipeline {
         let mut live_messages = messages.split_off(live_zone.boundary_turn);
         stages_run.push(stage_report("live_zone", true, 0, started));
 
-        let dedup_started = Instant::now();
-        let dedup_saved = if config.enable_dedup {
-            let before = messages_tokens(&live_messages);
-            let mut dedup = ContentAddressedDedup::new();
-            let _ = dedup.dedup_messages(&mut live_messages);
-            before.saturating_sub(messages_tokens(&live_messages))
-        } else {
-            0
-        };
-        stages_run.push(stage_report(
-            "dedup",
-            config.enable_dedup,
-            dedup_saved,
-            dedup_started,
-        ));
-
         let task_class = task_class(&live_messages);
         let policy_started = Instant::now();
         let policy = select_policy(task_class);
@@ -162,12 +157,30 @@ impl CompressionPipeline {
             tool_started,
         ));
 
+        // Dedup runs after every stage that rewrites tool output: its references
+        // and line deltas describe the earlier result exactly as it is sent, so
+        // nothing may change that result afterwards (#1980).
+        let dedup_started = Instant::now();
+        let dedup_saved = if config.enable_dedup {
+            let before = messages_tokens(&live_messages);
+            let _ = dedup_tool_outputs(&mut live_messages);
+            before.saturating_sub(messages_tokens(&live_messages))
+        } else {
+            0
+        };
+        stages_run.push(stage_report(
+            "dedup",
+            config.enable_dedup,
+            dedup_saved,
+            dedup_started,
+        ));
+
         let effort_started = Instant::now();
-        let effort_complexity = config.enable_effort.then(|| {
-            let mut all_messages = messages.clone();
-            all_messages.extend(live_messages.clone());
-            score_complexity(&all_messages)
-        });
+        // #1912: scored from the untouched opening turn so the injected budget
+        // (a cache-keyed top-level field) stays fixed for the whole session.
+        let effort_complexity = config
+            .enable_effort
+            .then(|| score_session_complexity(&original_messages));
         stages_run.push(stage_report(
             "effort",
             config.enable_effort,
@@ -195,9 +208,21 @@ impl CompressionPipeline {
             determinism_started,
         ));
 
+        // #1789: a stage that emptied a turn must revert, however good its
+        // savings look. Checked alongside the determinism proof because neither
+        // that proof nor the savings floor below can observe this failure mode.
+        let content_destroyed = destroys_content(&original_messages, messages);
+        if content_destroyed {
+            tracing::warn!(
+                "lean-ctx pipeline: compression emptied a message that had content; \
+                 reverting compression stages"
+            );
+        }
+
         let mut total_tokens_after = messages_tokens(messages);
         let mut total_savings_pct = savings_pct(total_tokens_before, total_tokens_after);
         let should_revert = determinism_unstable
+            || content_destroyed
             || (total_tokens_before > 0 && total_savings_pct < config.min_savings_pct);
         if should_revert {
             *messages = original_messages;
@@ -303,11 +328,57 @@ fn compress_live_prose(
     }
 }
 
+/// Compress one conversation turn.
+///
+/// #1789: this deliberately pins the strategy to [`CompressionStrategy::Light`]
+/// instead of letting `ProseCompressor::new` infer `Aggressive` from the
+/// presence of a task hint. `Aggressive` *drops* whole sections that carry no
+/// task/technical keyword — sound for a document, where the surviving sections
+/// still carry the content, but a chat turn is a single paragraph, so dropping
+/// its only section deletes the message. `Light` keeps every section and still
+/// applies the lossless pattern pass, which is the only squeeze a conversation
+/// turn may safely receive. Tool output keeps its section-dropping compressor
+/// in the `tool_results` stage, where whole-message deletion is impossible.
 fn compress_text(text: &mut String, task_class: &str) {
-    let result = compress_prose(text, Some(task_class));
-    if result.compressed_tokens < result.original_tokens && result.compressed.len() < text.len() {
+    let result = ProseCompressor::new(Some(task_class))
+        .with_strategy(CompressionStrategy::Light)
+        .compress(text);
+    if result.compressed_tokens < result.original_tokens
+        && result.compressed.len() < text.len()
+        && !result.compressed.trim().is_empty()
+    {
         *text = result.compressed;
     }
+}
+
+/// All text a message carries, across both wire shapes: a plain string
+/// (`content: "…"`, OpenAI) and a block array (`content: [{type:"text",…}]`,
+/// Anthropic).
+fn message_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// True when compression emptied a message that arrived with text (#1789).
+///
+/// This is a *content* invariant, deliberately separate from the determinism
+/// guard's *cache-prefix* invariant: emptying every live turn leaves the frozen
+/// prefix byte-identical, so the determinism proof stays stable while the
+/// request loses everything the model was supposed to read. Savings-based
+/// reverting cannot catch it either — deleting all content scores as a perfect
+/// ~100% saving and sails past `min_savings_pct`.
+fn destroys_content(before: &[Value], after: &[Value]) -> bool {
+    before.len() == after.len()
+        && before.iter().zip(after).any(|(before, after)| {
+            !message_text(before).trim().is_empty() && message_text(after).trim().is_empty()
+        })
 }
 
 fn insert_header(headers: &mut axum::http::HeaderMap, name: &str, value: &str) {
@@ -348,12 +419,14 @@ mod tests {
                 .iter()
                 .map(|stage| stage.name)
                 .collect::<Vec<_>>(),
+            // `dedup` must follow `tool_results` (#1980): a delta against a
+            // result that is compressed afterwards no longer reconstructs it.
             vec![
                 "live_zone",
-                "dedup",
                 "adaptive_policy",
                 "prose",
                 "tool_results",
+                "dedup",
                 "effort",
                 "determinism_guard",
             ]
@@ -445,8 +518,37 @@ mod tests {
 
         let report = CompressionPipeline::run(&mut messages, &PipelineConfig::default());
 
-        assert!(messages.is_empty());
+        assert!(messages.is_empty(), "{messages:?}");
         assert_eq!(report.total_tokens_before, 0);
         assert_eq!(report.total_tokens_after, 0);
+    }
+
+    /// #1789: the proxy emptied every non-system turn on provider routes.
+    ///
+    /// The prose stage runs `ProseCompressor` with a task hint, which selects
+    /// `CompressionStrategy::Aggressive`. That strategy drops any paragraph
+    /// without a hardcoded English technical keyword — and a chat turn *is* a
+    /// single paragraph, so dropping it deletes the whole message. The system
+    /// turn survived only because it sits in the frozen prefix.
+    #[test]
+    fn conversation_turns_never_lose_their_content() {
+        let mut messages = vec![
+            json!({"role": "system",    "content": "Tu es un assistant francais."}),
+            json!({"role": "user",      "content": "Bonjour, quelle est la capitale de la France ?"}),
+            json!({"role": "assistant", "content": "La capitale de la France est Paris."}),
+            json!({"role": "user",      "content": "Et combien d habitants environ ?"}),
+        ];
+
+        CompressionPipeline::run(&mut messages, &PipelineConfig::default());
+
+        for message in &messages {
+            let role = message["role"].as_str().unwrap_or_default();
+            let content = message["content"].as_str().unwrap_or_default();
+            assert!(
+                !content.trim().is_empty(),
+                "#1789: `{role}` turn was emptied by the compression pipeline; \
+                 upstream would receive a conversation the model cannot see"
+            );
+        }
     }
 }

@@ -1,10 +1,11 @@
 use crate::core::error::ShellError;
 
+use super::tokenizer::{Separator, segments_with_separators};
 use super::{
     ShellSecurity, allowlist_block_message, check_substitution_in_args, effective_allowlist,
-    expand_to_leaf_segments, extract_all_commands, extract_base_from_segment, shell_tokenize,
-    skip_env_assignments, split_on_operators, strip_all_heredoc_bodies, strip_comments,
-    strip_quoted_heredoc_bodies,
+    expand_to_leaf_segments, extract_all_commands, extract_base_from_segment,
+    extract_command_tokens_from_segment, shell_tokenize, skip_env_assignments, split_on_operators,
+    strip_all_heredoc_bodies, strip_comments, strip_quoted_heredoc_bodies,
 };
 
 /// Checks whether a command may run, honouring the active [`ShellSecurity`] mode
@@ -18,17 +19,42 @@ pub fn check_shell_allowlist(command: &str) -> Result<(), ShellError> {
     match ShellSecurity::resolve() {
         ShellSecurity::Off => Ok(()),
         ShellSecurity::Warn => {
+            // Advisory only, like the substitution finding (#1866): at `warn`
+            // it lands in the wrapped command's stderr, i.e. in the agent's
+            // tool result, and the command runs. The enforce text ("blocked,
+            // permanent, do not retry") would tell the agent the opposite (#1874).
             if let Err(msg) = enforce_shell_allowlist(command) {
-                tracing::warn!(
+                tracing::info!(
                     target: "shell_security",
-                    "warn-only: would block ({})",
-                    msg.lines().next().unwrap_or("blocked")
+                    "warn-only: shell_security=enforce would block this command; it ran ({})",
+                    warn_only_reason(msg.message())
                 );
             }
             Ok(())
         }
-        ShellSecurity::Enforce => enforce_shell_allowlist(command),
+        ShellSecurity::Enforce => enforce_shell_allowlist(command).inspect_err(|_| {
+            // Counts only inside an MCP tool call (see `security_events::note`).
+            crate::core::security_events::note(
+                crate::core::security_events::SecurityKind::ShellBlocked,
+                1,
+            );
+        }),
     }
+}
+
+/// The reason of an enforce-mode block message, without the wording that only
+/// holds when the command was actually stopped (#1874).
+#[must_use]
+pub fn warn_only_reason(msg: &str) -> &str {
+    let first = msg.lines().next().unwrap_or_default();
+    let reason = first
+        .strip_prefix("[BLOCKED — DO NOT RETRY] ")
+        .unwrap_or(first);
+    reason
+        .split(" This is a permanent restriction")
+        .next()
+        .unwrap_or(reason)
+        .trim_end()
 }
 
 /// True when `command` would pass the allowlist / dangerous-pattern checks in
@@ -74,7 +100,7 @@ pub(super) fn enforce_shell_allowlist(command: &str) -> Result<(), ShellError> {
 
     if has_dangerous_patterns(cmd) {
         return Err(format!(
-            "[BLOCKED — DO NOT RETRY] Command uses eval or $()/ backticks at command position, \
+            "[BLOCKED — DO NOT RETRY] Command runs eval, exec, source, `.` or a $()/backtick substitution at command position, \
              which is blocked regardless of allowlist. \
              This is a permanent security restriction, not a transient error.\n\
              Command: {command}"
@@ -91,7 +117,8 @@ pub(super) fn enforce_shell_allowlist(command: &str) -> Result<(), ShellError> {
         check_unconditional_blocked_only(cmd_all)?;
         return Ok(());
     }
-    check_all_segments(cmd_all, &allowlist)
+    let subcommand_scoping = crate::core::config::Config::load().shell_allowlist_subcommand_scoping;
+    check_all_segments(cmd_all, &Allowlist::new(allowlist, subcommand_scoping))
 }
 
 /// Normalize the command string: remove backslash-newline continuations and
@@ -109,12 +136,15 @@ pub(super) fn check_pipe_to_bare_interpreter(
     command: &str,
     strict: bool,
 ) -> Result<(), ShellError> {
-    let segments = split_on_operators(command);
+    // Only the command right of a `|` reads the pipe; one after `;`, `&&` or
+    // `||` starts fresh and reads the terminal (#1867).
+    let segments = segments_with_separators(command);
+    let piped_into = segments
+        .windows(2)
+        .filter(|pair| pair[0].1 == Some(Separator::Pipe))
+        .map(|pair| pair[1].0.as_str());
 
-    for (idx, seg) in segments.iter().enumerate() {
-        if idx == 0 {
-            continue;
-        }
+    for seg in piped_into {
         if is_bare_interpreter_stdin(seg) {
             let base = extract_base_from_segment(seg);
             if strict {
@@ -128,7 +158,9 @@ pub(super) fn check_pipe_to_bare_interpreter(
                 )
                 .into());
             }
-            tracing::warn!("[SECURITY] Pipe to bare interpreter '{base}' detected (warn-only)");
+            // Advisory only: at `warn` it lands in the wrapped command's stderr,
+            // i.e. in the agent's tool result, on every call (#1866).
+            tracing::info!("[SECURITY] Pipe to bare interpreter '{base}' detected (warn-only)");
         }
     }
     Ok(())
@@ -172,12 +204,19 @@ fn check_interpreter_eval_only(segment: &str) -> Result<(), ShellError> {
 /// `inline_ok`: if true, skip eval-flag/heredoc checks (#814 opt-in).
 fn check_interpreter_inner(
     segment: &str,
-    allowlist: Option<&[String]>,
+    allowlist: Option<&Allowlist>,
     depth: usize,
     inline_ok: bool,
 ) -> Result<(), ShellError> {
-    if depth > 3 {
-        return Ok(());
+    // Fail closed: stopping the walk early would let `env env env env bash -c …`
+    // skip every check below.
+    if depth > MAX_DELEGATION_DEPTH {
+        return Err(format!(
+            "[BLOCKED — DO NOT RETRY] More than {MAX_DELEGATION_DEPTH} nested delegation \
+             wrappers (env, nice, timeout, …). Call the command directly.\n\
+             This is a permanent security restriction."
+        )
+        .into());
     }
     let trimmed = skip_env_assignments(segment.trim());
     let tokens = shell_tokenize(trimmed);
@@ -198,16 +237,16 @@ fn check_interpreter_inner(
             if EVAL_FLAGS.contains(&tok.as_str()) {
                 return Err(format!(
                     "[BLOCKED — DO NOT RETRY] Interpreter '{base}' with inline code execution \
-                     flag '{tok}' is blocked. Use a script file instead.\n\
-                     This is a permanent security restriction."
+                     flag '{tok}' is blocked. Use a script file instead.\n{}",
+                    script_file_recipe(&base)
                 )
                 .into());
             }
             if has_eval_flag_prefix(tok) {
                 return Err(format!(
                     "[BLOCKED — DO NOT RETRY] Interpreter '{base}' with combined flag '{tok}' \
-                     containing eval flag is blocked.\n\
-                     This is a permanent security restriction."
+                     containing eval flag is blocked.\n{}",
+                    script_file_recipe(&base)
                 )
                 .into());
             }
@@ -219,12 +258,31 @@ fn check_interpreter_inner(
 
     // Delegation-command walk (recursive).
     if DELEGATION_COMMANDS.contains(&base.as_str()) {
-        let rest_tokens = delegated_command_tokens(&tokens[1..]);
-        if let Some(&delegated_tok) = rest_tokens.first() {
+        let rest_tokens = delegated_command_tokens(&base, &tokens[1..]);
+        if let Some(delegated_tok) = rest_tokens.first() {
+            let delegated = delegated_tok.rsplit('/').next().unwrap_or(delegated_tok);
+            if UNCONDITIONAL_BLOCKED.contains(&delegated) {
+                return Err(format!(
+                    "[BLOCKED — DO NOT RETRY] '{base}' delegates to '{delegated}', which is \
+                     unconditionally blocked. This is a permanent security restriction."
+                )
+                .into());
+            }
             // In restricted mode, the delegated command must be in the allowlist.
+            // Builtins need no entry (`command echo`), as at the top level.
             if let Some(al) = allowlist {
-                let delegated = delegated_tok.rsplit('/').next().unwrap_or(delegated_tok);
-                if !delegated.is_empty() && !matches_allowlist_entry(delegated, al) {
+                // GH #1419 follow-up: match on the delegated command's own
+                // tokens (basenamed), not just its bare name — `timeout 5
+                // git status` must be scoped by "git status *" the same way
+                // a top-level `git status` is, not blanket-allowed by "git".
+                let mut delegated_tokens = rest_tokens.clone();
+                if let Some(first) = delegated_tokens.first_mut() {
+                    *first = delegated.to_string();
+                }
+                if !delegated.is_empty()
+                    && !SHELL_BUILTINS.contains(&delegated)
+                    && !matches_allowlist_entry(&delegated_tokens, al)
+                {
                     return Err(format!(
                         "[BLOCKED — DO NOT RETRY] '{base}' delegates to '{delegated}' which is not \
                          in the shell allowlist. This is a permanent restriction."
@@ -248,11 +306,31 @@ fn check_interpreter_inner(
 fn heredoc_blocked_message(base: &str) -> String {
     format!(
         "[BLOCKED — DO NOT RETRY] Interpreter '{base}' with heredoc stdin is blocked. \
-         Inline code in the command string leaves no auditable artifact.\n\
-         Do this instead: write the code to a file, then run it —\n\
-           1. create /tmp/snippet with your code (Write/ctx_edit tool)\n\
-           2. {base} /tmp/snippet\n\
-         This is a permanent security restriction."
+         Inline code in the command string leaves no auditable artifact.\n{}",
+        script_file_recipe(base)
+    )
+}
+
+/// The one-attempt way around an inline-code block, so the agent's next call
+/// is the allowed one rather than another variant of the blocked one. Inline
+/// in-place edits (`perl -0pi -e`) are pointed at the edit tools, which is
+/// what they were used for.
+fn script_file_recipe(base: &str) -> String {
+    let ext = match base {
+        b if b.starts_with("python") => "py",
+        "node" | "deno" | "bun" => "js",
+        "perl" => "pl",
+        "ruby" => "rb",
+        "php" => "php",
+        _ => "txt",
+    };
+    format!(
+        "Do this instead — write the code to a file, then run it (one call each):\n\
+           1. create /tmp/lean-ctx-snippet.{ext} with your code (Write/Edit tool)\n\
+           2. {base} /tmp/lean-ctx-snippet.{ext}\n\
+         To change text in files, use the Edit tool or ctx_patch instead of an inline script.\n\
+         This is a permanent security restriction; only the user can lift it \
+         (shell_allow_inline_scripts = true)."
     )
 }
 
@@ -263,11 +341,18 @@ const UNCONDITIONAL_BLOCKED: &[&str] = &["eval", "exec", "source", "."];
 /// POSIX shell builtins that are executed by the shell itself — they cannot
 /// spawn an external process or escape any sandbox. Builtins bypass the
 /// allowlist check entirely (#1022).
+///
+/// `[[` is bash conditional *syntax* rather than a POSIX builtin, but it
+/// belongs here for the same reason (#1793): the shell evaluates it itself, it
+/// can spawn nothing, and `test`/`[` — its exact POSIX equivalents — are
+/// already listed. Its operands are shielded from operator splitting by
+/// `tokenizer::opens_double_bracket`, so any command substitution inside a
+/// condition is still extracted and validated separately.
 pub(super) const SHELL_BUILTINS: &[&str] = &[
-    "exit", "command", ":", "true", "false", "cd", "echo", "test", "[", "read", "set", "unset",
-    "export", "local", "return", "shift", "wait", "trap", "type", "hash", "pwd", "printf", "let",
-    "declare", "readonly", "getopts", "umask", "ulimit", "break", "continue", "bg", "fg", "jobs",
-    "times", "builtin", "enable", "shopt", "complete", "compgen",
+    "exit", "command", ":", "true", "false", "cd", "echo", "test", "[", "[[", "read", "set",
+    "unset", "export", "local", "return", "shift", "wait", "trap", "type", "hash", "pwd", "printf",
+    "let", "declare", "readonly", "getopts", "umask", "ulimit", "break", "continue", "bg", "fg",
+    "jobs", "times", "builtin", "enable", "shopt", "complete", "compgen",
 ];
 
 /// Interpreters that can execute arbitrary code via -c/-e flags.
@@ -290,27 +375,206 @@ const SCRIPT_EXTENSIONS: &[&str] = &[
 /// Commands that delegate to another command (the delegated command must also be allowed).
 /// `xargs` is here because `… | xargs bash -c '…'` would otherwise smuggle an
 /// interpreter past both the allowlist and the inline-code check (GH #391).
-const DELEGATION_COMMANDS: &[&str] = &["env", "nice", "timeout", "sudo", "doas", "xargs", "nohup"];
+/// `command` and `builtin` are shell builtins that run the word after them.
+const DELEGATION_COMMANDS: &[&str] = &[
+    "env", "nice", "timeout", "sudo", "doas", "xargs", "nohup", "command", "builtin",
+];
 
-/// Skips a delegation command's own flags/operands to find the delegated
-/// command token: leading `-x` flags, `KEY=VALUE` pairs (env), bare numbers
-/// (timeout/nice durations) and `{}` placeholders (xargs -I).
-fn delegated_command_tokens(tokens: &[String]) -> Vec<&str> {
-    tokens
-        .iter()
-        .map(std::string::String::as_str)
-        .skip_while(|t| {
-            t.starts_with('-')
-                || t.contains('=')
-                || *t == "{}"
-                || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
-        })
-        .collect()
+/// Wrappers nested deeper than this are refused rather than walked.
+const MAX_DELEGATION_DEPTH: usize = 3;
+
+/// How a delegation wrapper's own options consume words, so the walk can tell
+/// an option value (`env -u git`) from the command it runs. All of these stop
+/// parsing options at the first non-option word, so no permutation is needed.
+#[derive(Default)]
+struct WrapperOptions {
+    /// Short options taking a value, attached (`-ugit`) or as the next word.
+    short_value: &'static str,
+    /// Short options whose value is optional and only ever attached (`xargs -i`).
+    short_optional_value: &'static str,
+    /// Long options (without `--`) taking a value, `--opt=v` or `--opt v`.
+    long_value: &'static [&'static str],
+    /// Short options that only look a name up; nothing runs (`command -v`).
+    lookup_only: &'static str,
+    /// The option whose value is split into words and parsed in place (`env -S`).
+    split_string: Option<(char, &'static str)>,
+    /// Positional operands before the command (`timeout`'s DURATION).
+    operands: usize,
+    /// Whether `NAME=VALUE` words before the command are assignments.
+    assignments: bool,
+    /// Whether a lone `-` is an option (`env -` is `env -i`).
+    bare_dash: bool,
+}
+
+fn wrapper_options(wrapper: &str) -> WrapperOptions {
+    match wrapper {
+        // GNU and BSD `env`.
+        "env" => WrapperOptions {
+            short_value: "uCSPaLU",
+            long_value: &["unset", "chdir", "split-string", "argv0"],
+            split_string: Some(('S', "split-string")),
+            assignments: true,
+            bare_dash: true,
+            ..WrapperOptions::default()
+        },
+        "nice" => WrapperOptions {
+            short_value: "n",
+            long_value: &["adjustment"],
+            ..WrapperOptions::default()
+        },
+        "timeout" => WrapperOptions {
+            short_value: "sk",
+            long_value: &["signal", "kill-after"],
+            operands: 1,
+            ..WrapperOptions::default()
+        },
+        "sudo" => WrapperOptions {
+            short_value: "CDghpRrTtUu",
+            long_value: &[
+                "close-from",
+                "chdir",
+                "group",
+                "host",
+                "prompt",
+                "chroot",
+                "role",
+                "command-timeout",
+                "type",
+                "other-user",
+                "user",
+            ],
+            assignments: true,
+            ..WrapperOptions::default()
+        },
+        "doas" => WrapperOptions {
+            short_value: "Cua",
+            ..WrapperOptions::default()
+        },
+        // GNU and BSD `xargs`.
+        "xargs" => WrapperOptions {
+            short_value: "adEIJLnPRSs",
+            short_optional_value: "eil",
+            long_value: &[
+                "arg-file",
+                "delimiter",
+                "max-args",
+                "max-procs",
+                "max-chars",
+                "process-slot-var",
+            ],
+            ..WrapperOptions::default()
+        },
+        "command" => WrapperOptions {
+            lookup_only: "vV",
+            ..WrapperOptions::default()
+        },
+        _ => WrapperOptions::default(),
+    }
+}
+
+/// Returns the delegated command and its arguments: everything after the
+/// wrapper's own options, option values, assignments and operands. Empty when
+/// the wrapper runs nothing.
+fn delegated_command_tokens(wrapper: &str, tokens: &[String]) -> Vec<String> {
+    let opts = wrapper_options(wrapper);
+    let mut words = tokens.to_vec();
+    let mut operands = opts.operands;
+    let mut options_done = false;
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i].clone();
+        let is_option =
+            word.starts_with('-') && (word.len() > 1 || opts.bare_dash) && !options_done;
+        if !is_option {
+            options_done = true;
+            if opts.assignments && is_assignment(&word) {
+                i += 1;
+                continue;
+            }
+            if operands > 0 {
+                operands -= 1;
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+        if word == "--" {
+            options_done = true;
+            continue;
+        }
+
+        let mut split = None;
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_string())),
+                None => (long, None),
+            };
+            // GNU accepts any unambiguous prefix (`--uns` for `--unset`).
+            let takes_value = opts.long_value.iter().any(|o| o.starts_with(name));
+            let value = match attached {
+                Some(v) => Some(v),
+                None if takes_value => {
+                    i += 1;
+                    words.get(i - 1).cloned()
+                }
+                None => None,
+            };
+            if opts
+                .split_string
+                .is_some_and(|(_, long_name)| long_name.starts_with(name))
+            {
+                split = value;
+            }
+        } else {
+            let cluster: Vec<char> = word.chars().skip(1).collect();
+            for (pos, &c) in cluster.iter().enumerate() {
+                if opts.lookup_only.contains(c) {
+                    return Vec::new();
+                }
+                if opts.short_optional_value.contains(c) {
+                    break;
+                }
+                if opts.short_value.contains(c) {
+                    let attached: String = cluster[pos + 1..].iter().collect();
+                    let value = if attached.is_empty() {
+                        i += 1;
+                        words.get(i - 1).cloned()
+                    } else {
+                        Some(attached)
+                    };
+                    if opts.split_string.is_some_and(|(short, _)| short == c) {
+                        split = value;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // `env -S 'a b'` behaves as if `a` and `b` were given in its place.
+        if let Some(value) = split {
+            let mut spliced = shell_tokenize(&value);
+            spliced.extend(words.drain(i.min(words.len())..));
+            words = spliced;
+            i = 0;
+        }
+    }
+    words.split_off(i.min(words.len()))
+}
+
+/// `NAME=VALUE` with a valid shell variable name.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Check if a segment uses an interpreter with an eval flag, or a delegation command
 /// whose target is not in the allowlist.
-fn check_interpreter_abuse(segment: &str, allowlist: &[String]) -> Result<(), ShellError> {
+fn check_interpreter_abuse(segment: &str, allowlist: &Allowlist) -> Result<(), ShellError> {
     let inline_ok = crate::core::config::Config::load().shell_allow_inline_scripts_effective();
     check_interpreter_inner(segment, Some(allowlist), 0, inline_ok)
 }
@@ -498,23 +762,104 @@ pub(super) fn is_project_root_binary(token: &str) -> bool {
     canonical.starts_with(&canonical_root)
 }
 
-/// GH #1419: match a command's base binary against allowlist entries that may
-/// contain subcommands or wildcards (e.g. "terraform plan *"). Compares `base`
-/// against both the full entry and its first word.
-pub(super) fn matches_allowlist_entry(base: &str, allowlist: &[String]) -> bool {
-    allowlist
-        .iter()
-        .any(|entry| entry == base || entry.split_whitespace().next() == Some(base))
+/// Effective allowlist entries plus whether matching is subcommand-scoped
+/// (`shell_allowlist_subcommand_scoping`, GH #1419 follow-up). Threading this
+/// instead of a bare `&[String]` makes the flag explicit and testable at
+/// every call site without reading global config state inside the matching
+/// primitive itself — mirrors how `shell_strict_mode` is read once and
+/// passed as `strict: bool` into `check_substitution_in_args` /
+/// `check_pipe_to_bare_interpreter`.
+#[derive(Clone)]
+pub(crate) struct Allowlist {
+    pub(super) entries: Vec<String>,
+    pub(super) subcommand_scoping: bool,
 }
 
-pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<(), ShellError> {
+impl Allowlist {
+    pub(crate) fn new(entries: Vec<String>, subcommand_scoping: bool) -> Self {
+        Self {
+            entries,
+            subcommand_scoping,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl From<Vec<String>> for Allowlist {
+    /// Test/back-compat convenience: defaults subcommand scoping on, matching
+    /// the shipped default for `shell_allowlist_subcommand_scoping`.
+    fn from(entries: Vec<String>) -> Self {
+        Self {
+            entries,
+            subcommand_scoping: true,
+        }
+    }
+}
+
+/// GH #1419: match a command's tokens against allowlist entries that may
+/// contain subcommands or a trailing wildcard (e.g. "terraform plan *").
+///
+/// Grammar (design doc §3):
+/// - single-word entry -> implicit wildcard (matches the binary plus any args)
+/// - multi-word entry, no trailing `*` -> exact match, every token in order
+/// - multi-word entry, trailing `*` -> prefix match, zero or more extra tokens
+///
+/// `subcommand_scoping = false` preserves the pre-follow-up behavior exactly:
+/// only the base binary is compared, against each entry's own first word.
+pub(super) fn matches_allowlist_entry(tokens: &[String], allowlist: &Allowlist) -> bool {
+    let Some(base) = tokens.first().map(String::as_str) else {
+        return false;
+    };
+    if !allowlist.subcommand_scoping {
+        return allowlist
+            .entries
+            .iter()
+            .any(|entry| entry == base || entry.split_whitespace().next() == Some(base));
+    }
+    allowlist
+        .entries
+        .iter()
+        .any(|entry| entry_matches(entry, tokens))
+}
+
+/// One entry's own match test under the §3 grammar. Token-based, not
+/// string-based, so `"terraform plan *"` cannot match `terraform planning`
+/// (a different token that merely starts with the same characters).
+fn entry_matches(entry: &str, tokens: &[String]) -> bool {
+    let words: Vec<&str> = entry.split_whitespace().collect();
+    let (Some(&first_word), Some(base)) = (words.first(), tokens.first()) else {
+        return false;
+    };
+    if words.len() == 1 {
+        return base.as_str() == first_word;
+    }
+    if words.last() == Some(&"*") {
+        let prefix = &words[..words.len() - 1];
+        tokens.len() >= prefix.len()
+            && tokens
+                .iter()
+                .zip(prefix.iter())
+                .all(|(t, w)| t.as_str() == *w)
+    } else {
+        tokens.len() == words.len()
+            && tokens
+                .iter()
+                .zip(words.iter())
+                .all(|(t, w)| t.as_str() == *w)
+    }
+}
+
+pub(super) fn check_all_segments(command: &str, allowlist: &Allowlist) -> Result<(), ShellError> {
     if allowlist.is_empty() {
         return Ok(());
     }
 
     if has_dangerous_patterns(command) {
         return Err(format!(
-            "[BLOCKED — DO NOT RETRY] Command uses eval or $()/ backticks at command position, \
+            "[BLOCKED — DO NOT RETRY] Command runs eval, exec, source, `.` or a $()/backtick substitution at command position, \
              which is blocked in restricted mode. \
              This is a permanent security restriction, not a transient error.\n\
              Command: {command}"
@@ -524,6 +869,12 @@ pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<
 
     let segments = expand_to_leaf_segments(command)?;
     if segments.is_empty() {
+        // #1930: a line of inert PowerShell (`$sw.Elapsed.TotalSeconds`,
+        // `$path = [Environment]::GetEnvironmentVariable('Path')`) runs no
+        // command, so it has no leaf to check — that is not an empty command.
+        if super::ps_statements::is_inert_powershell(command) {
+            return Ok(());
+        }
         return Err("[BLOCKED — DO NOT RETRY] Empty command".into());
     }
 
@@ -536,26 +887,40 @@ pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<
         // invocation — check the body commands instead of the function name.
         if let Some(fn_name) = super::tokenizer::detect_function_def(seg) {
             local_functions.push(fn_name);
-            let body_cmds = super::tokenizer::extract_function_body_commands(seg);
+            // GH #2002: expand the body like a top-level line, so `for`/`if`/
+            // `while`/`case` in it are control flow, not commands to gate.
+            let body_cmds = match super::tokenizer::function_body(seg) {
+                Some(body) => expand_to_leaf_segments(body)?,
+                None => Vec::new(),
+            };
             for body_seg in &body_cmds {
                 check_inline_env_block(body_seg)?;
-                let body_base = extract_base_from_segment(body_seg);
-                if body_base.is_empty() || SHELL_BUILTINS.contains(&body_base.as_str()) {
+                let body_tokens = extract_command_tokens_from_segment(body_seg);
+                let Some(body_base) = body_tokens.first().cloned() else {
+                    continue;
+                };
+                if SHELL_BUILTINS.contains(&body_base.as_str()) {
+                    if DELEGATION_COMMANDS.contains(&body_base.as_str()) {
+                        check_interpreter_abuse(body_seg, allowlist)?;
+                    }
                     continue;
                 }
-                if !matches_allowlist_entry(&body_base, allowlist) {
+                if !matches_allowlist_entry(&body_tokens, allowlist) {
                     return Err(format!(
-                        "[BLOCKED — DO NOT RETRY] '{body_base}' (inside function body) is not in the                          shell allowlist.\nFix (additive, keeps the defaults): run  lean-ctx allow {body_base}",
+                        "[BLOCKED — DO NOT RETRY] '{body_base}' (inside function body) is not in the shell allowlist.\nFix (additive, keeps the defaults): run  lean-ctx allow {body_base}",
                     ).into());
                 }
+                check_interpreter_abuse(body_seg, allowlist)?;
+                check_dangerous_flags(body_seg)?;
+                super::self_config::check_self_reconfiguration(&body_tokens)?;
             }
             continue;
         }
 
-        let base = extract_base_from_segment(seg);
-        if base.is_empty() {
+        let tokens = extract_command_tokens_from_segment(seg);
+        let Some(base) = tokens.first().cloned() else {
             continue;
-        }
+        };
 
         // #1488: allow calling a function defined earlier in the same pipeline.
         if local_functions.contains(&base) {
@@ -571,6 +936,11 @@ pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<
             .into());
         }
         if SHELL_BUILTINS.contains(&base.as_str()) {
+            // `command`/`builtin` need no entry themselves, but they run the
+            // word after them, which must pass like any delegated command.
+            if DELEGATION_COMMANDS.contains(&base.as_str()) {
+                check_interpreter_abuse(seg, allowlist)?;
+            }
             continue;
         }
         // #1442: PowerShell verb-prefix matching — safe cmdlets (Get-*, Test-*,
@@ -579,7 +949,7 @@ pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<
             Some(true) => continue,
             // PS blocked alias/cmdlet, but allowlist override takes precedence
             // (supports e.g. Elixir's `iex` REPL alongside PS Invoke-Expression).
-            Some(false) if !matches_allowlist_entry(&base, allowlist) => {
+            Some(false) if !matches_allowlist_entry(&tokens, allowlist) => {
                 return Err(format!(
                     "[BLOCKED — DO NOT RETRY] PowerShell cmdlet '{base}' uses a destructive \
                      verb and is not auto-allowed. Add it explicitly: lean-ctx allow {base}\n\
@@ -591,7 +961,8 @@ pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<
         }
         check_interpreter_abuse(seg, allowlist)?;
         check_dangerous_flags(seg)?;
-        if !matches_allowlist_entry(&base, allowlist) {
+        super::self_config::check_self_reconfiguration(&tokens)?;
+        if !matches_allowlist_entry(&tokens, allowlist) {
             // #813: auto-allow binaries that resolve to existing files under
             // the project root. The first token (before rsplit) carries the
             // path context (e.g. "./cbc_old", "../bin/bench").
@@ -599,7 +970,20 @@ pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<
                 .into_iter()
                 .next()
                 .unwrap_or_default();
-            if is_project_root_binary(&first_token) {
+
+            // GH #1419 follow-up: when subcommand scoping is on and some
+            // entry explicitly names this binary, that naming IS the user's
+            // scoping signal — a scoping denial must not fall through into
+            // the project-root auto-allow below (`.venv/bin/pip`,
+            // `node_modules/.bin/x`, … would otherwise skip scoping just by
+            // living under the project root).
+            let binary_is_scoped = allowlist.subcommand_scoping
+                && allowlist
+                    .entries
+                    .iter()
+                    .any(|entry| entry.split_whitespace().next() == Some(base.as_str()));
+
+            if !binary_is_scoped && is_project_root_binary(&first_token) {
                 tracing::info!(
                     "[shell_allowlist] auto-allowing project-root binary: {first_token}"
                 );
@@ -609,7 +993,7 @@ pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<
             // #815: for compound commands, tell the user which segment was
             // blocked and that nothing ran (the pipeline is rejected as a
             // whole before execution, so no prefix commands executed).
-            let mut msg = allowlist_block_message(&base);
+            let mut msg = allowlist_block_message(&base, &tokens, &allowlist.entries);
             if total > 1 {
                 msg.push_str(&format!(
                     "\n\n[pipeline: segment {}/{total} blocked — \
@@ -633,14 +1017,19 @@ pub(super) fn check_all_segments(command: &str, allowlist: &[String]) -> Result<
 /// pre-commit hooks, playwright scripts).
 fn has_dangerous_patterns(command: &str) -> bool {
     let trimmed = command.trim();
+    // #1829: the separator scan below is not quote-aware, so single-quoted
+    // text (a jq program such as `'x | . as $r | ($r|z)'`) matched `| . ` and
+    // was blocked. Single quotes are pure data to the shell; mask them out.
+    // The real command-position check runs per parsed segment elsewhere.
+    let unquoted = mask_single_quoted(trimmed);
 
     for blocked in UNCONDITIONAL_BLOCKED {
         let with_space = format!("{blocked} ");
-        if trimmed.starts_with(&with_space) {
+        if unquoted.starts_with(&with_space) {
             return true;
         }
         for sep in ["; ", "&& ", "|| ", "| ", "\n"] {
-            if trimmed.contains(&format!("{sep}{blocked} ")) {
+            if unquoted.contains(&format!("{sep}{blocked} ")) {
                 return true;
             }
         }
@@ -651,6 +1040,39 @@ fn has_dangerous_patterns(command: &str) -> bool {
     }
 
     false
+}
+
+/// Replace the contents of single-quoted strings with spaces, keeping the
+/// quotes and everything else byte-for-byte. A `'` inside double quotes or
+/// escaped with `\` does not open a string. This only feeds the coarse
+/// separator scan above; the per-segment `UNCONDITIONAL_BLOCKED` check in
+/// `check_all_segments` / `check_unconditional_blocked_only` stays the
+/// authority on what runs at command position.
+fn mask_single_quoted(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let (mut in_single, mut in_double, mut escaped) = (false, false, false);
+    for ch in command.chars() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+                out.push(ch);
+            } else {
+                out.push(' ');
+            }
+            continue;
+        }
+        out.push(ch);
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            in_double = !in_double;
+        } else if ch == '\'' && !in_double {
+            in_single = true;
+        }
+    }
+    out
 }
 
 /// Check if `$()` or backticks appear at command position (first token

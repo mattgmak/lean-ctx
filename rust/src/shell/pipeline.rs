@@ -31,10 +31,8 @@ pub(super) fn exec_buffered(
     #[cfg(windows)]
     {
         if super::platform::is_powershell(shell) {
-            let ps_script = format!(
-                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {}",
-                command
-            );
+            let ps_script =
+                format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command}");
             match tempfile::Builder::new()
                 .prefix("lean-ctx-ps-")
                 .suffix(".ps1")
@@ -131,7 +129,7 @@ pub(super) fn exec_buffered(
     let output = wait_with_limits(child, max_bytes, timeout, isolate);
 
     let duration_ms = start.elapsed().as_millis();
-    let exit_code = output.status.code().unwrap_or(1);
+    let exit_code = super::exit_status::exit_code(output.status);
     let stdout =
         super::platform::resolve_carriage_returns(&super::platform::decode_output(&output.stdout));
     let stderr =

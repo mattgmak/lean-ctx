@@ -5,16 +5,12 @@
 //!   2. `ContentSource` serialization and tagging
 //!   3. BM25 cross-source ingest pipeline
 //!   4. Provider Registry lifecycle (register, discover, execute)
-//!   5. `ContextColumn` trait pipeline (L4 → L2/3 → L5)
-//!   6. Config-driven provider activation
-//!   7. File reference extraction from freeform text
-//!   8. `ChunkKind` extensions for external sources
+//!   5. Config-driven provider activation
+//!   6. File reference extraction from freeform text
+//!   7. `ChunkKind` extensions for external sources
 
 use lean_ctx::core::bm25_index::{BM25Index, ChunkKind, CodeChunk};
 use lean_ctx::core::content_chunk::{ContentChunk, ContentSource, extract_file_references};
-use lean_ctx::core::context_column::{
-    ColumnContext, ColumnOutput, ContextColumn, FilesystemColumn, ProviderColumn,
-};
 use lean_ctx::core::providers::registry::{ProviderRegistry, global_registry, result_to_chunks};
 use lean_ctx::core::providers::{ContextProvider, ProviderItem, ProviderParams, ProviderResult};
 use std::sync::Arc;
@@ -37,7 +33,7 @@ fn content_chunk_from_provider_has_correct_uri_scheme() {
     assert_eq!(cc.kind, ChunkKind::Issue);
     assert!(cc.is_external());
     assert_eq!(cc.provider_id(), Some("github"));
-    assert!(!cc.tokens.is_empty());
+    assert!(!cc.tokens.is_empty(), "`cc.tokens` is empty");
     assert!(cc.token_count > 0);
     assert_eq!(cc.references, vec!["src/auth.rs"]);
     assert!(cc.metadata.is_some());
@@ -78,7 +74,7 @@ fn code_chunk_to_content_chunk_defaults_to_file_source() {
     let cc: ContentChunk = code.into();
     assert_eq!(cc.source, ContentSource::File);
     assert!(!cc.is_external());
-    assert!(cc.references.is_empty());
+    assert!(cc.references.is_empty(), "{:?}", cc.references);
     assert!(cc.metadata.is_none());
 }
 
@@ -138,6 +134,7 @@ fn bm25_ingest_content_chunks_increases_doc_count() {
         files: std::collections::HashMap::new(),
         dirs: std::collections::HashMap::new(),
         content_truncated: false,
+        admission_policy: None,
     };
 
     let chunks = vec![
@@ -181,6 +178,7 @@ fn bm25_search_finds_ingested_provider_chunks() {
         files: std::collections::HashMap::new(),
         dirs: std::collections::HashMap::new(),
         content_truncated: false,
+        admission_policy: None,
     };
 
     index.ingest_content_chunks(vec![
@@ -222,6 +220,7 @@ fn bm25_mixed_code_and_provider_chunks() {
         files: std::collections::HashMap::new(),
         dirs: std::collections::HashMap::new(),
         content_truncated: false,
+        admission_policy: None,
     };
 
     index.ingest_content_chunks(vec![
@@ -270,6 +269,7 @@ fn bm25_external_chunk_count_accurate() {
         files: std::collections::HashMap::new(),
         dirs: std::collections::HashMap::new(),
         content_truncated: false,
+        admission_policy: None,
     };
 
     index.ingest_content_chunks(vec![
@@ -320,6 +320,7 @@ fn bm25_ingest_zero_chunks_is_noop() {
         files: std::collections::HashMap::new(),
         dirs: std::collections::HashMap::new(),
         content_truncated: false,
+        admission_policy: None,
     };
 
     let ingested = index.ingest_content_chunks(Vec::<ContentChunk>::new());
@@ -449,7 +450,10 @@ fn registry_available_provider_ids_filters_unavailable() {
     let reg = ProviderRegistry::new();
     reg.register(Arc::new(MockProvider { available: false }));
 
-    assert!(reg.available_provider_ids().is_empty());
+    {
+        let found = &reg.available_provider_ids();
+        assert!(found.is_empty(), "{found:?}");
+    }
     assert_eq!(reg.provider_count(), 1);
 }
 
@@ -577,132 +581,6 @@ fn result_to_chunks_preserves_metadata() {
 }
 
 #[test]
-fn filesystem_column_process_real_file() {
-    let col = FilesystemColumn;
-    let ctx = ColumnContext::default();
-    let output = col.process(file!(), &ctx).unwrap();
-
-    assert!(output.token_count > 0);
-    assert!(output.budget_ok);
-    assert!(output.quality_score > 0.0);
-    assert!(!output.chunks.is_empty());
-}
-
-#[test]
-fn filesystem_column_ingest_nonexistent_errors() {
-    let col = FilesystemColumn;
-    let ctx = ColumnContext::default();
-    assert!(col.ingest("/this/does/not/exist.rs", &ctx).is_err());
-}
-
-#[test]
-fn filesystem_column_compress_modes() {
-    let col = FilesystemColumn;
-    let ctx_full = ColumnContext {
-        compression_hint: Some("full".into()),
-        ..Default::default()
-    };
-    let ctx_map = ColumnContext {
-        compression_hint: Some("map".into()),
-        ..Default::default()
-    };
-    let ctx_sig = ColumnContext {
-        compression_hint: Some("signatures".into()),
-        ..Default::default()
-    };
-    let ctx_agg = ColumnContext {
-        compression_hint: Some("aggressive".into()),
-        ..Default::default()
-    };
-
-    let input = col.ingest(file!(), &ColumnContext::default()).unwrap();
-
-    let full = col.compress(&input, &ctx_full).unwrap();
-    let map = col.compress(&input, &ctx_map).unwrap();
-    let sig = col.compress(&input, &ctx_sig).unwrap();
-    let agg = col.compress(&input, &ctx_agg).unwrap();
-
-    assert!(full.compressed_token_count >= map.compressed_token_count);
-    assert!(map.compressed_token_count >= sig.compressed_token_count);
-    assert!(sig.compressed_token_count >= agg.compressed_token_count);
-    assert!(agg.compression_ratio >= sig.compression_ratio);
-}
-
-#[test]
-fn filesystem_column_verify_budget_enforcement() {
-    let col = FilesystemColumn;
-    let input = col.ingest(file!(), &ColumnContext::default()).unwrap();
-    let compressed = col.compress(&input, &ColumnContext::default()).unwrap();
-
-    let tight_ctx = ColumnContext {
-        budget_tokens: Some(1),
-        ..Default::default()
-    };
-    let output = col.verify(&compressed, &tight_ctx).unwrap();
-    assert!(!output.budget_ok);
-
-    let generous_ctx = ColumnContext {
-        budget_tokens: Some(1_000_000),
-        ..Default::default()
-    };
-    let output = col.verify(&compressed, &generous_ctx).unwrap();
-    assert!(output.budget_ok);
-
-    let no_budget = ColumnContext::default();
-    let output = col.verify(&compressed, &no_budget).unwrap();
-    assert!(output.budget_ok);
-}
-
-#[test]
-fn provider_column_wraps_provider_correctly() {
-    let provider = Arc::new(MockProvider { available: true });
-    let col = ProviderColumn::new(provider);
-
-    assert_eq!(col.id(), "mock_test");
-    assert_eq!(col.display_name(), "Mock Test Provider");
-    assert!(col.is_active());
-}
-
-#[test]
-fn provider_column_ingest_with_query_params() {
-    let provider = Arc::new(MockProvider { available: true });
-    let col = ProviderColumn::new(provider);
-    let ctx = ColumnContext::default();
-
-    let input = col.ingest("issues?state=open&limit=3", &ctx).unwrap();
-    assert_eq!(input.chunks.len(), 3);
-    assert!(input.raw_token_count > 0);
-
-    for chunk in &input.chunks {
-        assert!(chunk.is_external());
-        assert_eq!(chunk.provider_id(), Some("mock_test"));
-    }
-}
-
-#[test]
-fn provider_column_full_pipeline() {
-    let provider = Arc::new(MockProvider { available: true });
-    let col = ProviderColumn::new(provider);
-    let ctx = ColumnContext {
-        task: Some("Fix authentication bug".into()),
-        budget_tokens: Some(100_000),
-        ..Default::default()
-    };
-
-    let output = col.process("issues?limit=2", &ctx).unwrap();
-    assert_eq!(output.chunks.len(), 2);
-    assert!(output.budget_ok);
-    assert!(output.token_count > 0);
-}
-
-#[test]
-fn provider_column_inactive_when_unavailable() {
-    let provider = Arc::new(MockProvider { available: false });
-    let col = ProviderColumn::new(provider);
-    assert!(!col.is_active());
-}
-
-#[test]
 fn extract_refs_handles_backtick_paths() {
     let text = "Check `src/auth/handler.rs` for the fix";
     let refs = extract_file_references(text);
@@ -720,7 +598,7 @@ fn extract_refs_handles_bracket_paths() {
 fn extract_refs_ignores_email_addresses() {
     let text = "Contact user@example.com/foo.rs";
     let refs = extract_file_references(text);
-    assert!(refs.is_empty());
+    assert!(refs.is_empty(), "{refs:?}");
 }
 
 #[test]
@@ -813,6 +691,7 @@ fn end_to_end_provider_to_bm25_search() {
         files: std::collections::HashMap::new(),
         dirs: std::collections::HashMap::new(),
         content_truncated: false,
+        admission_policy: None,
     };
 
     let ingested = index.ingest_content_chunks(chunks);
@@ -824,30 +703,6 @@ fn end_to_end_provider_to_bm25_search() {
     for result in &results {
         assert!(result.file_path.starts_with("mock_test://"));
     }
-}
-
-#[test]
-fn end_to_end_column_pipeline_to_bm25() {
-    let provider = Arc::new(MockProvider { available: true });
-    let col = ProviderColumn::new(provider);
-    let ctx = ColumnContext::default();
-
-    let output: ColumnOutput = col.process("issues?limit=3", &ctx).unwrap();
-
-    let mut index = BM25Index {
-        chunks: Vec::new(),
-        inverted: std::collections::HashMap::new(),
-        avg_doc_len: 0.0,
-        doc_count: 0,
-        doc_freqs: std::collections::HashMap::new(),
-        files: std::collections::HashMap::new(),
-        dirs: std::collections::HashMap::new(),
-        content_truncated: false,
-    };
-
-    let ingested = index.ingest_content_chunks(output.chunks);
-    assert_eq!(ingested, 3);
-    assert_eq!(index.external_chunk_count(), 3);
 }
 
 #[test]

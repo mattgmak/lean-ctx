@@ -16,6 +16,35 @@ pub struct PublishedCanonicalReceipt {
     pub path: PathBuf,
 }
 
+impl PublishedCanonicalReceipt {
+    /// Resolve publication through the existing bounded, no-follow artifact store.
+    pub(crate) fn read_canonical(&self) -> Result<(ReceiptDocumentV1, Vec<u8>)> {
+        let invalid = ExecutionLedgerError::InvalidRecord;
+        let digest = lean_ctx_protocol::Sha256Digest::new(self.receipt_digest.clone())
+            .map_err(|error| invalid(error.to_string()))?;
+        let expected_path = crate::core::data_dir::lean_ctx_data_dir()
+            .map_err(invalid)?
+            .join("execution/receipts")
+            .join(format!("{}.json", digest.hex()));
+        if self.path != expected_path || self.receipt_ref != format!("id:{}", digest.as_str()) {
+            return Err(invalid(
+                "publication does not bind its canonical artifact location".into(),
+            ));
+        }
+        let bytes =
+            crate::core::engine_artifact::read_content("execution/receipts", digest.hex(), "json")
+                .map_err(invalid)?;
+        let receipt = ReceiptDocumentV1::from_canonical_bytes(&bytes)
+            .map_err(|error| invalid(error.to_string()))?;
+        if receipt.receipt_id.as_str() != self.receipt_id {
+            return Err(invalid(
+                "publication does not bind its canonical receipt identity".into(),
+            ));
+        }
+        Ok((receipt, bytes))
+    }
+}
+
 /// Persist exact canonical bytes, then append their immutable ledger reference.
 pub fn publish_canonical_receipt(
     receipt: &ReceiptDocumentV1,

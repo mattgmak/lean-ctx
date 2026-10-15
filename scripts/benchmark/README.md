@@ -1,5 +1,10 @@
 # Token Reduction Benchmark
 
+Captured files under `results/` are historical workload evidence and may
+contain the product wording at capture time. They are not current onboarding
+or general savings claims. For the product definition, see
+[canonical positioning](../../docs/POSITIONING_CANONICAL.md).
+
 From the repository root, run:
 
 ```bash

@@ -6,10 +6,12 @@
 //! and the `rewrite_candidate` dispatch every rewrite entry point (Cursor,
 //! Codex, Copilot, the inline CLI) funnels through.
 
+use super::powershell_rewrite::{self, PowerShellDecision, is_powershell_tool};
 use super::search_rewrite::{rewrite_dir_list_command, rewrite_search_command};
 use super::{
-    HOOK_STDIN_TIMEOUT, build_dual_allow_output, build_dual_rewrite_output, dedup, is_disabled,
-    is_shell_tool, payload, read_stdin_with_timeout, resolve_binary, shell_quote, shell_tokenize,
+    HOOK_STDIN_TIMEOUT, build_deny_output, build_dual_allow_output, build_dual_rewrite_output,
+    dedup, is_claude_pretooluse_payload, is_disabled, is_shell_tool, payload,
+    read_stdin_with_timeout, resolve_binary, shell_quote, shell_tokenize,
 };
 use crate::compound_lexer;
 use crate::core::debug_log::{self, Route};
@@ -53,8 +55,14 @@ pub(super) fn compute_rewrite() -> String {
 
     // #1032: Cursor fires preToolUse twice. Dedup on a PID-independent key (tool +
     // command) so the second fire replays the decision instead of re-logging.
-    let key_material = format!("{tool_name}\u{0}{cmd}");
+    // The output dialect is part of the key: a replayed Cursor-shaped deny is
+    // invalid for Claude Code.
+    let claude = is_claude_pretooluse_payload(&v);
+    let key_material = format!("{tool_name}\u{0}{cmd}\u{0}{claude}");
     dedup::deduped("rewrite", &key_material, || {
+        if is_powershell_tool(&tool_name) {
+            return powershell_output(&cmd, &binary, &tool_name, tool_args.as_ref(), &v);
+        }
         if let Some(rewritten) = rewrite_candidate(&cmd, &binary) {
             debug_log::log_hook_decision(
                 "rewrite",
@@ -64,7 +72,7 @@ pub(super) fn compute_rewrite() -> String {
                 "rewritable command",
             );
             build_dual_rewrite_output(tool_args.as_ref(), &rewritten)
-        } else if needs_enforcement_wrap(&cmd) {
+        } else if needs_enforcement_wrap(&cmd, &binary) {
             // #1408: Commands that bypass compression-routing but violate the
             // shell allowlist must still be wrapped for enforcement. Without
             // this, compound commands (`true && docker --version`) and
@@ -84,34 +92,82 @@ pub(super) fn compute_rewrite() -> String {
                 &tool_name,
                 Route::Native,
                 &cmd,
-                rewrite_skip_reason(&cmd),
+                rewrite_skip_reason(&cmd, &binary),
             );
             // #1285: native passthrough was structurally invisible — only
             // ctx_* calls reach metering.jsonl, so a session leaking reads
             // through raw Bash showed a clean savings rate. Count every
             // passthrough (token volumes are unknown pre-exec, so zeros) so
             // the dashboard's per-tool table shows the leak as a call count.
-            // Synchronous append: hooks are plain CLI processes without a
-            // Tokio reactor, so `append_best_effort` (spawn_blocking) is
-            // unavailable here.
-            if let Ok(store) = crate::core::metering::MeterStore::from_data_dir() {
-                let _ = store.append(&crate::core::metering::MeterEntry::new(
-                    "native_shell_passthrough",
-                    0,
-                    0,
-                    0,
-                ));
-            }
+            record_native_passthrough();
             build_dual_allow_output()
         }
     })
 }
 
+/// The hook output for a host's PowerShell tool (#1848) — see
+/// [`super::powershell_rewrite`] for why it never takes the Bash path.
+fn powershell_output(
+    cmd: &str,
+    binary: &str,
+    tool_name: &str,
+    tool_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+) -> String {
+    match powershell_rewrite::decide(cmd, binary) {
+        PowerShellDecision::Rewrite(rewritten) => {
+            debug_log::log_hook_decision(
+                "rewrite",
+                tool_name,
+                Route::LeanCtx,
+                cmd,
+                "rewritable command (PowerShell)",
+            );
+            build_dual_rewrite_output(tool_args, &rewritten)
+        }
+        PowerShellDecision::Deny(msg) => {
+            debug_log::log_hook_decision(
+                "rewrite",
+                tool_name,
+                Route::Native,
+                cmd,
+                "denied by the shell allowlist (PowerShell)",
+            );
+            build_deny_output(&msg, payload)
+        }
+        PowerShellDecision::Passthrough => {
+            debug_log::log_hook_decision(
+                "rewrite",
+                tool_name,
+                Route::Native,
+                cmd,
+                "not a single read/search/list command (PowerShell)",
+            );
+            record_native_passthrough();
+            build_dual_allow_output()
+        }
+    }
+}
+
+/// Count a native shell passthrough in metering (#1285). Synchronous append:
+/// hooks are plain CLI processes without a Tokio reactor, so
+/// `append_best_effort` (spawn_blocking) is unavailable here.
+fn record_native_passthrough() {
+    if let Ok(store) = crate::core::metering::MeterStore::from_data_dir() {
+        let _ = store.append(&crate::core::metering::MeterEntry::new(
+            crate::core::metering::NATIVE_PASSTHROUGH_TOOL,
+            0,
+            0,
+            0,
+        ));
+    }
+}
+
 /// Human-readable reason a shell command was left to the native tool. Mirrors
 /// the `None` branches of [`rewrite_candidate`] so #520's debug log can explain
 /// *why* a call fell back to native instead of routing through lean-ctx.
-pub(super) fn rewrite_skip_reason(cmd: &str) -> &'static str {
-    if cmd.starts_with("lean-ctx ") {
+pub(super) fn rewrite_skip_reason(cmd: &str, binary: &str) -> &'static str {
+    if is_leanctx_call(cmd, binary) {
         "already a lean-ctx command"
     } else if cmd.contains("<<") {
         "heredoc cannot be rewritten safely"
@@ -131,7 +187,13 @@ pub(super) fn is_rewritable(cmd: &str) -> bool {
 ///
 /// Conditions: shell security is active (not `Off`), the command would fail the
 /// allowlist, and it can survive the quoting round-trip (no heredocs).
-fn needs_enforcement_wrap(cmd: &str) -> bool {
+///
+/// A command that already runs lean-ctx — bare or by the binary path our own
+/// rewrites emit (`C:/…/lean-ctx.exe -c '…'` on Windows) — enforces the
+/// allowlist itself. Wrapping it again nests one more `-c` layer every time the
+/// hook sees it, and the nested POSIX quoting falls apart in the inner shell
+/// (#2088).
+fn needs_enforcement_wrap(cmd: &str, binary: &str) -> bool {
     use crate::core::shell_allowlist::{ShellSecurity, passes_enforced};
 
     if ShellSecurity::resolve() == ShellSecurity::Off {
@@ -140,7 +202,7 @@ fn needs_enforcement_wrap(cmd: &str) -> bool {
     if cmd.contains("<<") {
         return false;
     }
-    if cmd.starts_with("lean-ctx ") {
+    if is_leanctx_call(cmd, binary) {
         return false;
     }
     !passes_enforced(cmd)
@@ -151,14 +213,20 @@ fn needs_enforcement_wrap(cmd: &str) -> bool {
 /// handled authoritatively by [`build_rewrite_compound`]; this guards the
 /// single-command `is_rewritable` fallback in [`rewrite_candidate`] so a
 /// compound the compound-handler declined is never re-wrapped whole.
-fn is_compound(cmd: &str) -> bool {
+pub(super) fn is_compound(cmd: &str) -> bool {
     compound_lexer::split_compound(cmd)
         .iter()
         .any(|s| matches!(s, compound_lexer::Segment::Operator(_)))
 }
 
+/// Wrap `cmd` in `lean-ctx -c '…'`, quoted for the host's Bash tool.
+///
+/// Always POSIX: the calling shell is the host's Bash (Git Bash on Windows),
+/// not the shell lean-ctx detects for itself. cmd.exe-style double quotes let
+/// Bash expand `$vars` and run `$(…)` before lean-ctx sees the command (#1862).
+/// PowerShell tools never get here (#1848).
 pub(super) fn wrap_single_command(cmd: &str, binary: &str) -> String {
-    crate::shell::join_command(&[binary.to_owned(), "-c".to_owned(), cmd.to_owned()])
+    crate::shell::join_command_for(&[binary.to_owned(), "-c".to_owned(), cmd.to_owned()], "-c")
 }
 
 /// Quote-aware check for stdout file redirects (`>`, `>>`).
@@ -219,62 +287,13 @@ fn has_stdout_file_redirect(cmd: &str) -> bool {
 }
 
 pub(super) fn rewrite_candidate(cmd: &str, binary: &str) -> Option<String> {
-    if cmd.starts_with("lean-ctx ") || cmd.starts_with(&format!("{binary} ")) {
+    if !passes_rewrite_guards(cmd, binary) {
         return None;
     }
 
-    // GH #1420: package manager operations on lean-ctx itself must not be
-    // rewritten — wrapping `npm install lean-ctx-bin` in `lean-ctx -c` locks
-    // the binary (EBUSY on Windows) and can hang.
-    if is_self_install_command(cmd) {
-        return None;
-    }
-
-    // Package-manager install commands produce interactive progress output
-    // and can hang when wrapped. Always pass through.
-    if is_package_manager_install(cmd) {
-        return None;
-    }
-
-    // Heredocs cannot survive the quoting round-trip through `lean-ctx -c '...'`.
-    // Newlines get escaped, breaking the heredoc syntax entirely (GitHub #140).
-    if cmd.contains("<<") {
-        return None;
-    }
-
-    // If the command has a LEAN_CTX_DISABLED or LEAN_CTX_NO_HOOK env-prefix,
-    // the agent explicitly wants raw execution. Wrapping it in `lean-ctx -c`
-    // would bury the flag inside a string literal where is_disabled() can't
-    // see it. Skip rewrite entirely. (#1320)
-    {
-        let stripped = crate::rewrite_registry::strip_env_prefix(cmd);
-        if stripped.len() != cmd.len() {
-            let prefix_part = &cmd[..cmd.len() - stripped.len()];
-            if prefix_part.contains("LEAN_CTX_DISABLED") || prefix_part.contains("LEAN_CTX_NO_HOOK")
-            {
-                return None;
-            }
-        }
-    }
-
-    // File redirects (`cmd > out`, `cmd >> log`) mean the output is captured
-    // as data, not read by the agent. Wrapping in lean-ctx -c would either:
-    // (a) compress stdout before the redirect writes it to disk, or
-    // (b) add quoting overhead that can break redirect target paths.
-    // Let the native shell handle the redirect directly. (#1303)
-    if has_stdout_file_redirect(cmd) {
-        return None;
-    }
-
-    if let Some(rewritten) = rewrite_file_read_command(cmd, binary) {
-        return Some(rewritten);
-    }
-
-    if let Some(rewritten) = rewrite_search_command(cmd, binary) {
-        return Some(rewritten);
-    }
-
-    if let Some(rewritten) = rewrite_dir_list_command(cmd, binary) {
+    // The direct rewrites splice the binary into a Bash command line as-is: a
+    // path with a space (`C:/Users/First Last/…`) must arrive quoted (#1865).
+    if let Some(rewritten) = direct_rewrite(cmd, &shell_quote(binary)) {
         return Some(rewritten);
     }
 
@@ -292,6 +311,107 @@ pub(super) fn rewrite_candidate(cmd: &str, binary: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Commands no rewrite may touch, whatever shell runs them. Shared with the
+/// PowerShell path (#1848).
+pub(super) fn passes_rewrite_guards(cmd: &str, binary: &str) -> bool {
+    if is_leanctx_call(cmd, binary) {
+        return false;
+    }
+
+    // GH #1420: package manager operations on lean-ctx itself must not be
+    // rewritten — wrapping `npm install lean-ctx-bin` in `lean-ctx -c` locks
+    // the binary (EBUSY on Windows) and can hang.
+    if is_self_install_command(cmd) {
+        return false;
+    }
+
+    // Package-manager install commands produce interactive progress output
+    // and can hang when wrapped. Always pass through.
+    if is_package_manager_install(cmd) {
+        return false;
+    }
+
+    // Heredocs cannot survive the quoting round-trip through `lean-ctx -c '...'`.
+    // Newlines get escaped, breaking the heredoc syntax entirely (GitHub #140).
+    if cmd.contains("<<") {
+        return false;
+    }
+
+    // If the command has a LEAN_CTX_DISABLED or LEAN_CTX_NO_HOOK env-prefix,
+    // the agent explicitly wants raw execution. Wrapping it in `lean-ctx -c`
+    // would bury the flag inside a string literal where is_disabled() can't
+    // see it. Skip rewrite entirely. (#1320)
+    {
+        let stripped = crate::rewrite_registry::strip_env_prefix(cmd);
+        if stripped.len() != cmd.len() {
+            let prefix_part = &cmd[..cmd.len() - stripped.len()];
+            if prefix_part.contains("LEAN_CTX_DISABLED") || prefix_part.contains("LEAN_CTX_NO_HOOK")
+            {
+                return false;
+            }
+        }
+    }
+
+    // File redirects (`cmd > out`, `cmd >> log`) mean the output is captured
+    // as data, not read by the agent. Wrapping in lean-ctx -c would either:
+    // (a) compress stdout before the redirect writes it to disk, or
+    // (b) add quoting overhead that can break redirect target paths.
+    // Let the native shell handle the redirect directly. (#1303)
+    !has_stdout_file_redirect(cmd)
+}
+
+/// `cmd` already runs lean-ctx: bare, by path, or by a quoted path as our own
+/// rewrites emit it (#1865).
+pub(super) fn is_leanctx_call(cmd: &str, binary: &str) -> bool {
+    cmd.starts_with("lean-ctx ")
+        || cmd.starts_with(&format!("{binary} "))
+        || cmd.starts_with(&format!("{} ", shell_quote(binary)))
+}
+
+/// A single read/search/list command mapped onto the matching `lean-ctx`
+/// subcommand (`read`/`grep`/`ls`) — no `-c` wrap, so no shell in between.
+pub(super) fn direct_rewrite(cmd: &str, binary: &str) -> Option<String> {
+    if has_shell_expansion(cmd) {
+        return None;
+    }
+    rewrite_file_read_command(cmd, binary)
+        .or_else(|| rewrite_search_command(cmd, binary))
+        .or_else(|| rewrite_dir_list_command(cmd, binary))
+}
+
+/// `$` or `` ` `` anywhere in the command, or an unquoted glob/brace
+/// metacharacter (`*`, `?`, `[`, `{`). The tokenizer that feeds the direct
+/// rewrites drops the quotes, so it cannot tell `"$HOME"` (expand) from
+/// `'$HOME'` (literal), and the rewrites re-quote every path — which turns a
+/// glob the calling shell would have expanded into a literal, missing path
+/// (#1918). Such commands take the `-c` wrap, which hands the original text to
+/// a shell unchanged (#1862). Quoted metacharacters (`grep -n 'a.*b' f`) are
+/// literal to the shell too, so they keep the direct rewrite.
+fn has_shell_expansion(cmd: &str) -> bool {
+    cmd.contains(['$', '`']) || has_unquoted_glob(cmd)
+}
+
+/// True when `cmd` contains `*`, `?`, `[` or `{` outside single/double quotes
+/// and not backslash-escaped — i.e. a word the shell would glob or
+/// brace-expand.
+fn has_unquoted_glob(cmd: &str) -> bool {
+    let mut single = false;
+    let mut double = false;
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !single => {
+                chars.next();
+            }
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '*' | '?' | '[' | '{' if !single && !double => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Rewrites cat/head/tail to lean-ctx read with appropriate arguments.
@@ -521,8 +641,8 @@ fn rewrite_get_content(parts: &[String], binary: &str) -> Option<String> {
 }
 
 /// Returns true if the path clearly points outside the current project.
-/// Paths starting with `~`, `$`, or absolute paths that don't resolve
-/// within the working directory should not be intercepted.
+/// Paths starting with `~`, `$`, well-known system/config locations, and any
+/// path the jailed `lean-ctx read` would refuse should not be intercepted.
 pub(super) fn is_outside_project_path(path: &str) -> bool {
     let trimmed = path.trim();
 
@@ -560,7 +680,9 @@ pub(super) fn is_outside_project_path(path: &str) -> bool {
         }
     }
 
-    false
+    // #1903: `lean-ctx read` enforces the PathJail, so anything it would refuse
+    // (`../../etc/hosts`, a sibling checkout, a broad-root CWD) stays native.
+    crate::cli::cli_read_is_refused(trimmed)
 }
 
 /// #1537: whether a head/tail invocation uses byte-count semantics (`-c N`,
@@ -692,10 +814,8 @@ pub(super) fn build_rewrite_compound(cmd: &str, binary: &str) -> Option<String> 
         return None;
     }
 
-    let is_leanctx = |c: &str| c.starts_with("lean-ctx ") || c.starts_with(&format!("{binary} "));
-
     // A segment is already a lean-ctx call → don't nest `-c "… lean-ctx -c …"`.
-    if commands.iter().any(|c| is_leanctx(c)) {
+    if commands.iter().any(|c| is_leanctx_call(c, binary)) {
         return None;
     }
 
@@ -705,7 +825,8 @@ pub(super) fn build_rewrite_compound(cmd: &str, binary: &str) -> Option<String> 
     // new block" concern only applies when the user has shell_security = off —
     // in that case lean-ctx -c won't enforce anyway.
     if commands.iter().any(|c| is_rewritable(c))
-        && (crate::core::shell_allowlist::passes_enforced(cmd) || needs_enforcement_wrap(cmd))
+        && (crate::core::shell_allowlist::passes_enforced(cmd)
+            || needs_enforcement_wrap(cmd, binary))
     {
         return Some(wrap_single_command(cmd, binary));
     }
@@ -715,7 +836,7 @@ pub(super) fn build_rewrite_compound(cmd: &str, binary: &str) -> Option<String> 
     // rewritable tail stayed native. For `&&`/`||`/`;` chains without pipes,
     // rewrite each directly-mappable file-read segment in place and keep the
     // rest native.
-    rewrite_segments_in_place(&segments, binary)
+    rewrite_segments_in_place(&segments, &shell_quote(binary))
 }
 
 /// Rewrites file-read segments of a `&&`/`||`/`;` chain in place (#1279).
@@ -743,7 +864,10 @@ pub(super) fn rewrite_segments_in_place(
             }
             Segment::Command(c) => {
                 let c = c.trim();
-                if let Some(r) = rewrite_file_read_command(c, binary) {
+                if let Some(r) = (!has_shell_expansion(c))
+                    .then(|| rewrite_file_read_command(c, binary))
+                    .flatten()
+                {
                     out.push_str(&r);
                     rewrote = true;
                 } else {
@@ -839,6 +963,42 @@ fn is_self_install_command(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::rewrite_candidate;
+
+    /// #2088: the hook's own `-c` wrap, spelled with the binary path it emits
+    /// (Windows npm install, with and without a space in the path), must never
+    /// be wrapped again. Each hook pass used to add one more `-c` layer, and the
+    /// nested POSIX quoting then broke apart in the inner shell.
+    #[test]
+    fn own_wrap_by_binary_path_is_never_wrapped_again() {
+        // Default allowlist and mode: no process-wide env override, which would
+        // leak into parallel rewrite tests that hold no lock.
+        let outcomes: Vec<_> = [
+            "C:/Users/User/AppData/Roaming/npm/node_modules/lean-ctx-bin/bin/lean-ctx.exe",
+            "C:/Users/First Last/AppData/Roaming/npm/node_modules/lean-ctx-bin/bin/lean-ctx.exe",
+        ]
+        .into_iter()
+        .map(|binary| {
+            let once = super::wrap_single_command("python parse_elf.py", binary);
+            (
+                once.clone(),
+                crate::core::shell_allowlist::passes_enforced(&once),
+                rewrite_candidate(&once, binary),
+                super::needs_enforcement_wrap(&once, binary),
+                super::rewrite_skip_reason(&once, binary),
+            )
+        })
+        .collect();
+
+        for (once, allowlisted, rewritten, wrap_again, reason) in outcomes {
+            assert!(
+                !allowlisted,
+                "precondition: the path form itself is not allowlisted: {once}"
+            );
+            assert_eq!(rewritten, None, "{once}");
+            assert!(!wrap_again, "must not nest another -c layer: {once}");
+            assert_eq!(reason, "already a lean-ctx command", "{once}");
+        }
+    }
 
     #[test]
     fn disabled_prefix_skips_rewrite() {

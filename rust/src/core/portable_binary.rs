@@ -16,6 +16,17 @@ pub(crate) fn hook_binary_override() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Identify our hook executable without treating arbitrary user wrappers as owned.
+pub(crate) fn is_lean_ctx_hook_binary(binary: &str) -> bool {
+    let binary = binary.trim().trim_matches(['\'', '"']);
+    let name = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
+    matches!(
+        name,
+        "lean-ctx" | "lean-ctx.exe" | "lean-ctx.cmd" | "lean-ctx.bat"
+    ) || hook_binary_override()
+        .is_some_and(|configured| configured.trim_matches(['\'', '"']) == binary)
+}
+
 pub(crate) fn resolve_portable_binary() -> String {
     let current = std::env::current_exe()
         .ok()
@@ -32,6 +43,141 @@ pub(crate) fn resolve_portable_binary() -> String {
         .filter(|s| !s.is_empty());
 
     choose_binary_path(current.as_deref(), which_raw.as_deref())
+}
+
+/// File names a `lean-ctx` launcher can have inside a `PATH` directory.
+const LAUNCHER_NAMES: &[&str] = if cfg!(windows) {
+    &["lean-ctx.exe", "lean-ctx.cmd"]
+} else {
+    &["lean-ctx"]
+};
+
+/// The directories on `PATH`, in lookup order.
+pub(crate) fn path_dirs() -> Vec<std::path::PathBuf> {
+    std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .filter(|d| !d.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when `dir` is one of `path_dirs`, directly or through a symlink.
+pub(crate) fn dir_on_path(dir: &std::path::Path, path_dirs: &[std::path::PathBuf]) -> bool {
+    let canonical = std::fs::canonicalize(dir).ok();
+    path_dirs
+        .iter()
+        .any(|d| d == dir || (canonical.is_some() && std::fs::canonicalize(d).ok() == canonical))
+}
+
+/// Every `lean-ctx` launcher on `PATH`, in lookup order: the entry a shell
+/// runs for `lean-ctx`, followed by the ones it shadows.
+pub(crate) fn launchers_on_path(path_dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    path_dirs
+        .iter()
+        .filter_map(|d| {
+            LAUNCHER_NAMES
+                .iter()
+                .map(|name| d.join(name))
+                .find(|p| p.is_file())
+        })
+        .collect()
+}
+
+/// The binary path to embed in machine-local shell artifacts — the shell
+/// hooks, `env.sh` and the `_lc` shims (#1851).
+///
+/// Package managers expose `lean-ctx` on `PATH` through a stable entry (a
+/// Homebrew symlink, a scoop shim, an npm or mise launcher) while the binary
+/// itself lives in a versioned directory off `PATH`. The first launcher on
+/// `PATH` that is verified to run this installation — a symlink to it, a Scoop
+/// shim naming it, a mise/asdf shim owning its install tree — is embedded
+/// instead, so artifacts follow updates. An unrelated build on `PATH` must
+/// never replace an explicitly selected Pro/custom installation.
+pub(crate) fn stable_shell_binary(binary: &str) -> String {
+    stable_shell_binary_in(binary, &path_dirs())
+}
+
+/// The binary path to write into agent configurations — MCP server `command`
+/// fields and agent hooks (#1873).
+///
+/// These outlive the running build just like the shell artifacts of #1851: a
+/// Scoop or Homebrew install runs from a versioned directory the next update
+/// removes, which left every configured MCP server pointing at a deleted
+/// binary. A stable launcher is used only when its target identity is verified
+/// (see [`stable_shell_binary`]); otherwise the exact binary is kept.
+pub(crate) fn resolve_agent_binary() -> String {
+    stable_shell_binary(&resolve_portable_binary())
+}
+
+fn stable_shell_binary_in(binary: &str, path_dirs: &[std::path::PathBuf]) -> String {
+    let path = std::path::Path::new(binary);
+    if !path.is_absolute() || path.parent().is_some_and(|d| dir_on_path(d, path_dirs)) {
+        return binary.to_string();
+    }
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return binary.to_string();
+    };
+    launchers_on_path(path_dirs)
+        .iter()
+        .find(|launcher| launcher_runs(launcher, &canonical))
+        .map_or_else(
+            || binary.to_string(),
+            |p| sanitize_exe_path(&p.to_string_lossy()),
+        )
+}
+
+/// True when running `launcher` is verified to execute the installation of
+/// `target` (canonical) — never merely because it is named `lean-ctx`.
+fn launcher_runs(launcher: &std::path::Path, target: &std::path::Path) -> bool {
+    std::fs::canonicalize(launcher).is_ok_and(|l| l == target)
+        || scoop_shim_target(launcher)
+            .is_some_and(|t| std::fs::canonicalize(t).is_ok_and(|t| t == target))
+        || version_manager_shim_owns(launcher, target)
+}
+
+/// Upper bound for a Scoop `.shim` file; real ones are one or two lines.
+const MAX_SHIM_BYTES: u64 = 4096;
+
+/// The executable a Scoop shim runs (#1873). Scoop's `shims\lean-ctx.exe` is a
+/// generic launcher that reads `path = "…\apps\lean-ctx\current\lean-ctx.exe"`
+/// from the sibling `lean-ctx.shim`; `current` is a junction to the versioned
+/// directory, so the canonical target is the running build.
+fn scoop_shim_target(launcher: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(launcher.with_extension("shim"))
+        .ok()?
+        .take(MAX_SHIM_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_SHIM_BYTES {
+        return None;
+    }
+    text.lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "path").then(|| std::path::PathBuf::from(value.trim().trim_matches('"')))
+        })
+        .filter(|p| p.is_absolute())
+}
+
+/// mise and asdf keep a `shims` directory next to an `installs` tree
+/// (`<data>/shims/lean-ctx`, `<data>/installs/<tool>/<version>/…`). Their shim
+/// dispatches only into that tree, so it owns every binary inside it and keeps
+/// working after the versioned directory is upgraded away.
+fn version_manager_shim_owns(launcher: &std::path::Path, target: &std::path::Path) -> bool {
+    let Some(shims) = launcher.parent() else {
+        return false;
+    };
+    if shims.file_name() != Some(std::ffi::OsStr::new("shims")) {
+        return false;
+    }
+    shims.parent().is_some_and(|root| {
+        std::fs::canonicalize(root.join("installs"))
+            .is_ok_and(|installs| target.starts_with(installs))
+    })
 }
 
 /// Decide which `lean-ctx` path to bake into generated artifacts (autostart
@@ -56,11 +202,13 @@ pub(crate) fn resolve_portable_binary() -> String {
 /// while the proxy/MCP config captured the fresh build — silently running two
 /// different builds at once.
 fn choose_binary_path(current_exe: Option<&str>, which_raw: Option<&str>) -> String {
+    // `target/{debug,release}` plus a relocated `[build] target-dir` whose name
+    // ends in `target` (e.g. a machine-wide `~/.cargo/shared-target`).
     let is_build_artifact = |p: &str| {
-        p.contains("/target/debug/")
-            || p.contains("/target/release/")
-            || p.contains("\\target\\debug\\")
-            || p.contains("\\target\\release\\")
+        p.split(['/', '\\'])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0].ends_with("target") && matches!(w[1], "debug" | "release"))
     };
 
     // 1. Prefer the running binary when it lives in a stable install location.
@@ -194,17 +342,14 @@ mod tests {
     #[test]
     fn hook_binary_override_env_is_verbatim_and_blank_is_none() {
         let _lock = crate::core::data_dir::test_env_lock();
-        // SAFETY: serialized by test_env_lock.
-        unsafe { std::env::set_var("LEAN_CTX_HOOK_BINARY", "$HOME/.local/bin/lean-ctx") };
+        crate::test_env::set_var("LEAN_CTX_HOOK_BINARY", "$HOME/.local/bin/lean-ctx");
         assert_eq!(
             hook_binary_override().as_deref(),
             Some("$HOME/.local/bin/lean-ctx")
         );
-        // SAFETY: serialized by test_env_lock.
-        unsafe { std::env::set_var("LEAN_CTX_HOOK_BINARY", "   ") };
+        crate::test_env::set_var("LEAN_CTX_HOOK_BINARY", "   ");
         assert_eq!(hook_binary_override(), None);
-        // SAFETY: serialized by test_env_lock.
-        unsafe { std::env::remove_var("LEAN_CTX_HOOK_BINARY") };
+        crate::test_env::remove_var("LEAN_CTX_HOOK_BINARY");
     }
 
     #[test]
@@ -265,6 +410,23 @@ mod tests {
         }
 
         #[test]
+        fn relocated_target_dir_falls_back_to_path() {
+            // A machine-wide `[build] target-dir` must not be baked into the
+            // autostart plists: every other worktree's build overwrites it.
+            let chosen = choose_binary_path(
+                Some("/Users/dev/.cargo/shared-target/release/lean-ctx"),
+                Some("/Users/dev/.local/bin/lean-ctx"),
+            );
+            assert_eq!(chosen, "/Users/dev/.local/bin/lean-ctx");
+            // A bare `release` directory outside any target dir is an install.
+            let chosen = choose_binary_path(
+                Some("/opt/lean-ctx/release/lean-ctx"),
+                Some("/Users/dev/.local/bin/lean-ctx"),
+            );
+            assert_eq!(chosen, "/opt/lean-ctx/release/lean-ctx");
+        }
+
+        #[test]
         fn build_artifact_without_path_keeps_absolute_current_exe() {
             // No installed copy on PATH -> an absolute build path still beats the
             // bare name, so generated hooks stay absolute (#367).
@@ -287,5 +449,206 @@ mod tests {
             );
             assert_eq!(chosen, "/Users/dev/.local/bin/lean-ctx");
         }
+    }
+
+    /// #1851: package-manager layouts, a versioned install dir off PATH and a
+    /// stable launcher dir on it.
+    #[cfg(unix)]
+    mod stable_shell_binary {
+        use super::super::*;
+        use std::path::{Path, PathBuf};
+
+        fn launcher(dir: &Path) -> PathBuf {
+            std::fs::create_dir_all(dir).unwrap();
+            let path = dir.join("lean-ctx");
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            path
+        }
+
+        #[test]
+        fn binary_in_a_path_dir_is_kept() {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = launcher(&tmp.path().join("bin"));
+            let other = launcher(&tmp.path().join("other"));
+            let dirs: Vec<PathBuf> =
+                vec![other.parent().unwrap().into(), bin.parent().unwrap().into()];
+            let bin = bin.to_string_lossy();
+            assert_eq!(stable_shell_binary_in(&bin, &dirs), bin);
+        }
+
+        #[test]
+        fn versioned_install_dir_resolves_to_the_path_launcher() {
+            let tmp = tempfile::tempdir().unwrap();
+            let cellar = launcher(&tmp.path().join("Cellar/lean-ctx/3.10.2/bin"));
+            let unrelated = launcher(&tmp.path().join("other"));
+            let shims = tmp.path().join("shims/lean-ctx");
+            std::fs::create_dir_all(shims.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&cellar, &shims).unwrap();
+            let dirs = vec![
+                unrelated.parent().unwrap().into(),
+                shims.parent().unwrap().into(),
+            ];
+            assert_eq!(
+                stable_shell_binary_in(&cellar.to_string_lossy(), &dirs),
+                shims.to_string_lossy()
+            );
+        }
+
+        #[test]
+        fn symlinked_path_dir_counts_as_on_path() {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = launcher(&tmp.path().join("real"));
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(bin.parent().unwrap(), &link).unwrap();
+            let bin = bin.to_string_lossy();
+            assert_eq!(stable_shell_binary_in(&bin, &[link]), bin);
+        }
+
+        #[test]
+        fn no_launcher_on_path_keeps_the_binary() {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = launcher(&tmp.path().join("apps/3.10.2"));
+            let bin = bin.to_string_lossy();
+            assert_eq!(stable_shell_binary_in(&bin, &[tmp.path().join("x")]), bin);
+            assert_eq!(stable_shell_binary_in("lean-ctx", &[]), "lean-ctx");
+        }
+
+        #[test]
+        fn unrelated_public_launcher_keeps_the_selected_binary() {
+            let tmp = tempfile::tempdir().unwrap();
+            let selected = launcher(&tmp.path().join("private-install"));
+            let public = launcher(&tmp.path().join("public-bin"));
+            let selected = selected.to_string_lossy();
+            assert_eq!(
+                stable_shell_binary_in(&selected, &[public.parent().unwrap().into()]),
+                selected
+            );
+        }
+
+        fn shim_file(launcher: &Path, target: &Path) {
+            let body = format!("path = \"{}\"\nargs = \n", target.display());
+            std::fs::write(launcher.with_extension("shim"), body).unwrap();
+        }
+
+        #[test]
+        fn shim_file_naming_the_binary_verifies_the_launcher() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe = launcher(&tmp.path().join("apps/lean-ctx/3.10.4"));
+            let shim = launcher(&tmp.path().join("shims"));
+            shim_file(&shim, &exe);
+            assert_eq!(
+                stable_shell_binary_in(&exe.to_string_lossy(), &[shim.parent().unwrap().into()]),
+                shim.to_string_lossy()
+            );
+        }
+
+        #[test]
+        fn shim_file_naming_another_binary_is_ignored() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe = launcher(&tmp.path().join("private-install"));
+            let public = launcher(&tmp.path().join("apps/lean-ctx/3.10.4"));
+            let shim = launcher(&tmp.path().join("shims"));
+            shim_file(&shim, &public);
+            let exe = exe.to_string_lossy();
+            assert_eq!(
+                stable_shell_binary_in(&exe, &[shim.parent().unwrap().into()]),
+                exe
+            );
+        }
+
+        #[test]
+        fn oversized_shim_file_is_ignored() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe = launcher(&tmp.path().join("apps/lean-ctx/3.10.4"));
+            let shim = launcher(&tmp.path().join("shims"));
+            let padding = " ".repeat(MAX_SHIM_BYTES as usize);
+            let body = format!("{padding}\npath = \"{}\"\n", exe.display());
+            std::fs::write(shim.with_extension("shim"), body).unwrap();
+            let exe = exe.to_string_lossy();
+            assert_eq!(
+                stable_shell_binary_in(&exe, &[shim.parent().unwrap().into()]),
+                exe
+            );
+        }
+
+        #[test]
+        fn version_manager_shim_owning_the_install_tree_is_used() {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("mise");
+            let exe = launcher(&data.join("installs/lean-ctx/3.10.4/bin"));
+            let shim = launcher(&data.join("shims"));
+            assert_eq!(
+                stable_shell_binary_in(&exe.to_string_lossy(), &[shim.parent().unwrap().into()]),
+                shim.to_string_lossy()
+            );
+        }
+
+        #[test]
+        fn version_manager_shim_of_another_tree_is_ignored() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe = launcher(&tmp.path().join("private/installs/lean-ctx/3.10.4/bin"));
+            let data = tmp.path().join("mise");
+            launcher(&data.join("installs/lean-ctx/3.10.4/bin"));
+            let shim = launcher(&data.join("shims"));
+            let exe = exe.to_string_lossy();
+            assert_eq!(
+                stable_shell_binary_in(&exe, &[shim.parent().unwrap().into()]),
+                exe
+            );
+        }
+    }
+
+    /// #1873: a Scoop install runs from `apps\lean-ctx\<version>`, which the
+    /// next update removes; MCP configs must get the shim on PATH instead.
+    #[cfg(windows)]
+    #[test]
+    fn scoop_versioned_exe_resolves_to_the_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let apps = tmp.path().join("apps").join("lean-ctx").join("3.10.4");
+        let shims = tmp.path().join("shims");
+        for dir in [&apps, &shims] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("lean-ctx.exe"), b"").unwrap();
+        }
+        let exe = apps.join("lean-ctx.exe");
+        std::fs::write(
+            shims.join("lean-ctx.shim"),
+            format!("path = \"{}\"\r\n", exe.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            stable_shell_binary_in(&exe.to_string_lossy(), &[shims.clone()]),
+            sanitize_exe_path(&shims.join("lean-ctx.exe").to_string_lossy())
+        );
+    }
+
+    /// An opaque Windows launcher without a `.shim` naming the running build
+    /// does not establish executable identity.
+    #[cfg(windows)]
+    #[test]
+    fn unverified_scoop_shim_keeps_the_selected_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let apps = tmp.path().join("apps").join("lean-ctx").join("3.10.4");
+        let shims = tmp.path().join("shims");
+        for dir in [&apps, &shims] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("lean-ctx.exe"), b"").unwrap();
+        }
+        let exe = apps.join("lean-ctx.exe");
+        assert_eq!(
+            stable_shell_binary_in(&exe.to_string_lossy(), &[shims.clone()]),
+            exe.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn agent_binary_is_absolute() {
+        // #1873: MCP hosts spawn `command` directly, so the stable-launcher
+        // mapping must never degrade the path to a bare name.
+        let resolved = resolve_agent_binary();
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "resolve_agent_binary must return an absolute path, got: {resolved}"
+        );
     }
 }

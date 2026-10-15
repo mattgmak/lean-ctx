@@ -183,6 +183,16 @@ pub struct ProxyConfig {
     /// across turns (cache-safe). Env `LEAN_CTX_PROXY_OUTPUT_HOLDOUT`. See
     /// [`ProxyConfig::output_holdout_fraction`].
     pub output_holdout: Option<f64>,
+    /// Fraction `0.0..=1.0` of conversations placed in the input-compression
+    /// control arm (#1905). `0` (default) = no holdout. When `> 0`, a
+    /// deterministic cohort (salted separately from `output_holdout`) puts ~this
+    /// fraction of conversations in a control arm whose requests are forwarded
+    /// without any of the proxy's input compression (tool-output compression,
+    /// history pruning, prose rewriting, cold-prefix repack) but still metered,
+    /// so the input-token reduction is measured against a real uncompressed
+    /// baseline. Env `LEAN_CTX_PROXY_COMPRESSION_HOLDOUT`. See
+    /// [`ProxyConfig::compression_holdout_fraction`].
+    pub compression_holdout: Option<f64>,
     /// Opt-in cache-safe wire verbosity steer (#895). When `true`, the proxy
     /// appends a single constant "be concise" instruction to the last user turn
     /// of each request (output-shaping for non-rules-aware API clients). The
@@ -300,26 +310,20 @@ impl BaselineConfig {
     }
 }
 
-/// `[proxy.routing]` — the active router's rule set (enterprise#13).
+/// `[proxy.routing]` — explicit, operator-written model targets.
 ///
-/// Two mechanisms, both **within-shape** in M1 (the target must speak the same
-/// wire dialect as the request; N×M shape translation is M2):
-///
-/// - **Aliases**: exact requested-model → target. Lets an org expose stable
-///   names (`acme/fast`) or transparently swap one concrete model for another.
-/// - **Tiers**: intent-based downgrade. The request's last user message is
-///   classified (`intent_router`); the resulting tier (`fast|standard|premium`)
-///   picks a target from this table. An absent tier key (or `""`) keeps the
-///   requested model — premium work is never silently downgraded unless the
-///   operator says so.
+/// **Aliases** map an exact requested model to a fixed target, e.g. an org
+/// name (`acme/fast`) onto an approved endpoint or a local model. LeanCTX never
+/// chooses a model by itself: automatic, intent- or cost-based selection was
+/// removed in v4 (the gateway decides *what* may leave, not *which* model).
 ///
 /// A target is `"model"` (swap the model, keep the upstream) or
 /// `"provider:model"` where `provider` is a `[[proxy.providers]]` registry id
 /// or a built-in (`anthropic|openai|gemini`) — then the request is also
 /// re-targeted to that provider's upstream.
 ///
-/// **Fail-open by construction:** any lookup/classification/validation miss
-/// routes nothing and forwards the request unchanged.
+/// **Fail-open by construction:** an unknown alias or unreachable target
+/// forwards the request unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RoutingRules {
@@ -328,8 +332,9 @@ pub struct RoutingRules {
     /// Exact model-name aliases: requested model → `"provider:model"` | `"model"`.
     /// BTreeMap for deterministic iteration/serialization (#498).
     pub aliases: std::collections::BTreeMap<String, String>,
-    /// Intent-tier targets: `fast|standard|premium` → `"provider:model"` |
-    /// `"model"` | `""` (= keep requested model).
+    /// Removed intent-tier table. Still parsed so `doctor` can tell an operator
+    /// that it no longer routes anything; never read by the proxy.
+    #[serde(skip_serializing)]
     pub tiers: std::collections::BTreeMap<String, String>,
 }
 
@@ -337,7 +342,7 @@ impl RoutingRules {
     /// True when the router should run at all.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.enabled.unwrap_or(false) && !(self.aliases.is_empty() && self.tiers.is_empty())
+        self.enabled.unwrap_or(false) && !self.aliases.is_empty()
     }
 }
 
@@ -543,12 +548,14 @@ pub enum ProseRole {
 /// Instead of configuring 8+ individual booleans, operators pick a single mode
 /// that resolves sensible defaults. Explicit per-knob overrides always win.
 ///
-/// - `Cache` (default): maximise provider prompt-cache hit rate. History is
+/// - `Cache`: maximise provider prompt-cache hit rate. History is
 ///   frozen at staircase boundaries, breakpoints are injected, volatile fields
 ///   are detected, and the live tail is compressed — but the prefix is never
 ///   rewritten.
-/// - `Token`: maximise raw token reduction. History may be rewritten, cold
-///   prefixes repacked, and volatile fields relocated. Best for short one-shot
+/// - `Token` (default for the knob presets): maximise raw token reduction.
+///   Cold prefixes may be repacked and volatile fields relocated. History is
+///   only rewritten (rolling) when `token` is chosen explicitly; an unset mode
+///   keeps cache-aware history pruning (#1895). Best for short one-shot
 ///   requests where cache reuse is unlikely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyMode {
@@ -645,9 +652,12 @@ impl ProxyConfig {
     }
 
     /// Resolved history mode: `LEAN_CTX_PROXY_HISTORY_MODE` env var wins,
-    /// then `[proxy].history_mode` in config.toml, then cache-aware.
+    /// then `[proxy].history_mode` in config.toml, then the preset of an
+    /// *explicitly chosen* `proxy_mode` (`token` → rolling, `cache` →
+    /// cache-aware), then cache-aware.
     /// Unknown values fall back to the default so a typo can never silently
-    /// re-enable the cache-hostile rolling mode.
+    /// re-enable the cache-hostile rolling mode — and neither can the implicit
+    /// `Token` default of [`Self::resolved_proxy_mode`] (#1895).
     pub fn resolved_history_mode(&self) -> HistoryMode {
         let raw = std::env::var("LEAN_CTX_PROXY_HISTORY_MODE")
             .ok()
@@ -660,9 +670,12 @@ impl ProxyConfig {
                 return HistoryMode::Off;
             }
         }
-        match self.resolved_proxy_mode() {
-            ProxyMode::Token => HistoryMode::Rolling,
-            ProxyMode::Cache => HistoryMode::CacheAware,
+        let explicit_mode = std::env::var("LEAN_CTX_PROXY_MODE")
+            .ok()
+            .or_else(|| self.proxy_mode.clone());
+        match explicit_mode.as_deref().and_then(ProxyMode::parse) {
+            Some(ProxyMode::Token) => HistoryMode::Rolling,
+            Some(ProxyMode::Cache) | None => HistoryMode::CacheAware,
         }
     }
 
@@ -713,6 +726,21 @@ impl ProxyConfig {
             .and_then(|v| v.trim().parse::<f64>().ok());
         from_env
             .or(self.output_holdout)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Resolved input-compression holdout fraction (#1905), clamped to `[0,1]`.
+    /// Precedence: `LEAN_CTX_PROXY_COMPRESSION_HOLDOUT` env > `[proxy]
+    /// compression_holdout` > `0.0` (no holdout). An unparseable/blank env value
+    /// is ignored, as for [`ProxyConfig::output_holdout_fraction`].
+    #[must_use]
+    pub fn compression_holdout_fraction(&self) -> f64 {
+        let from_env = std::env::var("LEAN_CTX_PROXY_COMPRESSION_HOLDOUT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok());
+        from_env
+            .or(self.compression_holdout)
             .unwrap_or(0.0)
             .clamp(0.0, 1.0)
     }

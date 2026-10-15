@@ -92,7 +92,7 @@ pub(super) fn format_background_state(
                 BackgroundJobState::Failed
             };
             let head = format!("[background:{id} {}, exit {exit_code}]", state.as_str());
-            let footer = (exit_code != 0).then(|| format!("[exit:{exit_code}]"));
+            let footer = crate::shell::exit_status::exit_marker(exit_code);
             (
                 output.clone(),
                 ShellOutcome::Background(BackgroundShellOutcome {
@@ -158,6 +158,10 @@ pub(super) fn redact_shell_output_secrets(output: &str) -> String {
     let (redacted, matches) =
         crate::core::secret_detection::scan_and_redact(&output, &cfg.secret_detection);
     if !matches.is_empty() {
+        crate::core::security_events::note(
+            crate::core::security_events::SecurityKind::SecretRedacted,
+            matches.len(),
+        );
         let names: Vec<&str> = matches.iter().map(|m| m.pattern_name).collect();
         tracing::warn!(
             "[SHELL SECRET REDACTION] {} secret(s) redacted from shell output: {}",

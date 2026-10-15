@@ -170,10 +170,30 @@ fn probe_endpoint(provider_type: &str, endpoint: &str) -> Result<(), String> {
         ),
         _ => agent.get(endpoint),
     };
-    request
+    let response = request
         .call()
-        .map(|_| ())
-        .map_err(|error| format!("{provider_type} connectivity probe failed: {error}"))
+        .map_err(|error| format!("{provider_type} connectivity probe failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "{provider_type} connectivity probe failed: HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn health_probe_rejects_redirects_without_contacting_the_target() {
+    use super::hardened_http::redirect_tests::Server;
+    let target = Server::new(200, None, "[]");
+    let origin = Server::new(302, Some(&target.url), "synthetic-private-error");
+    let error = probe_endpoint("fixture", &origin.url).unwrap_err();
+    assert!(error.contains("302"));
+    assert!(!error.contains("synthetic-private-error"));
+    assert_eq!(origin.count(), 1);
+    assert_eq!(target.count(), 0);
+    assert!(probe_endpoint("fixture", &target.url).is_ok());
 }
 
 fn cache_health(provider_id: &str) -> (bool, Option<u64>) {
@@ -257,14 +277,11 @@ fn format_provider_health(provider: &ProviderHealth) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
 
     use super::{
         ConnectivityProbe, ProviderHealth, build_report, check_provider_health,
         env_var_for_provider, format_health_report,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn health(reachable: bool, cache_fresh: bool) -> ProviderHealth {
         ProviderHealth {
@@ -290,20 +307,15 @@ mod tests {
 
     #[test]
     fn test_provider_health_env_only_available() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::core::data_dir::test_env_lock();
         let original = std::env::var_os("GITHUB_TOKEN");
-        // SAFETY: test-only, serialized by ENV_LOCK
-        unsafe {
-            std::env::set_var("GITHUB_TOKEN", "test-token");
-        }
+        crate::test_env::set_var("GITHUB_TOKEN", "test-token");
 
         let result = check_provider_health("github-test", "github", ConnectivityProbe::EnvOnly);
 
         match original {
-            // SAFETY: test-only, serialized by ENV_LOCK
-            Some(value) => unsafe { std::env::set_var("GITHUB_TOKEN", value) },
-            // SAFETY: test-only, serialized by ENV_LOCK
-            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
+            Some(value) => crate::test_env::set_var("GITHUB_TOKEN", value),
+            None => crate::test_env::remove_var("GITHUB_TOKEN"),
         }
         assert!(result.reachable);
         assert!(result.latency_ms.is_none());
@@ -312,20 +324,14 @@ mod tests {
 
     #[test]
     fn test_provider_health_env_only_unavailable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::core::data_dir::test_env_lock();
         let original = std::env::var_os("GITHUB_TOKEN");
-        // SAFETY: test-only, serialized by ENV_LOCK
-        unsafe {
-            std::env::remove_var("GITHUB_TOKEN");
-        }
+        crate::test_env::remove_var("GITHUB_TOKEN");
 
         let result = check_provider_health("github-test", "github", ConnectivityProbe::EnvOnly);
 
         if let Some(value) = original {
-            // SAFETY: test-only, serialized by ENV_LOCK
-            unsafe {
-                std::env::set_var("GITHUB_TOKEN", value);
-            }
+            crate::test_env::set_var("GITHUB_TOKEN", value);
         }
         assert!(!result.reachable);
         assert_eq!(result.error.as_deref(), Some("GITHUB_TOKEN not set"));

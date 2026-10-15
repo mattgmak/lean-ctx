@@ -1,5 +1,6 @@
 //! Inline tests extracted from ctx_read.rs (#660 LOC gate).
 use super::*;
+use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn engine_test_context(root: &std::path::Path, path: &std::path::Path) -> ToolContext {
@@ -125,10 +126,12 @@ fn per_file_lock_allows_parallel_different_paths() {
     assert!(max_concurrent.load(Ordering::SeqCst) > 1);
 }
 
-/// The primary MCP handler must consult cross-agent delivery only after its
-/// session-local stub miss and before it starts the disk/compression pipeline.
+/// #1909: a content-free delivery recorded by *another* agent must never be
+/// served as a stub — the requester's context does not hold that content. The
+/// MCP handler has to fall through to a real read. Unlike main's legacy-mode
+/// exception, a metadata-only record is never usable context here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_ctx_read_serves_cross_agent_delivery_stub_before_disk_read() {
+async fn mcp_ctx_read_withholds_content_free_cross_agent_stub() {
     use crate::core::cache::SessionCache;
     use crate::core::ocla::OclaRegistry;
     use crate::core::ocla::types::DeliveryEntry;
@@ -140,31 +143,22 @@ async fn mcp_ctx_read_serves_cross_agent_delivery_stub_before_disk_read() {
     let file = dir.path().join("cross-agent-mcp.rs");
     std::fs::write(&file, "fn only_the_remote_agent_read_this() {}\n").unwrap();
     let path = file.to_string_lossy().to_string();
-    let bytes = std::fs::read(&file).unwrap();
-    let hash = blake3::hash(&bytes);
-    let mut blake3_prefix = [0u8; 12];
-    blake3_prefix.copy_from_slice(&hash.as_bytes()[..12]);
-    let mtime = std::fs::metadata(&file)
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let requester = std::env::var("CURSOR_TASK_ID")
-        .or_else(|_| std::env::var("CLAUDECODE"))
-        .unwrap_or_else(|_| "local-agent".to_string());
-    let remote_agent = format!("{requester}-remote");
+    let fp = crate::tools::ctx_read::file_blake3_prefix(&path).unwrap();
+    let remote_agent = format!(
+        "{}-remote",
+        crate::core::agent_identity::delivery_agent_id()
+    );
     OclaRegistry::global()
         .delivery_registry
         .record_delivery(DeliveryEntry {
-            blake3: blake3_prefix,
+            access: None,
+            blake3: fp.hash,
             path: path.clone(),
-            line_count: 1,
+            line_count: fp.line_count,
             token_count: 12,
             agent_id: remote_agent.clone(),
             conversation_id: remote_agent,
-            mtime,
+            mtime: fp.mtime,
             relay_content: None,
             relay_mode: None,
         });
@@ -176,19 +170,24 @@ async fn mcp_ctx_read_serves_cross_agent_delivery_stub_before_disk_read() {
         session: Some(Arc::new(RwLock::new(SessionState::new()))),
         ..ToolContext::default()
     };
-    let args = json!({ "path": path, "mode": "auto" })
-        .as_object()
-        .unwrap()
-        .clone();
-
-    let output = tokio::task::block_in_place(|| CtxReadTool.handle(&args, &ctx))
-        .expect("ctx_read must serve the cross-agent delivery stub");
-    assert!(output.text.contains("[cross-agent"), "got: {}", output.text);
-    assert!(
-        !output.text.contains("only_the_remote_agent_read_this"),
-        "cross-agent hit must return before disk content is read: {}",
-        output.text
-    );
+    for mode in ["auto", "signatures"] {
+        let args = json!({ "path": path, "mode": mode, "fresh": mode == "signatures" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let output = tokio::task::block_in_place(|| CtxReadTool.handle(&args, &ctx))
+            .expect("ctx_read must succeed");
+        assert!(
+            !output.text.contains("[cross-agent"),
+            "mode={mode}: content-free stub leaked: {}",
+            output.text
+        );
+        assert!(
+            output.text.contains("only_the_remote_agent_read_this"),
+            "mode={mode}: requester must receive the content: {}",
+            output.text
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -233,7 +232,7 @@ async fn mcp_aggressive_read_records_deterministic_engine_receipt() {
         .expect("real ctx_read aggressive path succeeds");
     assert_eq!(output.mode.as_deref(), Some("aggressive"));
     assert!(output.text.contains("stable_engine_path"));
-    assert_eq!(output.text, legacy.text);
+    assert!(legacy.text.contains("stable_engine_path"));
     let repeated = tokio::task::block_in_place(|| CtxReadTool.handle(&args, &ctx))
         .expect("repeated real ctx_read aggressive path succeeds");
     assert_eq!(repeated.text, output.text);
@@ -250,6 +249,21 @@ async fn mcp_aggressive_read_records_deterministic_engine_receipt() {
     );
     let receipt_bytes = std::fs::read(&receipts[0]).unwrap();
     let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes).unwrap();
+    let output_digest = receipt["observation"]["output_digest"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("sha256:")
+        .unwrap();
+    let verified_output = std::fs::read_to_string(
+        data_dir
+            .join("engine-interface/v1/outputs")
+            .join(format!("{output_digest}.txt")),
+    )
+    .unwrap();
+    assert_eq!(
+        output.text, verified_output,
+        "v1 delivers Engine content, not the legacy rendering"
+    );
     assert_eq!(receipt["observation"]["status"], "succeeded");
     assert!(
         receipt["invocation"]["policy_admission"]["policy_ref"]
@@ -456,15 +470,25 @@ async fn omitted_engine_interface_preserves_legacy_image_and_binary_paths() {
     .clone();
     let image_output = tokio::task::block_in_place(|| CtxReadTool.handle(&image_args, &image_ctx))
         .expect("omitted Engine interface must preserve image passthrough");
-    assert_eq!(image_output.content_blocks.as_ref().map(Vec::len), Some(2));
     let direct_image = read_image_file(&image.to_string_lossy())
         .expect("legacy image helper must remain authoritative");
     assert_eq!(image_output.text, direct_image.text);
     assert_eq!(image_output.path, direct_image.path);
     assert_eq!(image_output.mode, direct_image.mode);
+    // The image payload is the legacy helper's, byte for byte; the Context
+    // Gateway only appends its "not inspected" note (developer mode, case 22).
+    let blocks = image_output.content_blocks.as_ref().expect("image blocks");
+    let direct_blocks = direct_image.content_blocks.as_ref().expect("image blocks");
+    assert_eq!(blocks.len(), direct_blocks.len() + 1);
     assert_eq!(
-        serde_json::to_value(&image_output.content_blocks).unwrap(),
-        serde_json::to_value(&direct_image.content_blocks).unwrap()
+        serde_json::to_value(&blocks[..direct_blocks.len()]).unwrap(),
+        serde_json::to_value(direct_blocks).unwrap()
+    );
+    assert!(
+        blocks
+            .last()
+            .and_then(|block| block.as_text())
+            .is_some_and(|text| text.text.contains("coverage.unsupported_media"))
     );
 
     let binary = dir.path().join("legacy-binary.bin");
@@ -670,6 +694,66 @@ async fn mcp_ctx_read_records_new_cross_agent_delivery() {
     assert!(
         delivery.is_some(),
         "MCP read must record its fresh delivery"
+    );
+}
+
+/// A read whose cache write lock stays contended past the deadline still
+/// delivers the file. It used to fail with "cache lock contention … retry in a
+/// moment", which is how 16 parallel cold reads lost a file when the first one
+/// built the tokenizer while holding the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contended_cache_lock_degrades_to_uncached_read() {
+    use crate::core::cache::SessionCache;
+    use crate::core::session::SessionState;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("contended.rs");
+    std::fs::write(&file, "fn contended_lock_payload() {}\n").unwrap();
+    let path = file.to_string_lossy().to_string();
+    let cache = Arc::new(RwLock::new(SessionCache::new()));
+    let ctx = ToolContext {
+        project_root: dir.path().to_string_lossy().to_string(),
+        resolved_paths: std::collections::HashMap::from([("path".to_string(), path.clone())]),
+        cache: Some(cache.clone()),
+        session: Some(Arc::new(RwLock::new(SessionState::new()))),
+        ..ToolContext::default()
+    };
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = cache.blocking_write();
+        locked_tx.send(()).unwrap();
+        // Hold the lock until the read has returned — under a loaded full
+        // suite the read can outlast any fixed hold, and a holder that let go
+        // early would turn this into an uncontended read (and the release send
+        // below into a SendError). The bound only guards a hung read.
+        let _ = release_rx.recv_timeout(std::time::Duration::from_mins(5));
+    });
+    locked_rx.recv().unwrap();
+
+    let args = json!({ "path": path, "mode": "full" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = tokio::task::block_in_place(|| CtxReadTool.handle(&args, &ctx));
+    release_tx
+        .send(())
+        .expect("the lock was still held for the whole read");
+    holder.join().unwrap();
+
+    let output = result.expect("a contended cache lock must not fail the read");
+    assert!(
+        output.text.contains("contended_lock_payload"),
+        "got: {}",
+        output.text
+    );
+    assert!(
+        !output.text.contains("lock contention"),
+        "got: {}",
+        output.text
     );
 }
 
@@ -1259,6 +1343,7 @@ async fn mcp_ctx_read_serves_relay_content_from_another_agent() {
     OclaRegistry::global()
         .delivery_registry
         .record_delivery(DeliveryEntry {
+            access: None,
             blake3: blake3_prefix,
             path: path.clone(),
             line_count: 4,
@@ -1323,9 +1408,13 @@ fn inferred_session_task_does_not_steer_a_read() {
         !task_intent_steers_read(Some("inferred")),
         "a fabricated task must not filter or pin a file"
     );
+    assert!(
+        !task_intent_steers_read(Some("git")),
+        "dirty-file state (often unrelated earlier work) is not a stated task"
+    );
 
-    // Every intent that reflects a real signal still steers.
-    for stated in ["explicit", "plan", "git", "user"] {
+    // Every intent that reflects something the caller or a plan actually said.
+    for stated in ["explicit", "plan", "user"] {
         assert!(
             task_intent_steers_read(Some(stated)),
             "`{stated}` is grounded in something the caller or repo actually said"
@@ -1342,9 +1431,86 @@ fn inferred_session_task_does_not_steer_a_read() {
 /// this fails loudly instead of silently re-enabling the bug (#1590).
 #[test]
 fn auto_inferred_tasks_are_tagged_with_the_marker_we_filter_on() {
+    use crate::core::session::{GIT_TASK_INTENT, INFERRED_TASK_INTENT};
+    assert_eq!(
+        INFERRED_TASK_INTENT, "inferred",
+        "persisted sessions carry it"
+    );
+    assert_eq!(GIT_TASK_INTENT, "git", "persisted sessions carry it");
     let mut state = crate::core::session::SessionState::default();
-    state.set_task("Working on /repo/src/printer (explore)", Some("inferred"));
+    state.set_task(
+        "Working on /repo/src/printer (explore)",
+        Some(INFERRED_TASK_INTENT),
+    );
     let intent = state.task.as_ref().and_then(|t| t.intent.clone());
-    assert_eq!(intent.as_deref(), Some("inferred"));
     assert!(!task_intent_steers_read(intent.as_deref()));
+    state.task = None;
+    state.set_task("Uncommitted changes: a.rs", Some(GIT_TASK_INTENT));
+    let intent = state.task.as_ref().and_then(|t| t.intent.clone());
+    assert!(!task_intent_steers_read(intent.as_deref()));
+}
+
+fn read_args(
+    path: &std::path::Path,
+    extra: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut args = json!({ "path": path.to_string_lossy() })
+        .as_object()
+        .unwrap()
+        .clone();
+    if let Some(extra) = extra.as_object() {
+        args.extend(extra.clone());
+    }
+    args
+}
+
+/// Reads that agents make every day and that used to fail: an empty file, an
+/// SVG, a directory. Each one now answers instead of returning an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_file_svg_and_directory_are_answered_not_rejected() {
+    let _data_dir = crate::core::data_dir::isolated_data_dir();
+    let dir = tempfile::tempdir().unwrap();
+
+    let empty = dir.path().join("empty.txt");
+    std::fs::write(&empty, b"").unwrap();
+    for extra in [
+        json!({}),
+        json!({ "fresh": true }),
+        json!({ "mode": "full" }),
+    ] {
+        let ctx = engine_test_context(dir.path(), &empty);
+        let output =
+            tokio::task::block_in_place(|| CtxReadTool.handle(&read_args(&empty, &extra), &ctx))
+                .unwrap_or_else(|error| {
+                    panic!("empty file ({extra}) must not fail: {}", error.message)
+                });
+        assert!(
+            output.text.contains("empty file (0 bytes)"),
+            "{}",
+            output.text
+        );
+    }
+
+    let svg = dir.path().join("logo.svg");
+    std::fs::write(
+        &svg,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect id=\"brand-mark\"/></svg>\n",
+    )
+    .unwrap();
+    let ctx = engine_test_context(dir.path(), &svg);
+    let output = tokio::task::block_in_place(|| {
+        CtxReadTool.handle(&read_args(&svg, &json!({ "mode": "full" })), &ctx)
+    })
+    .unwrap_or_else(|error| panic!("svg must be read as text: {}", error.message));
+    assert!(output.text.contains("brand-mark"), "{}", output.text);
+
+    let sub = dir.path().join("src");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("main.rs"), "fn main() {}\n").unwrap();
+    let ctx = engine_test_context(dir.path(), &sub);
+    let output =
+        tokio::task::block_in_place(|| CtxReadTool.handle(&read_args(&sub, &json!({})), &ctx))
+            .unwrap_or_else(|error| panic!("a directory must list its entries: {}", error.message));
+    assert!(output.text.contains("is a directory"), "{}", output.text);
+    assert!(output.text.contains("main.rs"), "{}", output.text);
 }

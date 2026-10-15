@@ -22,12 +22,14 @@ fn request(name: &str, arguments: Value) -> CallToolRequestParams {
 }
 
 async fn call(server: &crate::tools::LeanCtxServer, name: &str, arguments: Value) -> String {
+    // A hang guard, not a latency bound: one ctx_shell `printf` took longer
+    // than 15 s on the windows-msvc release runner (sequential suite).
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
         server.call_tool_guarded(request(name, arguments)),
     )
     .await
-    .unwrap_or_else(|_| panic!("{name} MCP call must complete within 15 seconds"))
+    .unwrap_or_else(|_| panic!("{name} MCP call must complete within 60 seconds"))
     .unwrap_or_else(|error| panic!("{name} MCP call must complete: {error}"));
     assert_ne!(
         result.is_error,
@@ -81,41 +83,18 @@ async fn assert_completed_task(
         "execution receipt for {expected_tool} must retain the ingress task id"
     );
 
-    let assessment = DecisionLoopRuntime::get_or_init()
-        .assessment_for(task_id)
-        .expect("completed MCP call must record a value-gate assessment");
-    assert_eq!(assessment.task_id, task_id);
-    assert!(
-        assessment.cost_micros > 0,
-        "completed MCP call must have a positive execution cost"
+    let runtime = DecisionLoopRuntime::get_or_init();
+    let outcome = runtime
+        .outcome_for(task_id)
+        .expect("completed MCP call must record a canonical outcome");
+    assert_eq!(outcome.accepted_outcome.task_id.as_str(), task_id);
+    assert_eq!(
+        outcome.accepted_outcome.accepted,
+        lean_ctx_protocol::AcceptanceState::Unknown,
+        "tool success without acceptance evidence must remain unknown"
     );
-    let cpao = assessment
-        .cpao_micros
-        .expect("accepted MCP outcome must produce CPAO");
-    assert!(cpao > 0, "accepted MCP outcome must produce positive CPAO");
-    assert!(
-        (cpao as f64).is_finite(),
-        "CPAO must be representable as a finite report value"
-    );
-    assert!(assessment.outcome_accepted);
-    assert!(
-        assessment
-            .evidence
-            .iter()
-            .any(|evidence| evidence == "signal=BuildSucceeded"),
-        "successful MCP outcome must be recorded as BuildSucceeded"
-    );
-    let exported = serde_json::to_value(&assessment)
-        .expect("value assessment evidence must serialize for audit export");
-    assert_eq!(exported["task_id"], task_id);
-    assert_eq!(exported["cost_micros"], assessment.cost_micros);
-    assert_eq!(exported["cpao_micros"], cpao);
-    assert!(
-        exported["evidence"]
-            .as_array()
-            .is_some_and(|evidence| !evidence.is_empty()),
-        "audit export must retain outcome evidence"
-    );
+    assert!(outcome.assessment.is_none());
+    assert!(runtime.assessment_for(task_id).is_none());
 }
 
 async fn server_with_fixture() -> (
@@ -140,8 +119,7 @@ async fn server_with_fixture() -> (
 async fn decision_loop_integration_simple_read() {
     let _lock = crate::core::data_dir::test_env_lock();
     let (data_dir, project_dir, server) = server_with_fixture().await;
-    // SAFETY: test_env_lock serializes process-wide data directory changes.
-    unsafe { std::env::set_var("LEAN_CTX_DATA_DIR", data_dir.path()) };
+    crate::test_env::set_var("LEAN_CTX_DATA_DIR", data_dir.path());
 
     let task_id = call(
         &server,
@@ -170,8 +148,7 @@ async fn decision_loop_integration_simple_read() {
         "a task-text-less profile must pass output through unfiltered"
     );
 
-    // SAFETY: test_env_lock serializes process-wide data directory changes.
-    unsafe { std::env::remove_var("LEAN_CTX_DATA_DIR") };
+    crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -179,8 +156,7 @@ async fn decision_loop_integration_simple_read() {
 async fn decision_loop_integration_shell() {
     let _lock = crate::core::data_dir::test_env_lock();
     let (data_dir, _project_dir, server) = server_with_fixture().await;
-    // SAFETY: test_env_lock serializes process-wide data directory changes.
-    unsafe { std::env::set_var("LEAN_CTX_DATA_DIR", data_dir.path()) };
+    crate::test_env::set_var("LEAN_CTX_DATA_DIR", data_dir.path());
 
     let task_id = call(
         &server,
@@ -190,8 +166,7 @@ async fn decision_loop_integration_shell() {
     .await;
     assert_completed_task(&server, &task_id, "ctx_shell").await;
 
-    // SAFETY: test_env_lock serializes process-wide data directory changes.
-    unsafe { std::env::remove_var("LEAN_CTX_DATA_DIR") };
+    crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -199,8 +174,7 @@ async fn decision_loop_integration_shell() {
 async fn decision_loop_integration_multi_step_operation() {
     let _lock = crate::core::data_dir::test_env_lock();
     let (data_dir, project_dir, server) = server_with_fixture().await;
-    // SAFETY: test_env_lock serializes process-wide data directory changes.
-    unsafe { std::env::set_var("LEAN_CTX_DATA_DIR", data_dir.path()) };
+    crate::test_env::set_var("LEAN_CTX_DATA_DIR", data_dir.path());
 
     let first_task_id = call(
         &server,
@@ -228,6 +202,5 @@ async fn decision_loop_integration_multi_step_operation() {
     assert_ne!(first_task_id, shell_task_id);
     assert_ne!(shell_task_id, final_task_id);
 
-    // SAFETY: test_env_lock serializes process-wide data directory changes.
-    unsafe { std::env::remove_var("LEAN_CTX_DATA_DIR") };
+    crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
 }

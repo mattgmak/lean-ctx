@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 #[cfg(feature = "tree-sitter")]
 use super::deep_queries::{self, ImportKind};
@@ -60,7 +60,7 @@ pub(crate) fn extract_deps(content: &str, ext: &str) -> DepInfo {
             extract_kotlin_deps(content)
         }
         Some(crate::core::language_capabilities::LanguageId::Dart) => {
-            let mut imports = HashSet::new();
+            let mut imports = BTreeSet::new();
             let re = static_regex!(r#"^\s*(?:import|export|part)\s+['"]([^'"]+)['"]"#);
             for line in content.lines() {
                 let trimmed = line.trim();
@@ -77,7 +77,7 @@ pub(crate) fn extract_deps(content: &str, ext: &str) -> DepInfo {
             }
         }
         Some(crate::core::language_capabilities::LanguageId::Zig) => {
-            let mut imports = HashSet::new();
+            let mut imports = BTreeSet::new();
             let re = static_regex!(r#"@import\(\s*"([^"]+)"\s*\)"#);
             for line in content.lines() {
                 let trimmed = line.trim();
@@ -106,7 +106,7 @@ pub(crate) fn extract_deps(content: &str, ext: &str) -> DepInfo {
 }
 
 fn extract_ts_deps(content: &str) -> DepInfo {
-    let mut imports = HashSet::new();
+    let mut imports = BTreeSet::new();
     let mut exports = Vec::new();
 
     for line in content.lines() {
@@ -139,7 +139,7 @@ fn extract_ts_deps(content: &str) -> DepInfo {
 }
 
 fn extract_rust_deps(content: &str) -> DepInfo {
-    let mut imports = HashSet::new();
+    let mut imports = BTreeSet::new();
     let mut exports = Vec::new();
 
     for line in content.lines() {
@@ -152,21 +152,19 @@ fn extract_rust_deps(content: &str) -> DepInfo {
             }
         }
 
-        if trimmed.starts_with("pub fn ") || trimmed.starts_with("pub async fn ") {
-            if let Some(name) = trimmed
-                .split('(')
-                .next()
-                .and_then(|s| s.split_whitespace().last())
-            {
+        // #1911: cut at the first non-identifier char, so generics and
+        // lifetimes (`Foo<'a>`, `bar<T: X>(`) never leak into the export name.
+        let item = trimmed
+            .strip_prefix("pub fn ")
+            .or_else(|| trimmed.strip_prefix("pub async fn "))
+            .or_else(|| trimmed.strip_prefix("pub struct "))
+            .or_else(|| trimmed.strip_prefix("pub enum "))
+            .or_else(|| trimmed.strip_prefix("pub trait "));
+        if let Some(rest) = item {
+            let name = leading_identifier(rest.trim_start());
+            if !name.is_empty() {
                 exports.push(name.to_string());
             }
-        } else if (trimmed.starts_with("pub struct ")
-            || trimmed.starts_with("pub enum ")
-            || trimmed.starts_with("pub trait "))
-            && let Some(name) = trimmed.split_whitespace().nth(2)
-        {
-            let clean = name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
-            exports.push(clean.to_string());
         }
     }
 
@@ -176,8 +174,18 @@ fn extract_rust_deps(content: &str) -> DepInfo {
     }
 }
 
+/// The identifier `s` starts with (raw `r#ident` kept whole), up to the first
+/// char that cannot continue it — `<`, `(`, `:`, `{`, whitespace, ….
+fn leading_identifier(s: &str) -> &str {
+    let body_start = if s.starts_with("r#") { 2 } else { 0 };
+    let end = s[body_start..]
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(s.len(), |i| body_start + i);
+    if end == body_start { "" } else { &s[..end] }
+}
+
 fn extract_python_deps(content: &str) -> DepInfo {
-    let mut imports = HashSet::new();
+    let mut imports = BTreeSet::new();
     let mut exports = Vec::new();
 
     for line in content.lines() {
@@ -218,7 +226,7 @@ fn extract_python_deps(content: &str) -> DepInfo {
 }
 
 fn extract_go_deps(content: &str) -> DepInfo {
-    let mut imports = HashSet::new();
+    let mut imports = BTreeSet::new();
     let mut exports = Vec::new();
 
     let mut in_import_block = false;
@@ -314,7 +322,7 @@ fn clean_path_like(path: &str) -> String {
 }
 
 fn extract_c_like_deps(content: &str) -> DepInfo {
-    let mut imports = HashSet::new();
+    let mut imports = BTreeSet::new();
     let re = static_regex!(r#"^\s*#\s*include\s*[<"]([^">]+)[">]"#);
     for line in content.lines() {
         let trimmed = line.trim();
@@ -332,7 +340,7 @@ fn extract_c_like_deps(content: &str) -> DepInfo {
 }
 
 fn extract_ruby_deps(content: &str) -> DepInfo {
-    let mut imports = HashSet::new();
+    let mut imports = BTreeSet::new();
     let re = static_regex!(r#"^\s*require(?:_relative)?\s+['"]([^'"]+)['"]"#);
     for line in content.lines() {
         let trimmed = line.trim();
@@ -350,7 +358,7 @@ fn extract_ruby_deps(content: &str) -> DepInfo {
 }
 
 fn extract_php_deps(content: &str) -> DepInfo {
-    let mut imports = HashSet::new();
+    let mut imports = BTreeSet::new();
     let re = static_regex!(
         r#"\b(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+)['"]"#
     );
@@ -370,7 +378,7 @@ fn extract_php_deps(content: &str) -> DepInfo {
 }
 
 fn extract_bash_deps(content: &str) -> DepInfo {
-    let mut imports = HashSet::new();
+    let mut imports = BTreeSet::new();
     let re = static_regex!(r#"^\s*(?:source|\.)\s+['"]?([^'"\s;]+)['"]?"#);
     for line in content.lines() {
         let trimmed = line.trim();
@@ -419,6 +427,42 @@ fn extract_export_name(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1911: generics and lifetimes are cut off the export name.
+    #[test]
+    fn rust_exports_strip_generics_and_lifetimes() {
+        let src = "pub struct AutoModeContext<'a> {\n\
+                   pub enum Bar<T: Clone> { A(T) }\n\
+                   pub trait Baz<T>: Sized {}\n\
+                   pub struct Unit;\n\
+                   pub struct Tuple(u8);\n\
+                   pub fn generic<T: Into<String>>(t: T) {}\n\
+                   pub async fn run(x: u8) {}\n\
+                   pub fn r#type() {}\n";
+        let deps = extract_deps(src, "rs");
+        assert_eq!(
+            deps.exports,
+            [
+                "AutoModeContext",
+                "Bar",
+                "Baz",
+                "Unit",
+                "Tuple",
+                "generic",
+                "run",
+                "r#type"
+            ]
+        );
+    }
+
+    #[test]
+    fn leading_identifier_edge_cases() {
+        assert_eq!(leading_identifier("Foo<'a>"), "Foo");
+        assert_eq!(leading_identifier("r#match("), "r#match");
+        assert_eq!(leading_identifier("<T>"), "");
+        assert_eq!(leading_identifier("r#"), "");
+        assert_eq!(leading_identifier("naïve_ß()"), "naïve_ß");
+    }
 
     #[test]
     fn c_include_relative_is_extracted() {
@@ -492,6 +536,39 @@ const std = @import("std");
         let deps = extract_deps(src, "zig");
         assert!(deps.imports.contains(&"lib/math".to_string()));
         assert!(!deps.imports.iter().any(|i| i == "std"), "std is external");
+    }
+
+    #[test]
+    fn imports_are_byte_stable_across_processes() {
+        // #1891: a randomly seeded HashSet made the `deps` line of map/signatures
+        // differ per process. The order must be a pure function of the content.
+        let cases = [
+            (
+                "use crate::z::Z;\nuse super::m;\nuse crate::a::A;\nuse crate::a::A;\nuse anyhow::Result;\n",
+                "rs",
+            ),
+            (
+                "import x from './zeta';\nimport {y} from './alpha';\nconst m = require('./mid');\n",
+                "ts",
+            ),
+            ("import zlib\nfrom beta import b\nimport alpha\n", "py"),
+            ("import (\n\t\"z/pkg\"\n\t\"a/pkg\"\n)\n", "go"),
+            ("#include \"zed/z.h\"\n#include \"alpha/a.h\"\n", "c"),
+            ("require_relative './z'\nrequire_relative './a'\n", "rb"),
+            ("<?php\nrequire './z.php';\nrequire './a.php';\n", "php"),
+            ("source ./z.sh\nsource ./a.sh\n", "sh"),
+        ];
+        for (src, ext) in cases {
+            let imports = extract_deps(src, ext).imports;
+            let mut sorted = imports.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(imports, sorted, "{ext}: imports must be sorted and unique");
+            assert!(
+                imports.len() >= 2,
+                "{ext}: fixture should yield several imports"
+            );
+        }
     }
 
     #[test]

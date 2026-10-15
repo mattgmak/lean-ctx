@@ -1,9 +1,9 @@
 # Client Constraints Matrix v1 (docs‑backed SSOT)
 
-> **Status: local integration implementation reference.** This matrix describes
-> client configuration constraints, not a product tier or availability promise.
-> LeanCTX is **The Context SDK for AI Agents**; current scope and status are
-> governed by `docs/internal/README.md` (internal, not in this repository).
+> **Status: local integration implementation reference.** LeanCTX is the **Context Gateway for AI Systems**.
+> **Control what your AI can see.** This reference describes supported local
+> LeanCTX Engine integration behavior; it is not a general release or
+> performance guarantee. See [current positioning](../POSITIONING_CANONICAL.md).
 
 This document is the SSOT for **client-specific MCP integration constraints** (config schema, hook semantics, approval model, limits).
 

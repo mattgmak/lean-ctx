@@ -47,6 +47,21 @@ fn codex_chatgpt_proxy_artifact_detects_only_top_level_entries() {
         ),
         OptInRouted
     );
+    // The direct provider block keeps routed-era threads resumable and
+    // routes nothing → native, so `doctor --fix` leaves it alone.
+    assert_eq!(
+        classify_codex_proxy_entries(
+            "model = \"gpt-5.5\"\n\n[model_providers.leanctx-chatgpt]\nname = \"OpenAI\"\nbase_url = \"https://chatgpt.com/backend-api/codex\"\n"
+        ),
+        Native
+    );
+    // A routed block left behind without its pin is stale.
+    assert_eq!(
+        classify_codex_proxy_entries(
+            "[model_providers.leanctx-chatgpt]\nbase_url = \"http://127.0.0.1:8765/backend-api/codex\"\n"
+        ),
+        Artifact
+    );
     // Default provider → native.
     assert_eq!(
         classify_codex_proxy_entries("model_provider = \"openai\"\n"),
@@ -168,7 +183,10 @@ fn hook_binary_refs_extracts_token_before_hook_keyword() {
 
 #[test]
 fn hook_binary_refs_empty_without_hook_invocation() {
-    assert!(hook_binary_refs(r#"{"command": "echo nothing here"}"#).is_empty());
+    {
+        let found = &hook_binary_refs(r#"{"command": "echo nothing here"}"#);
+        assert!(found.is_empty(), "{found:?}");
+    }
 }
 
 #[test]
@@ -179,6 +197,113 @@ fn hook_binary_refs_handles_minified_json() {
     let content =
         r#"[{"hooks":[{"command":"lean-ctx hook rewrite"},{"command":"lean-ctx hook redirect"}]}]"#;
     assert_eq!(hook_binary_refs(content), vec!["lean-ctx", "lean-ctx"]);
+}
+
+// The reported Codex SessionStart failure: an extra entry ran a deleted
+// temporary test binary (exit 127). Its name is not `lean-ctx`, so neither the
+// stale-binary check nor setup touch it; doctor must still name it.
+#[test]
+fn hooks_running_a_deleted_program_are_reported_whoever_wrote_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let present = dir.path().join("lean-ctx");
+    std::fs::write(&present, "").unwrap();
+    let gone = dir.path().join("leanctx-pro-hint-latency-r1/engine-5a87");
+    let content = serde_json::json!({
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "startup|resume|clear",
+                "hooks": [
+                    {"command": format!("{} hook codex-session-start", present.display())},
+                    {"command": format!("{} hook codex-session-start", gone.display())},
+                    {"command": format!("\"{}\" --flag", gone.display())},
+                    {"command": "lean-ctx hook observe"},
+                    {"command": "echo /missing/but/an/argument"}
+                ]
+            }]
+        }
+    })
+    .to_string();
+    assert_eq!(
+        missing_hook_programs(&content),
+        vec![gone.display().to_string()]
+    );
+
+    let healthy = NamedCheck {
+        name: "Codex hooks.json".to_string(),
+        ok: true,
+        detail: "ok".to_string(),
+    };
+    let checked = with_missing_programs(healthy, std::path::Path::new("/h/hooks.json"), &content);
+    assert!(!checked.ok);
+    assert!(checked.detail.contains("engine-5a87"), "{}", checked.detail);
+    assert!(
+        checked.detail.contains("/h/hooks.json"),
+        "{}",
+        checked.detail
+    );
+}
+
+#[test]
+fn quoted_windows_drive_paths_count_as_absolute_programs() {
+    let content = serde_json::json!({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"command": r#""Z:\nowhere\lean ctx\engine.exe" hook codex-pretooluse"#}
+        ]}]}
+    })
+    .to_string();
+    assert_eq!(
+        missing_hook_programs(&content),
+        vec![r"Z:\nowhere\lean ctx\engine.exe".to_string()]
+    );
+}
+
+#[test]
+fn quoted_windows_hook_paths_keep_the_complete_binary() {
+    let binary = r"C:\Program Files\LeanCTX\lean-ctx.exe";
+    let command = format!("\"{binary}\" hook codex-session-start");
+    let json = serde_json::to_string(&serde_json::json!({ "command": command })).unwrap();
+    assert_eq!(hook_binary_refs(&json), vec![binary]);
+    assert!(stale_hook_binary(&json, binary).is_none());
+    assert_eq!(hook_binary_refs(&command), vec![binary]);
+}
+
+#[test]
+fn custom_binary_with_a_codex_operation_is_not_lean_ctx_owned() {
+    for operation in [
+        "codex-pretooluse",
+        "codex-pretooluse-custom",
+        "codex-session-start",
+    ] {
+        let json = serde_json::to_string(&serde_json::json!({
+            "command": format!("/custom/guard hook {operation}")
+        }))
+        .unwrap();
+        {
+            let found = &hook_binary_refs(&json);
+            assert!(found.is_empty(), "{found:?}");
+        }
+    }
+}
+
+#[test]
+fn raw_shell_mentions_are_not_hook_binary_references() {
+    for command in [
+        "echo /old/lean-ctx hook rewrite",
+        "\"echo\" \"/old/lean-ctx\" hook codex-session-start",
+        "/custom/lean-ctx-wrapper hook rewrite",
+    ] {
+        assert!(hook_binary_refs(command).is_empty(), "{command}");
+    }
+}
+
+#[test]
+fn nested_description_strings_are_not_hook_commands() {
+    let content = serde_json::json!({
+        "notes": ["/old/lean-ctx hook rewrite"],
+        "hooks": [{"command": "/current/lean-ctx hook codex-session-start"}]
+    })
+    .to_string();
+    assert_eq!(hook_binary_refs(&content), vec!["/current/lean-ctx"]);
 }
 
 #[test]
@@ -211,6 +336,30 @@ fn stale_hook_binary_accepts_current_binary() {
 }
 
 #[test]
+fn stale_codex_hook_is_not_hidden_by_a_current_hook() {
+    let binary = "/current/install/lean-ctx";
+    let stale = "/private/tmp/leanctx-check/lean-ctx";
+    for commands in [
+        vec![
+            format!("{binary} hook codex-session-start"),
+            format!("{stale} hook codex-session-start"),
+        ],
+        vec![
+            format!("{stale} hook codex-pretooluse"),
+            format!("{binary} hook codex-pretooluse"),
+        ],
+    ] {
+        let content = serde_json::to_string(&serde_json::json!({
+            "hooks": commands.into_iter().map(|command| {
+                serde_json::json!({ "command": command })
+            }).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        assert_eq!(stale_hook_binary(&content, binary).as_deref(), Some(stale));
+    }
+}
+
+#[test]
 fn stale_hook_binary_accepts_bare_path_command() {
     // The bare `lean-ctx` PATH form is always considered current.
     let content = r#""lean-ctx hook rewrite""#;
@@ -223,12 +372,10 @@ fn stale_hook_binary_accepts_bare_path_command() {
 #[test]
 fn stale_hook_binary_accepts_configured_portable_override() {
     let _lock = crate::core::data_dir::test_env_lock();
-    // SAFETY: serialized by test_env_lock.
-    unsafe { std::env::set_var("LEAN_CTX_HOOK_BINARY", "$HOME/.local/bin/lean-ctx") };
+    crate::test_env::set_var("LEAN_CTX_HOOK_BINARY", "$HOME/.local/bin/lean-ctx");
     let content = r#""$HOME/.local/bin/lean-ctx hook rewrite""#;
     assert!(stale_hook_binary(content, "/machine/abs/lean-ctx").is_none());
-    // SAFETY: serialized by test_env_lock.
-    unsafe { std::env::remove_var("LEAN_CTX_HOOK_BINARY") };
+    crate::test_env::remove_var("LEAN_CTX_HOOK_BINARY");
 
     // Without the override the same content IS stale — the acceptance is
     // strictly opt-in.

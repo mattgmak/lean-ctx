@@ -108,11 +108,23 @@ Never skip: validation, security, error handling.\n\
 /// v9 (#1287): the "re-reads ~13 tokens" claim is scoped to unchanged
 /// full/auto re-reads — signatures/map re-reads currently return the full
 /// (cached) payload.
-pub const RULES_VERSION: usize = 9;
+/// v10 (#1788): the steering states its own boundary. It governs the host's
+/// built-in file/search/shell tools; it is not a ranking over other MCP
+/// servers, which the previous unqualified wording was read as.
+/// v11 (#1849): the shadow edit line names no host tool — "native
+/// Edit/StrReplace" was wrong for Codex, which edits through `apply_patch`.
+pub const RULES_VERSION: usize = 11;
 
 /// Banner placed at the top of dedicated rule files (non-shadow only).
-pub const CRITICAL: &str = "CRITICAL: ALWAYS use lean-ctx ctx_* tools instead of native equivalents. \
-     This is NOT optional.";
+///
+/// It used to end "…instead of native equivalents. This is NOT optional." —
+/// unqualified, so it read as a ranking over every tool the host exposes, and a
+/// model with an IDE/LSP, database or issue-tracker MCP server attached routed
+/// those questions here too (#1788). The imperative stays (it is the adherence
+/// lever, and the instructions channel is guarded on it); what goes is the
+/// unbounded object. "as mapped below" hands the scope to `BULLETS`, which
+/// names the four tools this actually governs.
+pub const CRITICAL: &str = "CRITICAL: ALWAYS use lean-ctx ctx_* tools as mapped below.";
 
 /// Weak-model adherence nudge (#1067 / GH #593). Smaller models (e.g. GLM 5.2 in
 /// Windsurf) often read the tool-mapping rules yet still answer from memory or
@@ -138,8 +150,18 @@ MANDATORY MAPPING:\n\
 
 /// One-line admonition reinforcing the tool preference.  Always right after
 /// `BULLETS` in both profiles.
-pub const NEVER: &str = "NEVER use native Read/Grep/Shell/Glob when a ctx_* equivalent \
-    exists. SELF-CORRECT: the moment you reach for one, stop and call the ctx_* tool instead.";
+///
+/// Carries the scope boundary for the whole ruleset (#1788). The steering used
+/// to name no limit, so it was read as ranking lean-ctx above every other MCP
+/// server — an IDE/LSP bridge, a database, an issue tracker — rather than above
+/// the host's built-in file/search/shell tools. The closing clause is kept to
+/// one short sentence: this text ships on every turn, and the layer that sells
+/// token savings cannot pay for its own disclaimer twice. It is paid for, not
+/// added: "for these jobs" replaces "when a ctx_* equivalent exists", which
+/// restated the mapping printed directly above it.
+pub const NEVER: &str = "NEVER use built-in Read/Grep/Shell/Glob for these jobs. \
+    SELF-CORRECT: the moment you reach for one, stop and call the ctx_* tool \
+    instead. Other MCP servers keep their own jobs.";
 
 /// Intent-to-tool playbook — maps common agent questions to the right tool.
 /// Since v5 it also absorbs the agent-loop phases (#609) and the navigation
@@ -147,7 +169,7 @@ pub const NEVER: &str = "NEVER use native Read/Grep/Shell/Glob when a ctx_* equi
 /// profile (they stay verbatim in LONGFORM).
 pub const INTENT: &str = "\
 Tool selection by intent:\n\
-• Orient / understand code (call FIRST) -> ctx_compose\n\
+• Orient in this codebase (call FIRST) -> ctx_compose\n\
 • Read a file -> ctx_read(path, mode=signatures|map|full); edit after reading -> ctx_patch\n\
 • Exact symbol -> ctx_search(action=symbol); pattern -> ctx_search; by meaning -> ctx_search(action=semantic)\n\
 • Files by glob -> ctx_glob; structure -> ctx_tree; callers/impact -> ctx_callgraph\n\
@@ -218,7 +240,9 @@ pub const RECOVER_COMPACT: &str = "RECOVER: compression is reversible — read t
 /// Root restriction hint (#1465). Paths outside project roots and configured
 /// `allow_paths`/`extra_roots` are refused by ctx_* tools. Without this hint
 /// the model discovers the restriction only from a surprise error.
-pub const ROOT_RESTRICTION: &str = "ROOTS: ctx_* refuses paths outside project root + allow_paths. \
+/// The closing sentence is a block-end marker for installed Claude Code mods
+/// (`templates/claude_mod/register.ts`) — keep it verbatim.
+pub const ROOT_RESTRICTION: &str = "ROOTS: ctx_* read ~ projects, write the active one; ~/.ssh etc. closed. \
     Use native Read for out-of-root; `lean-ctx doctor` shows effective roots.";
 
 /// Context Engineering Protocol version reference.
@@ -236,7 +260,7 @@ pub const LITM_END: &str = "TOOL PREFERENCE (END): ctx_compose>chain ctx_read>Re
 /// tools that have *no* native trigger to intercept still need advertising.
 pub const SHADOW_MINIMAL: &str = "\
 lean-ctx shadow mode: native read/search/shell calls auto-route to ctx_* — no tool-mapping needed.\n\
-File editing → native Edit/StrReplace (lean-ctx only handles reads); if denied, use ctx_patch.\n\
+File editing → the host's native edit tool (lean-ctx only handles reads); if denied, use ctx_patch.\n\
 Exclusive tools (no native trigger): ctx_compose (understand code, call first), ctx_search(action=symbol) (exact symbol), ctx_search(action=semantic) (by meaning), ctx_callgraph (callers), ctx_knowledge / ctx_session (memory).";
 
 /// Hook-covered header (GL #1153): the honest replacement for the
@@ -339,14 +363,14 @@ fn longform_non_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<St
     use super::rules_sections as rs;
     let mut v = vec![
         s(CRITICAL),
-        s(MUST_INVOKE),
+        rs::must_invoke_section(p),
         s(BULLETS),
         s(NEVER),
         rs::intent_section(p),
         s(AGENT_LOOP), // verbose teaching — LONGFORM only
         rs::anti_section(p),
         s(NAV_PARADOX), // verbose teaching — LONGFORM only
-        s(PARALLEL),
+        rs::parallel_section(p),
         s(AUTO),
         s(RECOVER),
         s(ROOT_RESTRICTION),
@@ -363,12 +387,12 @@ fn full_non_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<String
     use super::rules_sections as rs;
     let mut v = vec![
         s(CRITICAL),
-        s(MUST_INVOKE),
+        rs::must_invoke_section(p),
         s(BULLETS),
         s(NEVER),
         rs::intent_section(p),
         rs::anti_section(p),
-        s(PARALLEL),
+        rs::parallel_section(p),
         s(AUTO),
         s(RECOVER_COMPACT),
         s(ROOT_RESTRICTION),
@@ -390,7 +414,7 @@ fn hook_covered_non_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Ve
     let mut v = vec![
         s(HOOK_COVERED_HEADER),
         rs::hook_covered_tools_section(p),
-        s(PARALLEL),
+        rs::parallel_section(p),
         s(RECOVER_COMPACT),
         s(ROOT_RESTRICTION),
     ];
@@ -408,7 +432,7 @@ fn compact_non_shadow_sections(p: &super::tool_profiles::ToolProfile) -> Vec<Str
         s(NEVER),
         rs::intent_section(p),
         rs::anti_section(p),
-        s(PARALLEL),
+        rs::parallel_section(p),
         s(RECOVER_COMPACT),
         s(ROOT_RESTRICTION),
     ];
@@ -473,6 +497,21 @@ pub fn render(
     level: CompressionLevel,
     tool_profile: &super::tool_profiles::ToolProfile,
 ) -> String {
+    let cfg = crate::core::config::Config::load();
+    render_with_solution(shadow, wrapper, level, tool_profile, &cfg.solution)
+}
+
+/// Render with an explicit solution-efficiency configuration.
+///
+/// The dedicated hook context uses this seam to exercise every rendered
+/// solution variant in its cross-language boundary drift test.
+pub(crate) fn render_with_solution(
+    shadow: bool,
+    wrapper: Wrapper,
+    level: CompressionLevel,
+    tool_profile: &super::tool_profiles::ToolProfile,
+    solution: &super::config::solution::SolutionConfig,
+) -> String {
     use super::rules_sections as rs;
 
     let sections: Vec<String> = match (wrapper, shadow) {
@@ -513,24 +552,19 @@ pub fn render(
         }
     }
 
-    // Solution Intelligence block: inject efficiency ladder when enabled
-    {
-        let cfg = crate::core::config::Config::load();
-        if cfg.solution.enabled {
-            let ladder = cfg.solution.ladder_text();
-            if !ladder.is_empty() {
-                body.push('\n');
-                if matches!(wrapper, Wrapper::Bare) {
-                    body.push_str(ladder);
-                } else {
-                    body.push_str(SOLUTION_BLOCK_START);
-                    body.push('\n');
-                    body.push_str("SOLUTION EFFICIENCY: stop at first level that applies:\n");
-                    body.push_str("skip (YAGNI) → reuse codebase → stdlib → native platform → installed dep → one-line → minimum code.\n");
-                    body.push_str("Never skip: validation, security, error handling.\n");
-                    body.push_str(SOLUTION_BLOCK_END);
-                }
-            }
+    // Solution Intelligence block: inject efficiency ladder when enabled.
+    let ladder = solution.ladder_text();
+    if !ladder.is_empty() {
+        body.push('\n');
+        if matches!(wrapper, Wrapper::Bare) {
+            body.push_str(ladder);
+        } else {
+            body.push_str(SOLUTION_BLOCK_START);
+            body.push('\n');
+            body.push_str("SOLUTION EFFICIENCY: stop at first level that applies:\n");
+            body.push_str("skip (YAGNI) → reuse codebase → stdlib → native platform → installed dep → one-line → minimum code.\n");
+            body.push_str("Never skip: validation, security, error handling.\n");
+            body.push_str(SOLUTION_BLOCK_END);
         }
     }
 
@@ -592,15 +626,15 @@ mod tests {
 
     #[test]
     fn sections_not_empty() {
-        assert!(!BULLETS.is_empty());
-        assert!(!NEVER.is_empty());
-        assert!(!INTENT.is_empty());
-        assert!(!ANTI.is_empty());
-        assert!(!PARALLEL.is_empty());
-        assert!(!AUTO.is_empty());
-        assert!(!CEP.is_empty());
-        assert!(!LITM_END.is_empty());
-        assert!(!CRITICAL.is_empty());
+        assert!(!BULLETS.is_empty(), "`BULLETS` is empty");
+        assert!(!NEVER.is_empty(), "`NEVER` is empty");
+        assert!(!INTENT.is_empty(), "`INTENT` is empty");
+        assert!(!ANTI.is_empty(), "`ANTI` is empty");
+        assert!(!PARALLEL.is_empty(), "`PARALLEL` is empty");
+        assert!(!AUTO.is_empty(), "`AUTO` is empty");
+        assert!(!CEP.is_empty(), "`CEP` is empty");
+        assert!(!LITM_END.is_empty(), "`LITM_END` is empty");
+        assert!(!CRITICAL.is_empty(), "`CRITICAL` is empty");
     }
 
     #[test]
@@ -961,7 +995,10 @@ mod tests {
 
     #[test]
     fn compression_text_matches_level() {
-        assert!(compression_text(CompressionLevel::Off).is_empty());
+        {
+            let found = &compression_text(CompressionLevel::Off);
+            assert!(found.is_empty(), "{found:?}");
+        }
         assert!(compression_text(CompressionLevel::Lite).contains("Bullet"));
         assert!(compression_text(CompressionLevel::Standard).contains("fn, cfg"));
         assert!(compression_text(CompressionLevel::Max).contains("Telegraph"));

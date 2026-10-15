@@ -1,6 +1,62 @@
 use super::*;
 use crate::tools::CrpMode;
 
+// The policy override is process-wide: a parallel test that installs a policy
+// made these searches answer "N sources withheld under policy". Every search
+// here pins "no policy" for its call; these shadow the glob-imported entries.
+
+#[allow(clippy::too_many_arguments)]
+fn handle(
+    pattern: &str,
+    dir: &str,
+    include: Option<&str>,
+    max_results: usize,
+    crp_mode: CrpMode,
+    respect_gitignore: bool,
+    allow_secret_paths: bool,
+    anchored: bool,
+) -> SearchOutcome {
+    let _no_policy = crate::core::policy::runtime::TestPolicyOverride::set(None);
+    super::handle(
+        pattern,
+        dir,
+        include,
+        max_results,
+        crp_mode,
+        respect_gitignore,
+        allow_secret_paths,
+        anchored,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_filtered(
+    pattern: &str,
+    dir: &str,
+    include: Option<&str>,
+    max_results: usize,
+    crp_mode: CrpMode,
+    respect_gitignore: bool,
+    allow_secret_paths: bool,
+    anchored: bool,
+    exclude: Option<&str>,
+    exclude_pattern: Option<&str>,
+) -> SearchOutcome {
+    let _no_policy = crate::core::policy::runtime::TestPolicyOverride::set(None);
+    super::handle_filtered(
+        pattern,
+        dir,
+        include,
+        max_results,
+        crp_mode,
+        respect_gitignore,
+        allow_secret_paths,
+        anchored,
+        exclude,
+        exclude_pattern,
+    )
+}
+
 /// Determinism contract (#498): identical search over identical files
 /// must produce byte-identical output — a prerequisite for provider
 /// prompt-cache hits on repeated tool results.
@@ -29,6 +85,33 @@ fn search_output_is_byte_stable_across_calls() {
         .text
     };
     assert_eq!(run(), run(), "search output must be deterministic");
+}
+
+/// Agents search for code text: `foo(`, `items[0`, `fn run(&self`. Those are
+/// not valid regex; the search runs literally and says so instead of failing.
+#[test]
+fn invalid_regex_is_searched_literally_with_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "fn run(&self) {}\nlet x = items[0];\nrun_other();\n",
+    )
+    .unwrap();
+    let root = dir.path().to_string_lossy().into_owned();
+    for (pattern, expected) in [("fn run(&self", "a.rs"), ("items[0", "items[0]")] {
+        let out = handle(pattern, &root, None, 20, CrpMode::Off, true, true, false).text;
+        assert!(!out.starts_with("ERROR:"), "{pattern}: {out}");
+        assert!(
+            out.contains("searched for it literally"),
+            "{pattern}: {out}"
+        );
+        assert!(out.contains(expected), "{pattern}: {out}");
+    }
+    let regex = handle("run_\\w+", &root, None, 20, CrpMode::Off, true, true, false).text;
+    assert!(
+        !regex.contains("literally") && regex.contains("run_other"),
+        "valid regex is unchanged: {regex}"
+    );
 }
 
 /// #1008: opt-in anchored search tags each hit with `:hh` (matching
@@ -177,6 +260,9 @@ fn warm_index_and_content_cache_path_returns_correct_matches() {
     // then this search reuses those bytes. Results must be byte-identical to
     // the walk path — this asserts that correctness, independent of whether
     // any individual file is a cache hit or a fallback re-read.
+    // Pin "no policy": a parallel test's override withheld both sources here
+    // ("2 sources withheld under policy", ubuntu main CI).
+    let _no_policy = crate::core::policy::runtime::TestPolicyOverride::set(None);
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.rs"),
@@ -193,7 +279,8 @@ fn warm_index_and_content_cache_path_returns_correct_matches() {
         "index should warm for a small clean corpus"
     );
 
-    let out = handle(
+    // `super::handle`: this test already holds the pin, which is not reentrant.
+    let out = super::handle(
         "authenticate",
         &root,
         None,
@@ -469,6 +556,116 @@ fn include_glob_filters_by_brace_expansion() {
     assert!(!out.contains("c.py"), "py file must be excluded: {out}");
 }
 
+/// #1994: `*.go,*.yaml` compiled to one glob no file matched, and the
+/// result was a clean `0 matches` over an empty scope.
+#[test]
+fn comma_separated_include_is_a_glob_list() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.go"), "comma_glob_needle_1994\n").unwrap();
+    std::fs::write(dir.path().join("b.yaml"), "comma_glob_needle_1994\n").unwrap();
+    std::fs::write(dir.path().join("c.py"), "comma_glob_needle_1994\n").unwrap();
+
+    let out = handle(
+        "comma_glob_needle_1994",
+        dir.path().to_string_lossy().as_ref(),
+        Some("*.go, *.yaml"),
+        10,
+        CrpMode::Off,
+        true,
+        true,
+        false,
+    )
+    .text;
+
+    assert!(out.contains("a.go"), "go file must match: {out}");
+    assert!(out.contains("b.yaml"), "yaml file must match: {out}");
+    assert!(!out.contains("c.py"), "py file must be excluded: {out}");
+    assert_eq!(
+        extract_extensions(Some("*.go,*.{ts,tsx}")),
+        vec!["go", "ts", "tsx"]
+    );
+}
+
+/// #1994: an include that admits no file and a genuine miss printed
+/// byte-identical lines. Both now state the scanned count, and the empty
+/// scope says why nothing was searched — with and without a warm index.
+/// #2059: a file `path` plus `include` scanned 0 files — the glob was matched
+/// against the empty path relative to the file itself.
+#[test]
+fn include_and_exclude_apply_to_a_file_root_by_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.rs");
+    std::fs::write(&file, "fn main() { let needle2059 = 1; }\n").unwrap();
+    let file = file.to_string_lossy().to_string();
+    let search = |include: Option<&str>, exclude: Option<&str>| {
+        handle_filtered(
+            "needle2059",
+            &file,
+            include,
+            10,
+            CrpMode::Off,
+            true,
+            false,
+            false,
+            exclude,
+            None,
+        )
+        .text
+    };
+
+    assert!(search(None, None).contains("let needle2059"));
+    for include in ["*.rs", "main.rs", "**/*.rs"] {
+        let hit = search(Some(include), None);
+        assert!(hit.contains("needle2059"), "include={include}: {hit}");
+    }
+    let filtered = search(Some("*.go"), None);
+    assert!(filtered.contains("(scanned 0 files)"), "{filtered}");
+    let excluded = search(None, Some("*.rs"));
+    assert!(!excluded.contains("let needle2059"), "{excluded}");
+}
+
+#[test]
+fn zero_hits_state_the_scope_and_name_an_empty_filter() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::remove_var("LEAN_CTX_DISABLE_SEARCH_INDEX");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
+    std::fs::write(dir.path().join("b.go"), "package b\n").unwrap();
+    let root = dir.path().to_string_lossy().to_string();
+
+    for warm in [false, true] {
+        if warm {
+            assert!(crate::core::search_index::warm_blocking(&root, true, false));
+        }
+        let search = |include: &str| {
+            handle(
+                "zzzqqqnomatch1994",
+                &root,
+                Some(include),
+                10,
+                CrpMode::Off,
+                true,
+                false,
+                false,
+            )
+            .text
+        };
+        let miss = search("*.go");
+        assert!(
+            miss.contains("(scanned 2 files)"),
+            "a genuine miss must report its scope (warm={warm}): {miss}"
+        );
+        assert!(!miss.contains("nothing was searched"), "{miss}");
+
+        let empty = search("*.nothing");
+        assert!(
+            empty.contains("(scanned 0 files)") && empty.contains("nothing was searched"),
+            "an empty filter must say so (warm={warm}): {empty}"
+        );
+        assert_ne!(miss, empty);
+    }
+}
+
 #[test]
 fn bare_include_glob_matches_at_any_depth() {
     // rg/git grep behaviour: a bare glob without `/` should match
@@ -540,6 +737,31 @@ fn include_glob_recursive_path_pattern() {
     assert!(
         !out.contains("top.rs"),
         "root file outside src/ must be excluded: {out}"
+    );
+}
+
+/// #2059 as reported: `path` = `Cargo.toml`, `include` = `*.toml`.
+#[test]
+fn explicit_manifest_file_matches_its_include_glob() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("Cargo.toml");
+    std::fs::write(&file, "[package]\nname = \"manifest_include_2059\"\n").unwrap();
+
+    let out = handle(
+        "^\\[package\\]",
+        file.to_string_lossy().as_ref(),
+        Some("*.toml"),
+        10,
+        CrpMode::Off,
+        true,
+        true,
+        false,
+    )
+    .text;
+
+    assert!(
+        out.contains("[package]") && out.contains("(scanned 1)"),
+        "the explicit Cargo.toml must be scanned: {out}"
     );
 }
 
@@ -745,4 +967,65 @@ fn result_cap_is_announced_instead_of_looking_exhaustive() {
         !complete.contains("stopped at the max_results"),
         "an exhaustive search must not warn about a cap it never reached: {complete}"
     );
+}
+
+/// ~600 KB of text with one needle near the end: above `MAX_FILE_SIZE`,
+/// below `MAX_EXPLICIT_FILE_SIZE`.
+fn large_log(needle: &str) -> String {
+    let mut body = "2026-09-29 INFO routine line without anything special\n".repeat(11_000);
+    body.push_str(needle);
+    body.push('\n');
+    assert!(body.len() as u64 > MAX_FILE_SIZE);
+    body
+}
+
+#[test]
+fn explicitly_named_large_file_is_searched() {
+    // #1917: `grep NEEDLE big.log` must look inside the file the caller named,
+    // not report "0 matches" because the file exceeds the directory-walk cap.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("big.log");
+    std::fs::write(&file, large_log("NEEDLE_1917 found")).unwrap();
+    let out = handle(
+        "NEEDLE_1917",
+        file.to_string_lossy().as_ref(),
+        None,
+        10,
+        CrpMode::Off,
+        true,
+        true,
+        false,
+    )
+    .text;
+    assert!(out.starts_with("1 matches"), "{out}");
+    assert!(out.contains("NEEDLE_1917 found"), "{out}");
+}
+
+#[test]
+fn directory_walk_names_the_large_files_it_skipped() {
+    // #1917: a skipped file must be named so the caller can search it directly.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("big.log"), large_log("NEEDLE_1917")).unwrap();
+    std::fs::write(dir.path().join("small.txt"), "nothing here\n").unwrap();
+    let out = handle(
+        "NEEDLE_1917",
+        dir.path().to_string_lossy().as_ref(),
+        None,
+        10,
+        CrpMode::Off,
+        true,
+        true,
+        false,
+    )
+    .text;
+    assert!(out.starts_with("0 matches"), "{out}");
+    assert!(out.contains("large files skipped"), "{out}");
+    assert!(out.contains("big.log"), "skipped file must be named: {out}");
+}
+
+#[test]
+fn name_skipped_caps_the_list() {
+    let names: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_string()).collect();
+    assert_eq!(name_skipped(&names, 3), "a, b, c");
+    assert_eq!(name_skipped(&names, 7), "a, b, c, +4 more");
 }

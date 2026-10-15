@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 pub mod agents;
+pub(crate) mod project_pins;
 mod support;
+pub(crate) use project_pins::strip_project_scoped_env_toml;
 
 /// Controls how hooks instruct agents to access lean-ctx functionality.
 ///
@@ -58,9 +60,13 @@ impl HookMode {
     }
 }
 
-/// Agents with reliable shell + hook infrastructure that support Replace mode
+/// Agents with reliable shell + hook infrastructure that *can* run Replace mode
 /// (native tools denied, lean-ctx MCP is the only path). These agents have
 /// either `permissions.deny` support or PreToolUse deny-hook capability.
+///
+/// Replace is opt-in (`hook_mode = "replace"`): denying native tools made
+/// agents fail and retry instead of working, so these agents default to Hybrid
+/// like every other hook-capable agent.
 pub const REPLACE_AGENTS: &[&str] = &[
     "cursor",
     "claude",
@@ -126,34 +132,62 @@ pub fn is_supported_agent(agent: &str) -> bool {
 
 /// Auto-detect the best hook mode for a given agent key.
 ///
-/// Priority: disabled/shadow_mode cap > config override > Replace > Hybrid > Mcp
-/// - Replace: native tools denied, MCP-only path (zero tool drift)
-/// - Hybrid: MCP + shell hooks (fallback for agents without deny support)
+/// Priority: disabled/shadow_mode cap > config override > Hybrid > Mcp
+/// - Replace: native tools denied, MCP-only path — only when the user chose it
+///   (`hook_mode = "replace"`, `LEAN_CTX_HOOK_MODE=replace`, `harden --hard`)
+/// - Hybrid: MCP + shell hooks; native tools keep working, known commands
+///   are rewritten through lean-ctx (default for every hook-capable agent)
 /// - Mcp: MCP server only (no shell hooks available)
 ///
 /// `LEAN_CTX_DISABLED=1` or `shadow_mode = false` cap the mode at Hybrid so
 /// the deny-list is never injected when the user opted out (#1037).
 pub fn recommend_hook_mode(agent_key: &str) -> HookMode {
-    let deny_suppressed = is_deny_suppressed();
     if let Some(override_mode) = crate::core::config::Config::load().hook_mode_override() {
-        return if deny_suppressed {
+        return if is_deny_suppressed() {
             override_mode.cap_at_hybrid()
         } else {
             override_mode
         };
     }
-    if deny_suppressed {
-        if REPLACE_AGENTS.contains(&agent_key) || HYBRID_AGENTS.contains(&agent_key) {
-            return HookMode::Hybrid;
-        }
-        return HookMode::Mcp;
-    }
-    if REPLACE_AGENTS.contains(&agent_key) {
-        HookMode::Replace
-    } else if HYBRID_AGENTS.contains(&agent_key) {
+    if REPLACE_AGENTS.contains(&agent_key) || HYBRID_AGENTS.contains(&agent_key) {
         HookMode::Hybrid
     } else {
         HookMode::Mcp
+    }
+}
+
+/// True when native-tool denial is in effect: the user chose Replace and has
+/// not suppressed denials (#1037). Deny hooks consult this at call time, so a
+/// hook entry written while Replace was the default stops blocking the moment
+/// the binary updates — no settings rewrite has to happen first.
+#[must_use]
+pub fn replace_mode_chosen() -> bool {
+    crate::core::config::Config::load().hook_mode_override() == Some(HookMode::Replace)
+        && !is_deny_suppressed()
+}
+
+/// Whether Claude Code (and CodeBuddy, which shares its contract) keeps native
+/// Grep/Glob out of the model's tool list via `permissions.deny`.
+///
+/// Unlike a hook denial this costs no error and no retry: Claude Code drops a
+/// denied tool from the list, so the model never calls it. And it keeps
+/// searches on the compressed path — native Glob cannot be redirected (#1033).
+/// Measured 2026-10-13 over 30 days: 0 Grep/Glob calls and 0 denials in 380
+/// Claude sessions with the list, while native Glob returned ~12× the tokens
+/// of `ctx_glob` for the same patterns. So the default (auto) mode keeps it;
+/// an explicit `hook_mode = "hybrid"`/`"mcp"`, `shadow_mode = false` or
+/// `LEAN_CTX_DISABLED` give the tools back.
+#[must_use]
+pub fn claude_hides_native_search(mode: HookMode) -> bool {
+    match mode {
+        HookMode::Replace => true,
+        HookMode::Hybrid => {
+            crate::core::config::Config::load()
+                .hook_mode_override()
+                .is_none()
+                && !is_deny_suppressed()
+        }
+        HookMode::Mcp => false,
     }
 }
 
@@ -177,18 +211,18 @@ use agents::{
     install_amp_hook, install_antigravity_cli_hook, install_antigravity_hook,
     install_claude_hook_config, install_claude_hook_scripts, install_claude_hook_with_mode,
     install_claude_permissions_allow_mcp, install_claude_permissions_deny_replace,
-    install_claude_project_hooks, install_cline_rules, install_codebuddy_hook_config,
-    install_codebuddy_hook_scripts, install_codebuddy_hook_with_mode,
-    install_codebuddy_permissions_deny_replace, install_codebuddy_project_hooks,
-    install_codex_hook, install_codex_runtime_hook, install_copilot_hook,
-    install_copilot_runtime_hook, install_crush_hook_with_mode, install_cursor_deny_hook,
-    install_cursor_hook_config, install_cursor_hook_scripts, install_cursor_hook_with_mode,
-    install_gemini_deny_hook, install_gemini_hook, install_gemini_hook_config,
-    install_gemini_hook_scripts, install_grok_mcp, install_hermes_hook_with_mode,
-    install_jetbrains_hook, install_kiro_hook, install_openclaw_hook,
-    install_opencode_hook_with_mode, install_pi_hook_with_mode, install_qoder_hook_with_mode,
-    install_qoder_runtime_hook_with_mode, install_vibe_hook, install_windsurf_hooks,
-    install_windsurf_hooks_replace, install_windsurf_rules,
+    install_claude_project_hooks, install_claude_statusline, install_cline_rules,
+    install_codebuddy_hook_config, install_codebuddy_hook_scripts,
+    install_codebuddy_hook_with_mode, install_codebuddy_permissions_deny_replace,
+    install_codebuddy_project_hooks, install_codex_hook, install_codex_runtime_hook,
+    install_copilot_hook, install_copilot_runtime_hook, install_crush_hook_with_mode,
+    install_cursor_deny_hook, install_cursor_hook_config, install_cursor_hook_scripts,
+    install_cursor_hook_with_mode, install_gemini_deny_hook, install_gemini_hook,
+    install_gemini_hook_config, install_gemini_hook_scripts, install_grok_mcp,
+    install_hermes_hook_with_mode, install_jetbrains_hook, install_kiro_hook,
+    install_openclaw_hook, install_opencode_hook_with_mode, install_pi_hook_with_mode,
+    install_qoder_hook_with_mode, install_qoder_runtime_hook_with_mode, install_vibe_hook,
+    install_windsurf_hooks, install_windsurf_hooks_replace, install_windsurf_rules,
 };
 use support::{
     ensure_codex_hooks_enabled, install_codex_instruction_docs, install_named_json_server,
@@ -246,15 +280,33 @@ const REFRESH_EXEMPT_HYBRID_AGENTS: &[&str] = &[
 /// Called after updates and on MCP server start to ensure hooks match the
 /// current binary version. Registry-driven: every Hybrid agent with a global
 /// shell hook is covered (the rest are explicitly exempted, enforced by test).
+///
+/// `[setup] manage_hooks = false` turns this into a no-op (#1879): users who
+/// hand-pick hook entries keep them, and only an explicit `setup`, `init` or
+/// `doctor --fix` writes agent hook config.
 pub fn refresh_installed_hooks() {
+    if !crate::core::config::Config::load().setup.manage_hooks {
+        tracing::debug!("hook refresh skipped: [setup] manage_hooks = false");
+        return;
+    }
     let Some(home) = crate::core::home::resolve_home_dir() else {
         return;
     };
+    // OpenCode is refreshed by `setup`, not here — except its native-tool
+    // gates: "ask" refuses calls like a deny hook, and an update through a
+    // package manager never reaches setup.
+    agents::release_opencode_native_tool_gates(&home);
     for agent in REFRESHABLE_HOOK_AGENTS {
         if hooks_installed_for(agent, &home) {
             refresh_agent_hooks(agent, &home);
         }
     }
+}
+
+/// The hook mode in effect for `agent`, or `None` when no lean-ctx hook
+/// artifacts are installed for it (global only). Used for coverage reporting.
+pub(crate) fn installed_hook_mode(agent: &str, home: &std::path::Path) -> Option<HookMode> {
+    hooks_installed_for(agent, home).then(|| recommend_hook_mode(agent))
 }
 
 /// True when `agent` already has lean-ctx hook artifacts on disk (global only).
@@ -306,15 +358,18 @@ fn refresh_agent_hooks(agent: &str, home: &std::path::Path) {
         "claude" => {
             install_claude_hook_scripts(home);
             install_claude_hook_config(home);
-            if mode == HookMode::Replace {
+            // The value status line shipped in 3.10.3 but was only written by
+            // `init --agent claude`, so every existing install missed it.
+            install_claude_statusline(home);
+            if claude_hides_native_search(mode) {
                 install_claude_permissions_deny_replace(home);
             }
         }
         "codebuddy" => {
             install_codebuddy_hook_scripts(home);
             install_codebuddy_hook_config(home);
-            if mode == HookMode::Replace {
-                install_codebuddy_permissions_deny_replace(home);
+            if claude_hides_native_search(mode) {
+                install_codebuddy_permissions_deny_replace(home, mode);
             }
         }
         "cursor" => {
@@ -365,7 +420,7 @@ fn file_contains_lean_ctx(path: &std::path::Path) -> bool {
 /// there. Shell-executed hook commands go through
 /// [`resolve_hook_command_binary`], which honors the portable override (#708).
 fn resolve_binary_path() -> String {
-    crate::core::portable_binary::resolve_portable_binary()
+    crate::core::portable_binary::resolve_agent_binary()
 }
 
 /// Binary token for **shell-executed** hook commands (`<binary> hook rewrite`
@@ -950,7 +1005,7 @@ pub fn kiro_steering_content() -> String {
         "---\n\
 inclusion: always\n\
 ---\n\n\
-# Context Engineering Layer\n\n\
+# LeanCTX — Context Gateway for AI Systems\n\n\
 {start}\n\
 <!-- version: {version} -->\n\n\
 The workspace has the `lean-ctx` MCP server installed. \
@@ -1146,8 +1201,9 @@ pub(crate) fn install_agent_runtime_hook_with_mode(agent: &str, global: bool, mo
         "claude" | "claude-code" => {
             install_claude_hook_scripts(&home);
             install_claude_hook_config(&home);
+            install_claude_statusline(&home);
 
-            if mode == HookMode::Replace {
+            if claude_hides_native_search(mode) {
                 install_claude_permissions_deny_replace(&home);
             }
 
@@ -1157,8 +1213,8 @@ pub(crate) fn install_agent_runtime_hook_with_mode(agent: &str, global: bool, mo
             install_codebuddy_hook_scripts(&home);
             install_codebuddy_hook_config(&home);
 
-            if mode == HookMode::Replace {
-                install_codebuddy_permissions_deny_replace(&home);
+            if claude_hides_native_search(mode) {
+                install_codebuddy_permissions_deny_replace(&home, mode);
             }
         }
         "cursor" => {
@@ -1280,48 +1336,22 @@ fn make_executable(_path: &PathBuf) {}
 /// per-category dirs (config/data/state/cache) at runtime, and pinning the data
 /// dir would set that var in the server's environment, forcing single-dir mode
 /// and collapsing config/state/cache onto the data dir — defeating the XDG split
-/// (GH #408). Emits `LEAN_CTX_PROJECT_ROOT` and `LEAN_CTX_EXTRA_ROOTS` when known
-/// (process env first, then config). Without these, a long-lived MCP server
-/// spawned by the agent loses the project / worktree scope captured at `init`,
-/// so an explicit path under a sibling worktree is wrongly rejected as a jail
-/// escape (#403). Single source of truth so every agent installer stays consistent.
+/// (GH #408).
+///
+/// Deliberately does NOT pin a project either. Agent configs are user-global:
+/// one `~/.codex/config.toml` serves every Codex session on the machine. The
+/// #403 build copied the *installing* process's `LEAN_CTX_PROJECT_ROOT` /
+/// `LEAN_CTX_EXTRA_ROOTS` in here, so whichever project last ran `setup`,
+/// `doctor --fix` or an MCP-start hook refresh became the project of every
+/// later session — and each switch needed a config edit plus an MCP restart.
+/// The server derives its project per session instead (host roots, host env,
+/// working directory) and reads `extra_roots` from config.toml itself; stale
+/// pins are removed by [`project_pins`].
+///
+/// Single source of truth so every agent installer stays consistent; it is
+/// currently empty on purpose.
 pub(crate) fn mcp_server_env_pairs() -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-
-    let cfg = crate::core::config::Config::load();
-
-    let project_root = std::env::var("LEAN_CTX_PROJECT_ROOT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| cfg.project_root.clone().filter(|v| !v.trim().is_empty()));
-    if let Some(root) = project_root {
-        pairs.push(("LEAN_CTX_PROJECT_ROOT".to_string(), root));
-    }
-
-    // Env override is already a platform path-list; config is a Vec we join the
-    // same way `LEAN_CTX_EXTRA_ROOTS` is parsed (`std::env::split_paths`).
-    let extra_roots = std::env::var("LEAN_CTX_EXTRA_ROOTS")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            let roots: Vec<&str> = cfg
-                .extra_roots
-                .iter()
-                .map(String::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .collect();
-            if roots.is_empty() {
-                return None;
-            }
-            std::env::join_paths(roots)
-                .ok()
-                .map(|s| s.to_string_lossy().to_string())
-        });
-    if let Some(extra) = extra_roots {
-        pairs.push(("LEAN_CTX_EXTRA_ROOTS".to_string(), extra));
-    }
-
-    pairs
+    Vec::new()
 }
 
 /// The MCP server env block as a JSON object, for the JSON-config agents.

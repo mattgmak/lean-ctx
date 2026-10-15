@@ -7,6 +7,7 @@ mod defaults;
 mod defaults_allowlist;
 mod enterprise;
 mod enums;
+mod intelligence;
 mod loader;
 mod logic;
 mod memory;
@@ -21,10 +22,12 @@ mod response_shaping;
 pub mod risk;
 pub mod schema;
 mod sections;
+mod semantic;
 mod serde_defaults;
 pub mod setter;
 mod shell_activation;
 pub mod solution;
+mod value_display;
 
 /// Cache payload for [`Config::load_arc`]: the shared config alongside the
 /// content hashes of the global and project-local files plus the environment-
@@ -45,6 +48,7 @@ pub use enums::{
     CognitiveMode, CompressionLevel, Effort, OutputDensity, PermissionInheritance, RecoveryHints,
     ResponseVerbosity, RulesInjection, RulesScope, SessionDegrade, TeeMode, TerseAgent,
 };
+pub use intelligence::IntelligenceRuntimeConfig;
 pub use loader::last_config_parse_error;
 pub use loader::local_sensitive_overrides;
 pub(crate) use loader::strip_sensitive_overrides;
@@ -65,11 +69,17 @@ pub use response_shaping::{
     CodeRepetitionConfig, ConfirmationConfig, NarrationConfig, PreambleConfig,
     ResponseShapingConfig,
 };
+pub use semantic::SemanticMode;
 pub use shell_activation::ShellActivation;
+pub use value_display::{StatuslineStyle, ValueDisplayConfig, ValueDisplayMode};
 
 #[cfg(test)]
 mod solution_tests;
 #[cfg(test)]
+mod telemetry_migration_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_parsing;
+#[cfg(test)]
+mod v3_config_migration_tests;

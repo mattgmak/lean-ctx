@@ -16,3 +16,7 @@ rust/eval/testbench/** text eol=lf
 rust/data/addon_registry.json text eol=lf
 rust/data/grammar_registry.json text eol=lf
 
+# Signed release assets: the signatures cover the exact downloaded bytes, so a
+# CRLF checkout on Windows would make genuine fixtures fail verification.
+rust/src/core/updater/testdata/** -text
+

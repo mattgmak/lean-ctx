@@ -4,7 +4,15 @@
 //! and leaf metadata before and after I/O. Unix keeps the stronger
 //! descriptor-relative backend in `platform`.
 
-use super::*;
+use super::{
+    APPEND_JOURNAL_SCHEMA, AppendJournalV1, Arc, DirectoryIdentity, ExecutionEvent,
+    ExecutionLedgerError, ExecutionLedgerStore, File, FileExt, GENESIS, LEDGER_RECORD_KIND,
+    LEDGER_RECORD_SCHEMA, LedgerRecordV1, MAX_APPEND_JOURNAL_BYTES, MAX_LEDGER_RECORD_BYTES, Mutex,
+    Path, PathBuf, Read, Result, Seek, SeekFrom, Write, file_is_newline_terminated,
+    file_len_and_sha256, fs, hash_event, parse_canonical_event, read_bounded_file,
+    read_complete_events_and_tail, read_events_from_file, sha256, sha256_prefix,
+    validate_relative_path, validate_root_path, verify_events,
+};
 #[cfg(windows)]
 use std::ffi::c_void;
 use std::fs::OpenOptions;
@@ -389,7 +397,7 @@ fn validate_directory(path: &Path) -> Result<()> {
                 | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
         )?;
         validate_windows_handle(path, &directory, true)?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -404,8 +412,8 @@ fn validate_directory(path: &Path) -> Result<()> {
 fn validate_regular_file(path: &Path, file: &File, label: &str) -> Result<()> {
     #[cfg(windows)]
     {
-        return validate_windows_handle(path, file, false)
-            .map_err(|_| invalid(&format!("{label} changed while opening")));
+        validate_windows_handle(path, file, false)
+            .map_err(|_| invalid(&format!("{label} changed while opening")))
     }
     #[cfg(not(windows))]
     {
@@ -436,7 +444,7 @@ fn remove_checked(path: &Path) -> Result<()> {
             FILE_FLAG_OPEN_REPARSE_POINT,
         )?;
         validate_windows_handle(path, &file, false)?;
-        return mark_windows_delete(&file);
+        mark_windows_delete(&file)
     }
     #[cfg(not(windows))]
     {
@@ -541,10 +549,9 @@ fn windows_handle_matches_path(file: &File, expected: &Path) -> Result<bool> {
     let expected = long_windows_path(expected)?;
     Ok(actual.len() == expected.len()
         && actual.iter().zip(expected).all(|(left, right)| {
-            if *left <= u8::MAX as u16 && right <= u8::MAX as u16 {
-                (*left as u8).eq_ignore_ascii_case(&(right as u8))
-            } else {
-                *left == right
+            match (u8::try_from(*left), u8::try_from(right)) {
+                (Ok(left_byte), Ok(right_byte)) => left_byte.eq_ignore_ascii_case(&right_byte),
+                _ => *left == right,
             }
         }))
 }

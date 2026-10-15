@@ -4,7 +4,7 @@ lean-ctx is configured as an MCP server. Use lean-ctx MCP tools instead of built
 
 | Built-in | Use instead | Why |
 |----------|-------------|-----|
-| Read / cat / head | `ctx_read` | Session caching, 6 compression modes, re-reads cost ~13 tokens |
+| Read / cat / head | `ctx_read` | Session caching, read modes, compact references for eligible re-reads |
 | Bash (shell commands) | `ctx_shell` | Pattern-based compression for git, npm, cargo, docker, tsc |
 | Grep / rg | `ctx_search` | Compact context, token-efficient results |
 | ls / find | `ctx_tree` | Compact directory maps with file counts |

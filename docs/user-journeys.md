@@ -1,13 +1,9 @@
 # Historical User Journeys — Context OS research
 
-> **Status: historical product research — not current website or installation
-> copy.** This document includes proposed Context OS, plugin, multi-SDK, Cloud,
-> and commercial-plane journeys that are not active LeanCTX commitments. Current
-> truth is `docs/internal/README.md` (internal, not in this repository): LeanCTX is **The
-> Context SDK for AI Agents**, a local context system for existing agents;
-> the local Runtime is available and Python
-> SDK v1/reference-wrapper work is Preview. Do not treat commands or claims below
-> as shipped without current reference documentation and release evidence.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 > **Original audience:** website / product narrative. Each journey is a
 > persona-driven historical story: *who* hits a wall, *what* they do with

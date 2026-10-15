@@ -4,8 +4,8 @@
 > integration promise.** Codex, Claude Code, and Cursor are the current
 > first-class local setup paths. Verify this generic Attach wiring against the
 > installed OpenCode version; compatibility alone is not a performance or
-> evidence guarantee. Product scope is governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> evidence guarantee. See the [canonical positioning](../POSITIONING_CANONICAL.md)
+> for current product scope and claim boundaries.
 
 Complete guide to setting up and optimally using lean-ctx with OpenCode (open-source AI coding agent).
 
@@ -68,7 +68,7 @@ OpenCode uses `~/.config/opencode/AGENTS.md` for global agent instructions. lean
 
 ...
 
-# lean-ctx — Context Engineering Layer
+# LeanCTX — Context Gateway for AI Systems
 
 <!-- lean-ctx-rules -->
 
@@ -158,38 +158,30 @@ rules back).
 
 ## Multi-Model Workflow
 
-OpenCode supports multiple LLM providers. lean-ctx works identically across all of them:
-
-### Provider-Agnostic Benefits
-
-| Provider | Context Window | lean-ctx Benefit |
-| Claude (Anthropic) | 200K tokens | Cost reduction, session memory |
-| GPT-4 (OpenAI) | 128K tokens | Context space optimization |
-| Gemini (Google) | 1M+ tokens | Cost reduction, focus |
-| Local models (Ollama) | 8-32K tokens | Critical context management |
+OpenCode can connect to multiple providers. This guide describes the lean-ctx
+integration points; available models, tokenization, context limits, caching,
+usage reporting, and billing vary by provider and configuration.
 
 ### Small Context Windows (Local Models)
 
-For local models with limited context windows, lean-ctx is especially valuable:
+For a task that needs structure rather than full source, choose a narrower view:
 
 ```
-# Compressed reads leave room for actual reasoning
-ctx_read("src/main.rs", "map")        # ~400 tokens instead of ~2000
-ctx_read("src/lib.rs", "signatures")  # ~200 tokens instead of ~2000
-
-# Combined savings: 4x more files fit in context
+# Structural views can reduce emitted source context
+ctx_read("src/main.rs", "map")
+ctx_read("src/lib.rs", "signatures")
 ```
 
 ### Large Context Windows (Cloud Models)
 
-Even with large context windows:
+The same selection and cache mechanisms apply where supported:
 
 ```
-# Cost reduction: fewer tokens = lower API bills
-ctx_read("src/main.rs", "full")  # Cached: ~13 tokens on re-read
+# An eligible unchanged read may return a compact cache reference
+ctx_read("src/main.rs", "full")
 
-# Quality improvement: focused context = better responses
-ctx_overview("implement user authentication")  # Task-relevant context only
+# Gather task-oriented project context
+ctx_overview("implement user authentication")
 ```
 
 ## OpenCode-Specific Workflow
@@ -301,16 +293,16 @@ ctx_agent(action="handoff", target="agent-2", context="Implement the auth refact
 ctx_agent(action="sync")  # Receives Agent 1's context
 ```
 
-## Token Savings
+## Context measurement
 
-| Operation                  | Without lean-ctx | With lean-ctx | Savings |
-| -------------------------- | ---------------- | ------------- | ------- |
-| File read (cached re-read) | ~2000 tokens     | ~13 tokens    | 99.4%   |
-| File read (map mode)       | ~2000 tokens     | ~400 tokens   | 80%     |
-| File read (signatures)     | ~2000 tokens     | ~200 tokens   | 90%     |
-| `git status`               | ~800 tokens      | ~120 tokens   | 85%     |
-| `cargo test`               | ~2000 tokens     | ~300 tokens   | 85%     |
-| `npm install`              | ~1500 tokens     | ~200 tokens   | 87%     |
+`map`, `signatures`, focused search, and supported shell summaries can reduce
+the context emitted for a task. The result depends on the file, mode, command,
+integration, provider route, and recovery behavior.
+
+`lean-ctx gain --live` and `lean-ctx benchmark report .` show local token and
+cost estimates for activity they observe. Provider-reported usage is available
+only for supported routed paths that record it; local estimates do not
+establish invoice savings or answer quality.
 
 ## Troubleshooting
 

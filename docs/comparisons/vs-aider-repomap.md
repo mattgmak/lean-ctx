@@ -1,9 +1,9 @@
 # LeanCTX and Aider repo-map
 
-> **Status: historical comparison note — not canonical product copy.** Current
-> LeanCTX scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository). This note makes no
-> claim that either repo-map produces a particular quality or agent outcome.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 Aider's repo-map is part of its coding assistant. LeanCTX can expose local
 codebase-orientation primitives to an existing MCP-capable coding agent. These

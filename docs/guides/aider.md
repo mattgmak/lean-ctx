@@ -4,8 +4,8 @@
 > integration promise.** Codex, Claude Code, and Cursor are the current
 > first-class local setup paths. This generic MCP/CLI wiring must be verified
 > against the installed Aider version and observes only the context behavior it
-> can see. Product scope is governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> can see. See the [canonical positioning](../POSITIONING_CANONICAL.md) for
+> current product scope and claim boundaries.
 
 Complete guide to setting up and optimally using lean-ctx with Aider (AI pair programming in your terminal).
 
@@ -31,7 +31,7 @@ lean-ctx doctor
 
 Aider operates differently from IDE-based agents. It uses its own repository map and file management. lean-ctx complements Aider by providing:
 
-1. **Compressed file reads** — token savings on file context
+1. **Context-aware file reads** — choose a structural or focused representation when it fits the task
 2. **Semantic search** — find relevant code by meaning
 3. **Knowledge persistence** — maintain decisions across sessions
 4. **Code graph** — understand impact of changes
@@ -63,7 +63,7 @@ aider --mcp-server "lean-ctx:lean-ctx"
 lean-ctx injects dedicated rules that guide Aider to use lean-ctx tools:
 
 ```markdown
-# lean-ctx — Context Engineering Layer
+# LeanCTX — Context Gateway for AI Systems
 <!-- lean-ctx-rules -->
 
 ## Mode Selection
@@ -171,15 +171,17 @@ ctx_knowledge(action="remember", category="decision", content="Refactored to con
 ctx_session(action="task", value="Database connection pooling refactor [100%]")
 ```
 
-## Token Savings with Aider
+## Context selection and measurement
 
-Aider sends full file contents to the LLM. lean-ctx helps by:
+Use `map` or `signatures` to inspect structure before adding source files to an
+Aider request. Search can return focused matches, and saved knowledge can carry
+selected findings into later sessions. The context Aider ultimately sends still
+depends on its file selection and the installed integration.
 
-1. **Pre-filtering context** — use `map`/`signatures` to understand structure before adding files
-2. **Cached reads** — unchanged re-reads may use the local cache representation;
-   inspect local diagnostics before making any performance claim
-3. **Search efficiency** — `ctx_search` returns compact results vs. raw grep output
-4. **Knowledge persistence** — avoid re-discovering things in new sessions
+`lean-ctx gain --live` and `lean-ctx benchmark report .` show local token and
+cost estimates for the activity they observe. Provider-reported usage is
+available only for supported routed paths that record it; local estimates do
+not establish invoice savings or answer quality.
 
 ## Advanced: Pre-Prompt Integration
 

@@ -21,6 +21,7 @@
 
 use super::prompt::{confirm, wants_yes};
 use crate::core::config::setter::set_by_key;
+use crate::core::pathjail_scope::PathJailScope;
 use crate::core::security_posture::{JailState, PostureLevel, SecurityPosture};
 use crate::core::shell_allowlist::ShellSecurity;
 
@@ -166,6 +167,12 @@ fn print_status() {
     println!();
     println!("  {BOLD}Containment{RST} {DIM}— protects your machine from the agent{RST}");
     println!("    Path jail       {}", jail_line(&p.jail));
+    if !p.jail.is_disabled() {
+        println!(
+            "    Jail scope      {}",
+            scope_line(PathJailScope::resolve())
+        );
+    }
     println!("    Shell gating    {}", shell_line(p.shell));
     println!();
     println!("  {BOLD}Secret defense{RST} {DIM}— protects your secrets from the LLM provider{RST}");
@@ -180,14 +187,31 @@ fn print_status() {
     );
     println!("    {DIM}secrets →{RST}  lean-ctx security secrets <on|off>");
     println!(
-        "    {DIM}granular →{RST} lean-ctx config set shell_security warn|off · path_jail false · lean-ctx allow <cmd>"
+        "    {DIM}granular →{RST} lean-ctx config set shell_security warn|off · path_jail false · path_jail_scope home|projects|project"
     );
+    println!(
+        "    {DIM}paths    →{RST}  lean-ctx allow-path <dir>     {DIM}open one extra/protected dir · lean-ctx allow <cmd> for commands{RST}"
+    );
+}
+
+fn scope_line(scope: PathJailScope) -> String {
+    match scope {
+        PathJailScope::Home => format!(
+            "{GREEN}home{RST}  {DIM}(read and write everything below ~; ~/.ssh, ~/.config & other dot dirs, ~/Library stay closed){RST}"
+        ),
+        PathJailScope::Projects => format!(
+            "{YELLOW}projects{RST}  {DIM}(read every project below ~, write the active one — `path_jail_scope home` for all of ~){RST}"
+        ),
+        PathJailScope::Project => format!(
+            "{YELLOW}project{RST}  {DIM}(only the active project + allow_paths — `path_jail_scope home` for all of ~){RST}"
+        ),
+    }
 }
 
 fn jail_line(jail: &JailState) -> String {
     match jail {
         JailState::Enforced => {
-            format!("{GREEN}enforced{RST}  {DIM}(project root + configured allow_paths only){RST}")
+            format!("{GREEN}enforced{RST}  {DIM}(see scope below + configured allow_paths){RST}")
         }
         JailState::Relaxed(sources) => format!(
             "{GREEN}enforced{RST} {YELLOW}but widened via {}{RST}  {DIM}(reads beyond the project root){RST}",

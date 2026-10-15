@@ -171,10 +171,11 @@ pub(crate) fn hybrid_search_mode(
             )
         } else {
             format!(
-                "Semantic search (Hybrid): \"{}\" ({} results from {} indexed chunks, embeddings coverage {:.0}%)\n",
+                "Semantic search (Hybrid): \"{}\" ({} results from {} indexed chunks in {}, embeddings coverage {:.0}%)\n",
                 truncate_query(query, 60),
                 results.len(),
                 index.doc_count,
+                crate::core::pathutil::strip_verbatim(root.to_path_buf()).display(),
                 coverage * 100.0
             )
         };
@@ -213,10 +214,11 @@ pub(crate) fn hybrid_search_mode(
             )
         } else {
             format!(
-                "Semantic search (BM25{graph_tag}): \"{}\" ({} results from {} indexed chunks)\n",
+                "Semantic search (BM25{graph_tag}): \"{}\" ({} results from {} indexed chunks in {})\n",
                 truncate_query(query, 60),
                 results.len(),
                 index.doc_count,
+                crate::core::pathutil::strip_verbatim(root.to_path_buf()).display(),
             )
         };
         format!("{header}{}", format_search_results(&results, compact))
@@ -288,10 +290,11 @@ pub(crate) fn dense_search_mode(
             )
         } else {
             format!(
-                "Semantic search (Dense): \"{}\" ({} results from {} indexed chunks, embeddings coverage {:.0}%)\n",
+                "Semantic search (Dense): \"{}\" ({} results from {} indexed chunks in {}, embeddings coverage {:.0}%)\n",
                 truncate_query(query, 60),
                 results.len(),
                 index.doc_count,
+                crate::core::pathutil::strip_verbatim(root.to_path_buf()).display(),
                 coverage * 100.0
             )
         };
@@ -324,8 +327,11 @@ pub(crate) fn load_engine_and_index(
         return Err("embeddings disabled by memory_profile=low".into());
     }
 
-    let engine = crate::core::embeddings::shared_engine()
-        .ok_or_else(|| "embedding engine load failed".to_string())?;
+    let engine = {
+        let _phase = crate::core::phase_timing::enter("dense: embedding engine load");
+        crate::core::embeddings::shared_engine()
+            .ok_or_else(|| "embedding engine load failed".to_string())?
+    };
 
     let model_name = engine.model_name();
     let mut idx = EmbeddingIndex::load(root)
@@ -385,6 +391,7 @@ pub(crate) fn ensure_embeddings(
         return Ok((aligned, coverage, Vec::new()));
     }
 
+    let _phase = crate::core::phase_timing::enter("dense: embedding changed chunks");
     let mut changed_files = embed_idx.files_needing_update(&index.chunks);
     changed_files.sort();
     changed_files.dedup();
@@ -419,6 +426,9 @@ pub(crate) fn ensure_embeddings(
     }
 
     if let Some(aligned) = embed_idx.get_aligned_flat(&index.chunks) {
+        if !changed_files.is_empty() {
+            crate::core::embedding_index::clear_partial_marker(root);
+        }
         let coverage = embed_idx.coverage(index.chunks.len());
         return Ok((aligned, coverage, changed_files));
     }
@@ -444,6 +454,7 @@ pub(crate) fn ensure_embeddings(
     let aligned = embed_idx
         .get_aligned_flat(&index.chunks)
         .ok_or_else(|| "embedding alignment failed after full rebuild".to_string())?;
+    crate::core::embedding_index::clear_partial_marker(root);
     let coverage = embed_idx.coverage(index.chunks.len());
     Ok((aligned, coverage, all_files))
 }

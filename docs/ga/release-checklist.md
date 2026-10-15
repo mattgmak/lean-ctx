@@ -3,10 +3,10 @@
 > **Status: active OSS release gate, not a completion record.** Every unchecked
 > item remains pending; this checklist does not authorize website, Cloud,
 > managed-service, control-plane, or Research capability deployment. Delivery
-> order and capability status are governed by the
-> OSS Vision Delivery Plan (`docs/internal/execution/OSS-VISION-DELIVERY-PLAN.md`, internal — not in this repository)
-> and the internal canonical entry point (`docs/internal/README.md`, internal — not in this repository). This document
-> is the public local Runtime release boundary; maintainer-only operator notes do
+> order and public capability status follow the
+> [canonical positioning](../POSITIONING_CANONICAL.md), [public claims contract](../contracts/public-product-claims-v1.md)
+> and [Vision](../../VISION.md). This document
+> is the public LeanCTX Engine release boundary; maintainer-only operator notes do
 > not replace or weaken any gate below.
 
 ## Overview
@@ -91,7 +91,7 @@ release assets, and verification commands.
   cargo test --manifest-path rust/Cargo.toml --lib calibrator::selection
   ```
 
-- [ ] Narrative and claim language matches the internal authority.
+- [ ] Narrative and claim language matches the public claims contract.
 
   ```bash
   python3 scripts/check-narrative-governance.py
@@ -162,14 +162,14 @@ W1 verifier with external signer trust. A release may ship without such a claim.
    - Linux x86_64 and arm64
    - Linux CUDA
 
-3. Confirm CI attaches platform archives and binaries, `SBOM.txt`,
+3. Confirm CI attaches platform archives and binaries, `SBOM.cdx.json`,
    `SHA256SUMS`, and `release-manifest.json` to the release.
 
 4. Confirm `SHA256SUMS` is generated and signed where the release process has
    a signing key. Do not publish if a checksum or manifest artifact is missing.
 
 The required chain is source commit → build artifacts → `SHA256SUMS` →
-`SBOM.txt` → `release-manifest.json`. The integrity contract defines its
+`SBOM.cdx.json` → `release-manifest.json`. The integrity contract defines its
 schema and failure behavior.
 
 ### 3. Post-release gate
@@ -187,8 +187,10 @@ schema and failure behavior.
   ```
 
 - [ ] Update the compatibility matrix if platform, agent, or protocol support changed.
-- [ ] Preserve Python’s **Preview** status in release notes and compatibility
-  material; do not infer broader support from package tests.
+- [ ] Preserve each interface's declared status in release notes and compatibility
+  material. The standalone SDK's Stable interfaces and its separately named
+  Preview namespace follow that repository's public surface manifest; an old
+  in-tree Python experiment does not define the standalone SDK's status.
 - [ ] Record the exact offline fixture and rollback commands/results when the
   release changes those boundaries. A green unit test does not establish a
   customer-proof or a capability promotion.
@@ -236,11 +238,12 @@ A release is complete only when:
 - The compatibility matrix and milestone state are current.
 - Both remotes contain the final `main` commit and version tag.
 
-It may describe only the capability status that is actually shipped: local
-Runtime/CLI/MCP paths are Available, Python SDK v1 is Preview, and Profiles,
-first-class Context Kits, benchmark/performance claims, managed operation, and
-control-plane capabilities remain Research unless their explicit delivery gates
-are complete.
+It may describe only the capability status that is actually shipped. Local
+Engine/CLI/MCP paths are Available within their documented scope. The standalone
+SDK and licensed Enterprise product have their own release and contract
+boundaries. Research profiles, first-class Context Kits and performance claims
+require their explicit delivery and evidence gates; this Engine release does
+not promote them or establish managed-service availability.
 
 Record the tag, source commit, verification output, and approved exceptions with
 release evidence. Reject a release for any manifest, checksum, size, or tag

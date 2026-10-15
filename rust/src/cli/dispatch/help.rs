@@ -8,7 +8,7 @@
 /// (`onboard`), not the full 150-line command reference.
 pub(super) fn quickstart_text() -> String {
     format!(
-        "lean-ctx {version} — Context SDK for AI Agents
+        "lean-ctx {version} — Context Gateway for AI Systems
 
 With no arguments, lean-ctx speaks the MCP protocol on stdin/stdout — that is
 for your AI editor, not for interactive use. It is doing that right now and
@@ -46,7 +46,7 @@ pub(super) fn print_help_concise() {
 
 pub(super) fn concise_help_text() -> String {
     format!(
-        "lean-ctx {version} — Context SDK for AI Agents
+        "lean-ctx {version} — Context Gateway for AI Systems
 
 {banner}
 
@@ -72,7 +72,7 @@ EVERYDAY COMMANDS:
 MANAGE:
     lean-ctx status                Am I connected? (quick check)
     lean-ctx update                Update to the latest version
-    lean-ctx enable-gpu            Install the CUDA-enabled Linux binary
+    lean-ctx enable-gpu            Install the CUDA-enabled binary (Linux, Windows)
     lean-ctx uninstall             Remove lean-ctx cleanly
 
 SAFETY (env vars):
@@ -97,7 +97,7 @@ GITHUB:  https://github.com/yvgude/lean-ctx
 /// — a removed command listed here is how #1602 reached a user.
 pub(super) fn full_help_text() -> String {
     format!(
-        "lean-ctx {version} — Context SDK for AI Agents
+        "lean-ctx {version} — Context Gateway for AI Systems
 
 {banner}
 
@@ -158,15 +158,23 @@ COMMANDS:
     gain --unpublish[=<id|url|all>]  Take a published card down (works even when publishing is off)
     config set gain.auto_publish true  Development-only local export setting (off by default)
     savings [--period day|week|month|all] [--format table|json|markdown] Local representation-change report; not comparable proof
+    value [--session <id>|--all] [--json]  What lean-ctx did, recomputed from the verified chains
+    statusline [--wrap \"<cmd>\"]    Claude Code status line (set up by `init --agent claude`)
+    inspect [--last <N>|--task <ID>] [--json]  Why the Context Gateway delivered, changed or withheld sources; --task: one task's plan→delivery→outcome
+    claude-mod [status|install|uninstall]  Claude Code mod: wake-not-poll, Bash shaping, /leanctx (opt-in)
+    prompt-segment [--shell zsh|bash|fish|plain]  Shell prompt segment (set up by `init --prompt`)
     learning [status|export|import]  Local adaptive-learning state: inspect, export, import
-         token-report [--json]          Token + memory report (project + session + CEP)
+    autopilot [status|explain|history|export|evidence|reset]  Personal receipt-validated learning; evidence: per-workload strategy evidence (help for options)
+    codex-protected --project <DIR> [--codex <PATH>|--check]  One Codex session that reaches <DIR> only through lean-ctx
+    token-report [--json]          Token + memory report (project + session + CEP)
     pack --pr                      PR Context Pack (changed files, impact, tests, artifacts)
     snapshot create|list|show|verify|restore|publish|import  Context Time Machine: git-anchored, signed snapshots; replay, resume + share
-    index <status|build|build-full|watch> [--force]  Codebase index utilities
-    embeddings <status|provision>  Local ONNX Runtime for semantic embeddings (official CPU build, sha256-pinned)
+    index <status|build|build-full|watch|why <file>>  Codebase index utilities
+    embeddings status              Show the ONNX Runtime used for semantic embeddings (ORT_DYLIB_PATH)
     cep                            CEP report (compression metrics, cache, modes, trends)
     verify-cache [path] [--json]   Inspect local session-cache re-read behavior
     prove [--format table|json|markdown] [--output FILE]  Generate Decision Loop evidence report
+    prove speed --suite FILE [--runs N] [--budget N] [--json] | --verify [FILE]  Signed A/B proof of model latency with vs. without lean-ctx
     health [path] [--json] [--gate]  Code-health report: cognitive complexity, naming, navigability score + token tax
     dashboard [--port=N] [--host=H] [--base-path=/prefix] [--open=browser|none|vscode]  Open web dashboard (default: http://localhost:3333)
     serve [--host H] [--port N]    MCP over HTTP (Streamable HTTP, local-first)
@@ -223,6 +231,7 @@ COMMANDS:
     secure                         Restore secure defaults (path jail + shell gating + secret redaction)
     security secrets <on|off>      Toggle secret/.env redaction (separate from containment)
     allow <cmd>                    Allow one shell command (additive; granular re-enable after yolo)
+    allow-path <dir>               Let tools reach a dir outside ~ or a protected one (no restart)
     tools [minimal|standard|power|show|list]  How many MCP tools your agent sees
     profile [list|show|diff|create|set|suggest]  Manage local context configuration profiles
     kit [list|load|show|unload] [name]  Manage available local TOML/.ctxpkg substrate; first-class Kit semantics are Research
@@ -231,25 +240,25 @@ COMMANDS:
     compression [off|lite|standard|max]  Set local output-density preference (alias: terse)
     slow-log [list|clear]          Show/clear slow command log (~/.lean-ctx/slow-commands.log)
     debug-log [list|tail N|clear|path]  Opt-in tool-call + hook-routing log (set debug_log / LEAN_CTX_DEBUG_LOG)
-    update [<version>] [--check]   Update lean-ctx, or pin a version, from GitHub Releases
-    enable-gpu [--check]           Install CUDA-enabled binary (x86_64 GNU/Linux)
+    update [<version>] [--check]   Update from a verified GitHub release
+                                   [--pin <version>|--unpin|--status|--rollback]
+    enable-gpu [--check]           Install CUDA-enabled binary (x86_64 Linux/Windows)
     stop                           Stop ALL lean-ctx processes (daemon, proxy, orphans)
     restart                        Restart daemon (applies config.toml changes)
     dev-install                    Build release + atomic install + restart (for development)
     codesign-setup                 macOS: one-time stable signing identity (stops repeating TCC prompt, #356)
     gotchas [list|clear|export|stats] Bug Memory: view/manage auto-detected error patterns
-    buddy [show|stats|ascii|json]  Token Guardian: your data-driven coding companion
     doctor integrations [--json]   Integration health checks (Cursor/Claude Code/CodeBuddy)
     doctor [--fix] [--json]        Run diagnostics (and optionally repair)
     doctor --migrate-check         v1.0 migration readiness audit (config, deprecations, data)
+    migrate config [path] --rollback          Restore digest-bound pre-v4 global config
+    migrate task-receipt <dir> [--rollback] Preserve or roll back V3 task migration metadata
     smells [scan|summary|rules|file] [--rule=<r>] [--path=<p>] [--json]
                                    Code smell detection (Property Graph, 8 rules)
     control <action> [--target=<t>] Context field manipulation (exclude/pin/priority)
     plan <task> [--budget=N]       Context planning (optimal Phi-scored context plan)
     compile [--mode=<m>] [--budget=N] Context compilation (knapsack + Boltzmann)
     visualize [--output F] [--open] Generate interactive HTML report (D3.js graph)
-    plugin list|enable|disable|info|init|hooks
-                                   Manage lean-ctx plugins
     addon list|search|info|add|remove
                                    Unavailable: marketplace/addon surface is Research
     rules sync|diff|lint|status|init
@@ -261,6 +270,82 @@ COMMANDS:
                                    MCP configs, rules, autostart, data, AND the binary itself.
                                    --keep-config preserves MCP/rules · --keep-binary keeps the
                                    binary · --dry-run previews without changing anything
+
+PROJECT & AGENT TOOLS:
+    semantic-search <query> [options]  Hybrid BM25 + embeddings code search (alias: search-code)
+    repomap [--json] [--max-tokens N] [--limit N]  PageRank-ranked repository map (alias: repo-map)
+    glob <pattern> [path]          Find files by glob pattern
+    heatmap [--top=N] [--dir=D] [--by=connections|tokens] [--json]  Most-connected / costliest files
+    call <tool> --project-root <path> --json '<json>' [--json-file <path>]
+                                   Invoke one MCP tool from the shell
+    ledger <status|reset|evict|prune|push> [args]  Inspect and manage the context ledger
+    ocla [ocla]                    Inspect Open Context & Token Lifecycle Architecture state
+    summary [recall|record|list] [query] [--top-k N]  Record + recall AI session summaries
+    checkpoints [--session <id>] [--commit <sha>] [--orphaned]  List provenance checkpoints
+    import <claude-code|codex|cursor|opencode>|--all [--dry-run]  Import facts from AI session histories
+    skillify [mine|list|status|promote <slug>]  Codify recurring session patterns into .cursor/rules
+    learn [--apply] [--mine [dir]] Learned error→fix corrections (--mine: distill a transcript dir)
+    export-rules [--format mdc|agents-md|claude-md|codebuddy-md] [--root DIR]
+                                   Export high-confidence knowledge as agent rules
+    compact [path]                 Compact agent transcripts (default: ~/.claude/projects)
+    agent register|list|presence|show|heartbeat|suspend|resume|decommission|check
+                                   Agent identities: registered, attested, revocable
+    instructions --client <id> [--profile <name>] [--json] | --list-clients
+                                   Print the agent instructions lean-ctx generates for a client
+    provider init|auth|logout|list Context providers (config scaffolds, Jira OAuth)
+    trust [<path>|status [<path>]|--list]  Trust a workspace (gates project-level overrides)
+    untrust [<path>]               Remove a workspace from the trust store
+    harden [options]               Deny native Read/Grep/Glob in IDE configs
+  telemetry [status|on|off|show|reset-id|history]  Inspect and control product telemetry
+    completions <zsh|bash|fish>    Print the shell completion script
+    report-issue [--title T] [--description D] [--dry-run] [--include-tee]
+                                   Open a GitHub issue with diagnostics (alias: report)
+    billing status|plans|entitlements <plan>|usage|settlement <verify|export> [--json]
+                                   Plan, entitlement and usage details
+
+EVIDENCE & MEASUREMENT:
+    stats [json|reset-cep]         Raw token counters (JSON export, reset CEP stats)
+    roi [--json|--md] [--export <path>]  Recorded savings (ROI) report from the signed ledger
+    finops export [--target=focus|cbf|vantage] [--from=D] [--to=D] [--out=FILE]
+                                   Daily cost/savings rows from the savings ledger
+    measure <baseline-start|baseline-stop|treatment-start|treatment-stop|compare|report>
+                                   Baseline vs. treatment measurement [--format markdown|json]
+    evidence run|workflow|realworld|report|v2|inspect  Generate or inspect evidence bundles
+    evidence-export [--output DIR] [--format markdown|json]  Portable package of local evidence
+    shadow [--latest|--list|--force]  Inspect local Shadow Mode comparisons
+    eval init <dir> | eval ab --suite <file>  Deterministic with/without output-quality proof
+    verify [--format summary|json|both] [--json]  Output-verification statistics
+    verify <bundle.zip> [--public-key F] [--verbose] [--json]  Verify an evidence bundle offline
+    proof [--format json|summary|both] [--no-write] [--filename F]  Write context proof artifacts
+    audit [evidence|determinism]   Compliance report (default), evidence audit, determinism check
+    conformance [--json]           Conformance scorecard, non-zero exit on failure (alias: selftest)
+    quality-lab [--original F --compressed F --ext E] [--json] [--gate]  Compression quality check
+    benchmark-run [AGENT] [options]  Run a benchmark against a coding agent (alias: bench-run)
+    calibrate [PROFILE] [options]  Find the optimal Performance Profile
+    pair <CODE>                    Pair with leanctx.com for remote benchmarks
+    scenario [all|triage|knowledge|shadow|value-gate|full-loop]  Run an end-to-end scenario
+    triage accuracy [--json]       Triage model accuracy report
+    model install triage | model status | model remove triage  Manage the local triage model
+    cognitive                      Context-intelligence subsystem status
+    introspect <cognition|qubo> [--json]  Cognition snapshot or QUBO selection benchmark
+    safety-levels                  Per-command compression safety levels (alias: safety)
+    badge [generate|stats [--json]|github-action|install]  \"Written with lean-ctx\" README badge
+
+INTEGRATION ENTRY POINTS (called by editors and hooks, not by hand):
+    mcp                            Start the MCP server on stdio (same as bare lean-ctx)
+    hook <rewrite|redirect|deny|read-dedup|observe|post-commit|copilot|...>
+                                   Agent hook handlers (Claude, Cursor, Copilot, Codex, Vibe)
+    editor-signal --file <path>    Report the file an editor has open
+    editor-session --event <open|heartbeat|close> --source <editor> --workspace <path> --session-id <id>
+                                   Record editor session presence
+    editor-bridge dir              Print the directory an editor's semantic bridge announces itself in
+    git-trailer <msg-file> [source]  Add the lean-ctx commit trailer (prepare-commit-msg hook)
+
+RESEARCH & RENAMED:
+    demo                           Research: control-plane demo (not in the public runtime)
+    enterprise                     Research: organization operations (not in the public runtime)
+    team                           Requires the lean-ctx Enterprise edition
+    upgrade [args]                 Renamed to `update`; forwards its arguments
 
 SHELL HOOK PATTERNS (95+):
     git       status, log, diff, add, commit, push, pull, fetch, clone,
@@ -286,7 +371,7 @@ SHELL HOOK PATTERNS (95+):
 
 READ MODES:
     auto                           Auto-select optimal mode (default)
-    full                           Full content (cached re-reads = 13 tokens)
+    full                           Full content (eligible re-reads use cache references)
     map                            Dependency graph + API signatures
     signatures                     tree-sitter AST extraction (27 languages)
     task                           Task-relevant filtering (requires ctx_session task)
@@ -315,7 +400,7 @@ EXAMPLES:
     lean-ctx gain --live           Live auto-updating terminal dashboard
     lean-ctx gain --graph          30-day local context-usage chart
     lean-ctx gain --daily          Day-by-day breakdown with USD
-         lean-ctx token-report --json   Machine-readable token + memory report
+    lean-ctx token-report --json   Machine-readable token + memory report
     lean-ctx dashboard             Open web dashboard at localhost:3333
     lean-ctx dashboard --host=0.0.0.0  Bind to all interfaces (remote access)
     lean-ctx gain --wrapped        Wrapped report card (recommended)
@@ -348,7 +433,7 @@ EXAMPLES:
     lean-ctx-mode off              Same as lean-ctx-off
     lean-ctx-status                Show whether compression is active
     lean-ctx init --agent pi       Install Pi Coding Agent extension
-  lean-ctx init --agent grok        Configure Grok (xAI) MCP + hooks
+    lean-ctx init --agent grok     Configure Grok (xAI) MCP + hooks
     lean-ctx doctor                Check PATH, config, MCP, and dashboard port
     lean-ctx doctor integrations   Detailed integration checks (Cursor/Claude Code/CodeBuddy)
     lean-ctx doctor --fix --json   Repair + machine-readable report
@@ -372,16 +457,17 @@ GRAPH (project analysis):
     lean-ctx graph symbol <spec>   Inspect a symbol (format: <file>::<symbol>, or bare <symbol>)
     lean-ctx graph context <query> Query the property graph for a concept
 
-HOSTED RESEARCH (unavailable unless LEAN_CTX_EXPERIMENTAL_HOSTED=1):
-    cloud status                   Development-only hosted status check
-    cloud upgrade                  Unavailable: hosted plans are not a public product path
-    login <email>                  Development-only account evaluation
-    register <email>               Development-only account evaluation
-    forgot-password <email>        Development-only account evaluation
-    sync                           Development-only hosted sync evaluation
-    sync index <push|pull|status>  Development-only hosted-index evaluation
-    cloud autosync <on|off|status> Development-only background-sync evaluation
-    contribute                     Development-only data-contribution evaluation
+ACCOUNT SYNC (accounts under an existing agreement; local tooling needs no account):
+    login <email>                  Sign in to your LeanCTX account on this machine
+    register <email>               Create a LeanCTX account
+    forgot-password <email>        Send a password reset email
+    sync                           Sync stats, plus your context when your plan includes synchronization
+    sync index <push|pull|status>  Encrypted cross-device retrieval index
+    cloud status                   Show account, plan and last sync
+    cloud pull                     Restore your synchronized knowledge onto this machine
+    cloud autosync <on|off|status> Daily background push of your synchronized context
+    cloud upgrade                  Unavailable: paid plans are application-only (hello@leanctx.com)
+    contribute                     Share anonymized compression data
 
 TROUBLESHOOTING:
     Commands broken?     lean-ctx-off             (fixes current session)

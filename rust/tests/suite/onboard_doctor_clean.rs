@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Golden-path contract (zero-config excellence): `lean-ctx onboard --yes` on a
 //! fresh machine with detected-but-unconfigured agents must leave `doctor` fully
 //! green — no "run: lean-ctx setup" follow-ups, no dead loops.
@@ -8,23 +10,6 @@
 //! mismatch between doctor and setup).
 
 use std::process::Command;
-
-/// Stops the daemon `onboard` started (scoped to the test's data dir), even
-/// when an assertion panics mid-test.
-struct DaemonStop<'a> {
-    bin: &'a str,
-    envs: Vec<(String, String)>,
-}
-
-impl Drop for DaemonStop<'_> {
-    fn drop(&mut self) {
-        let _ = Command::new(self.bin)
-            .arg("stop")
-            .env_clear()
-            .envs(self.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .output();
-    }
-}
 
 #[test]
 #[cfg_attr(
@@ -72,10 +57,8 @@ fn onboard_yes_leaves_doctor_fully_green() {
         // Hermetic: doctor must not try to fetch embedding models in CI.
         ("LEAN_CTX_EMBEDDINGS_AUTO_DOWNLOAD".into(), "0".into()),
     ];
-    let _stop = DaemonStop {
-        bin,
-        envs: envs.clone(),
-    };
+    // Stops the daemon `onboard` starts, even when an assertion panics.
+    let _daemon = super::hermetic_env::SandboxDaemon(&home);
 
     let onboard = Command::new(bin)
         .args(["onboard", "--yes"])
@@ -90,11 +73,20 @@ fn onboard_yes_leaves_doctor_fully_green() {
         String::from_utf8_lossy(&onboard.stderr)
     );
 
+    let env_script = home.join("cfg/env.sh");
+    assert!(
+        env_script.is_file(),
+        "onboard must install its shell environment"
+    );
+    // A subprocess cannot export into its parent. Model the documented Docker
+    // environment for the next invocation, without weakening doctor checks.
     let doctor = Command::new(bin)
         .arg("doctor")
         .current_dir(&proj)
         .env_clear()
         .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .env("BASH_ENV", &env_script)
+        .env("CLAUDE_ENV_FILE", &env_script)
         .output()
         .expect("doctor spawn");
     let stdout = String::from_utf8_lossy(&doctor.stdout);

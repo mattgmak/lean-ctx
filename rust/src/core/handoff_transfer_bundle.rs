@@ -462,7 +462,11 @@ mod tests {
         let b = build_bundle_v1(ledger, None, BundlePrivacyV1::Redacted);
         assert_eq!(b.privacy, "redacted");
         assert!(b.ledger.project_root.is_none());
-        assert!(b.ledger.session_snapshot.is_empty());
+        assert!(
+            b.ledger.session_snapshot.is_empty(),
+            "{:?}",
+            b.ledger.session_snapshot
+        );
     }
 
     #[test]
@@ -476,11 +480,44 @@ mod tests {
         assert_eq!(parsed.privacy, "redacted");
     }
 
+    #[test]
+    fn unicode_signature_material_is_invalid() {
+        for malformed in ["\u{1f512}", "0\u{20ac}", "\u{e9}\u{e9}"] {
+            for signature_is_malformed in [true, false] {
+                let mut bundle = build_bundle_v1(sample_ledger(), None, BundlePrivacyV1::Redacted);
+                bundle.signer_agent_id = Some("unicode-regression".to_string());
+                bundle.signature = Some(if signature_is_malformed {
+                    malformed.to_string()
+                } else {
+                    "00".repeat(64)
+                });
+                bundle.signer_public_key = Some(if signature_is_malformed {
+                    "00".repeat(32)
+                } else {
+                    malformed.to_string()
+                });
+                let serialized = serialize_bundle_v1_pretty(&bundle).unwrap();
+                let parsed = parse_bundle_v1(&serialized).unwrap();
+                assert_eq!(
+                    check_bundle_signature(&parsed),
+                    BundleSignatureStatus::Invalid("non-ASCII hex string".to_string())
+                );
+            }
+        }
+    }
+
     /// GL #465: signed bundles verify; any tampering after signing flips the
     /// status to `Invalid` (fail-closed); bundles without signature fields are
     /// `Unsigned` (legacy, allowed with warning).
     #[test]
     fn import_signature_check_verified_unsigned_invalid() {
+        // Signing writes the agent key under the data dir. Own it for the
+        // test: a concurrent test that points LEAN_CTX_DATA_DIR at a temp dir
+        // and deletes it made `sign` fail with "path not found" (Windows CI).
+        let _lock = crate::core::data_dir::test_env_lock();
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::test_env::set_var("LEAN_CTX_DATA_DIR", data_dir.path());
+
         let unsigned = build_bundle_v1(sample_ledger(), None, BundlePrivacyV1::Redacted);
         assert_eq!(
             check_bundle_signature(&unsigned),
@@ -511,5 +548,7 @@ mod tests {
             check_bundle_signature(&partial),
             BundleSignatureStatus::Invalid(_)
         ));
+
+        crate::test_env::remove_var("LEAN_CTX_DATA_DIR");
     }
 }

@@ -716,7 +716,7 @@ Headless writes are atomic (temp file `.<name>.lean-ctx.tmp.<pid>` + `rename`,
 ### 7.4 Cache coherence
 
 After every write, lean-ctx evicts the file from the cache; the next `ctx_read`
-re-validates via mtime (~13 tokens). The `editedText` of the `EditResponse` allows an
+re-validates via mtime. A cache reference has no fixed token price. The `editedText` of the `EditResponse` allows an
 immediate rewarm; for multi-file refactoring each `changed_path` is mtime-checked.
 
 ---

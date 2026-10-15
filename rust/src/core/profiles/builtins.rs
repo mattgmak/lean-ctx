@@ -20,7 +20,7 @@ pub(super) fn builtin_coder() -> Profile {
             prefer_cache: Some(true),
         },
         compression: CompressionConfig {
-            crp_mode: Some("tdd".to_string()),
+            crp_mode: None,
             output_density: Some("terse".to_string()),
             terse_mode: Some(true),
             ..CompressionConfig::default()
@@ -238,10 +238,7 @@ fn builtin_review() -> Profile {
             ..CompressionConfig::default()
         },
         translation: TranslationConfig::default(),
-        layout: LayoutConfig {
-            enabled: Some(true),
-            ..LayoutConfig::default()
-        },
+        layout: LayoutConfig::default(),
         memory: crate::core::memory_policy::MemoryPolicyOverrides::default(),
         verification: crate::core::output_verification::VerificationConfig::default(),
         budget: BudgetConfig {

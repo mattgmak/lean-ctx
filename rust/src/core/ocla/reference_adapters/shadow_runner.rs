@@ -438,7 +438,9 @@ mod tests {
                 workdir: None,
             },
             policy_constraints: PolicyConstraints::default(),
-            timeout_ms: 500,
+            // Production default budget: health check + rewrite + execution under
+            // a fully parallel test run overran 500 ms and dropped the RTK side.
+            timeout_ms: 5_000,
         }
     }
 
@@ -467,6 +469,8 @@ mod tests {
     #[test]
     fn live_shadow_produces_a_valid_observation_pair_without_mutating_response() {
         use crate::core::ocla::reference_adapters::{RtkConfig, RtkShellAdapter};
+        const TEST_VERSION_PROBE_TIMEOUT_MS: u64 = 10_000;
+        const TEST_INVOCATION_TIMEOUT_MS: u64 = 30_000;
         let directory = tempfile::tempdir().expect("temporary directory");
         let binary = directory.path().join("rtk");
         // #1777: create the fake RTK executable *as* an executable and flush it
@@ -492,16 +496,45 @@ mod tests {
             file.sync_all().expect("flush fake RTK");
         }
         let hash = super::super::rtk_shell::sha256_file(&binary).expect("hash fake RTK");
+        // Bound fixture preparation separately; this exercises observation pairing,
+        // while production retains its fixed version-probe deadline.
+        // A test thread that forked while the write handle above was open holds
+        // it until its child execs, and exec of the fresh script then fails with
+        // ETXTBSY (seen on Linux CI). Retry only that error, as in
+        // lsp::format's `spawn_fresh_script`; once one spawn succeeds, no
+        // inherited handle is left and the adapter's own spawns are unaffected.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let prepared = loop {
+            match crate::core::process_capture::run_with_output_limits(
+                std::process::Command::new(&binary).arg("--version"),
+                Some(std::time::Duration::from_secs(10)),
+                16 * 1024,
+                16 * 1024,
+            ) {
+                Err(error)
+                    if error.contains("Text file busy") && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result,
+            }
+        }
+        .expect("prepare RTK fixture");
+        assert!(!prepared.timed_out && prepared.output.status.success());
         let adapter = RtkShellAdapter::new(
             RtkConfig::new(&binary)
                 .with_pins("1.2.3", hash)
+                .with_timeout_ms(TEST_INVOCATION_TIMEOUT_MS)
+                .with_test_version_probe_timeout_ms(TEST_VERSION_PROBE_TIMEOUT_MS)
                 .with_working_dir(directory.path())
                 .with_sandbox_root(directory.path()),
         );
         let runner = ShadowRunner::with_adapter(adapter);
         let production = String::from("production response stays native");
+        let mut test_invocation = invocation("printf unchanged");
+        test_invocation.timeout_ms = TEST_INVOCATION_TIMEOUT_MS;
         let report = runner
-            .compare_preserving(&production, invocation("printf unchanged"))
+            .compare_preserving(&production, test_invocation)
             .expect("shadow pair");
         assert_eq!(production, "production response stays native");
         assert_eq!(
@@ -509,7 +542,12 @@ mod tests {
             report.rtk_observation.task_id
         );
         assert!(report.native_observation.output_ref.is_some());
-        assert!(report.rtk_observation.output_ref.is_some());
+        assert!(
+            report.rtk_observation.output_ref.is_some(),
+            "RTK output missing: {:?}; observation: {:?}",
+            report.rtk_failure,
+            report.rtk_observation
+        );
         assert!(matches!(
             report.decision,
             ShadowDecision::LowerEtpaoPolicyEquivalent | ShadowDecision::QualityFloorFailed

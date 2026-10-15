@@ -1,6 +1,8 @@
 mod env_guard;
 mod first_run;
 mod index_build;
+mod intelligence;
+pub(crate) use intelligence::configure_runtime;
 mod interactive;
 mod onboard;
 mod options;
@@ -9,7 +11,7 @@ mod with_options;
 
 // Shared imports for sibling submodules that use `use super::*` (mcp, helpers).
 use crate::core::editor_registry::{ConfigType, EditorTarget, WriteAction, WriteOptions};
-use crate::core::portable_binary::resolve_portable_binary;
+use crate::core::portable_binary::resolve_agent_binary;
 use std::path::PathBuf;
 
 mod mcp;

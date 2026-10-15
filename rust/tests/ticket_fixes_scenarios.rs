@@ -579,7 +579,7 @@ fn hash_fast_with_real_world_cyrillic_plan_file() {
     let h1 = lean_ctx::server::helpers::hash_fast(&content);
     let h2 = lean_ctx::server::helpers::hash_fast(&content);
     assert_eq!(h1, h2, "hash must be deterministic");
-    assert!(!h1.is_empty());
+    assert!(!h1.is_empty(), "`h1` is empty");
 }
 
 // ──────────────────────────────────────────────────────────
@@ -782,8 +782,8 @@ fn hook_shell_tokenize_simple_no_quotes() {
 fn hook_shell_quote_adds_quotes_for_spaces() {
     use lean_ctx::hook_handlers::shell_quote;
     let q = shell_quote("My Documents/file.txt");
-    assert!(q.starts_with('"') && q.ends_with('"'));
-    assert!(q.contains("My Documents"));
+    // Single quotes: the calling POSIX shell must expand nothing (#1862).
+    assert_eq!(q, "'My Documents/file.txt'");
 }
 
 #[test]

@@ -84,8 +84,10 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    pub fn crp_mode_effective(&self) -> &str {
-        self.crp_mode.as_deref().unwrap_or("tdd")
+    /// The CRP mode this profile actually produces, after env and
+    /// `compression_level` precedence — the same value tools use (#1890).
+    pub fn crp_mode_effective(&self) -> &'static str {
+        crate::core::protocol::CrpMode::resolve(self.crp_mode.as_deref()).as_str()
     }
     pub fn output_density_effective(&self) -> &str {
         self.output_density.as_deref().unwrap_or("normal")
@@ -121,22 +123,15 @@ impl TranslationConfig {
 }
 
 /// Layout (attention-aware reorder) configuration.
+///
+/// Reserved: no read path reorders content, so these keys are accepted for
+/// profile compatibility but have no effect (#1915,
+/// docs/contracts/attention-layout-driver-v1.md).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LayoutConfig {
-    /// If false, preserve original order.
     pub enabled: Option<bool>,
-    /// Minimum line count for enabling reorder.
     pub min_lines: Option<usize>,
-}
-
-impl LayoutConfig {
-    pub fn enabled_effective(&self) -> bool {
-        self.enabled.unwrap_or(false)
-    }
-    pub fn min_lines_effective(&self) -> usize {
-        self.min_lines.unwrap_or(15)
-    }
 }
 
 /// Routing policy overrides (intent → model tier → read mode/budgets).
@@ -261,19 +256,24 @@ impl BudgetConfig {
     }
 }
 
-/// Hard requirements for a profile's output and resource use.
+/// Targets for a profile's output and resource use.
+///
+/// Offline only: `quality_floor` feeds the benchmark spec and `max_context_tokens`
+/// caps `lean-ctx calibrate`. No live read/shell/proxy path enforces any of these,
+/// and `max_cost_usd`, `max_latency_ms` and `require_verification` are read by
+/// nothing yet (#1905).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ConstraintsConfig {
-    /// Minimum quality score, from 0.0 to 1.0.
+    /// Minimum benchmark quality score, from 0.0 to 1.0 (offline benchmark gate).
     pub quality_floor: Option<f64>,
-    /// Maximum cost per task in USD.
+    /// Maximum cost per task in USD. Not enforced.
     pub max_cost_usd: Option<f64>,
-    /// Maximum latency per operation in milliseconds.
+    /// Maximum latency per operation in milliseconds. Not enforced.
     pub max_latency_ms: Option<u64>,
-    /// Hard context limit, overriding the budget when lower.
+    /// Context limit applied by `lean-ctx calibrate` when lower than the budget.
     pub max_context_tokens: Option<usize>,
-    /// Require output verification before accepting a result.
+    /// Require output verification before accepting a result. Not enforced.
     pub require_verification: Option<bool>,
 }
 

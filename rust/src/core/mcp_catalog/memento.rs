@@ -103,6 +103,7 @@ mod tests {
     fn store_falls_back_to_derived_environment_name() {
         let id = "mcp/test/env-fallback";
         let name = env_name(id);
+        let _env_lock = crate::core::data_dir::test_env_lock();
         crate::test_env::set_var(&name, "environment-secret");
         assert_eq!(
             SecretMementoStore::global().restore(id).as_deref(),

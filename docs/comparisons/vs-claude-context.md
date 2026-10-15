@@ -1,9 +1,9 @@
 # LeanCTX and claude-context
 
-> **Status: historical comparison note — not canonical product copy.** Current
-> LeanCTX scope and status are governed by
-> `docs/internal/README.md` (internal, not in this repository). This note makes no
-> universal privacy, latency, retrieval-quality, or feature-coverage claim.
+> **Status: Historical / Research.** This retained record is not current
+> onboarding or a release claim. LeanCTX is the **Context Gateway for AI Systems**.
+> See [current positioning](../POSITIONING_CANONICAL.md) and the relevant edition's
+> released contract; older product definitions and availability below are historical.
 
 The tools can be assessed as different ways to help an agent find project
 material. LeanCTX's current scope is the local context Runtime around existing

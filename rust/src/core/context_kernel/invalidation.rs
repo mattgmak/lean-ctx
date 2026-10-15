@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Invalidation propagation across kernel plans, receipts, and candidates.
 
 use std::collections::HashMap;
@@ -180,6 +182,7 @@ pub mod tests {
             excluded: Vec::new(),
             deferred: Vec::new(),
             provider_stats: HashMap::new(),
+            origins: Default::default(),
         }
     }
 
@@ -243,8 +246,16 @@ pub mod tests {
 
         let result = state.propagate(&event);
 
-        assert!(result.invalidated_plan_ids.is_empty());
-        assert!(result.invalidated_receipt_ids.is_empty());
+        assert!(
+            result.invalidated_plan_ids.is_empty(),
+            "{:?}",
+            result.invalidated_plan_ids
+        );
+        assert!(
+            result.invalidated_receipt_ids.is_empty(),
+            "{:?}",
+            result.invalidated_receipt_ids
+        );
         assert_eq!(result.invalidated_candidate_ids, vec!["file:b"]);
         assert_eq!(result.total_invalidated, 1);
     }
@@ -268,8 +279,16 @@ pub mod tests {
             "operator",
         ));
 
-        assert!(old_result.invalidated_plan_ids.is_empty());
-        assert!(old_result.invalidated_receipt_ids.is_empty());
+        assert!(
+            old_result.invalidated_plan_ids.is_empty(),
+            "{:?}",
+            old_result.invalidated_plan_ids
+        );
+        assert!(
+            old_result.invalidated_receipt_ids.is_empty(),
+            "{:?}",
+            old_result.invalidated_receipt_ids
+        );
         assert_eq!(current_result.invalidated_plan_ids, vec!["plan-2"]);
         assert_eq!(state.plan_content_refs.len(), 1);
     }

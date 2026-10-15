@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `.lmd.md` reads are raw — like any other file.
 //!
 //! After the lmd reverse-cut, lean-ctx has no `.lmd.md`-specific code path: a
@@ -26,17 +27,37 @@ fn ctx_read_lmd_md_returns_raw_source() {
     // So we give the spawned binary a fresh, private data dir and force `--fresh`,
     // making this an unconditional first read that never depends on nor pollutes
     // the real store.
+    // The checkout is read-only in CI; the project fixture belongs outside it.
     let fixture = tempfile::tempdir().expect("fixture dir");
     let data_dir = tempfile::tempdir().expect("isolated LEAN_CTX_DATA_DIR");
     let f = fixture.path().join("d.lmd.md");
     std::fs::write(&f, "@date\nRAW_DELEGATION_MARKER\n").unwrap();
 
     let out = Command::new(LEAN_CTX_BIN)
+        .current_dir(fixture.path())
+        .env("HOME", data_dir.path())
+        .env("LEAN_CTX_PROJECT_ROOT", fixture.path())
         .env("LEAN_CTX_DATA_DIR", data_dir.path())
+        .env("LEAN_CTX_CONFIG_DIR", data_dir.path().join("config"))
+        .env("LEAN_CTX_STATE_DIR", data_dir.path().join("state"))
+        .env("LEAN_CTX_CACHE_DIR", data_dir.path().join("cache"))
+        // Exercise the local read without contacting the developer's daemon.
+        .env("LEAN_CTX_HOOK_CHILD", "1")
+        // A tool-backed CLI read auto-starts a daemon that outlives the test
+        // (GL #1291); the raw-read contract is the same on the standalone path.
+        .env("__LEAN_CTX_NO_DAEMON", "1")
+        // `lean-ctx read` is jailed to the project root (#1903).
+        .current_dir(fixture.path())
         .args(["read", f.to_str().unwrap(), "--mode", "full", "--fresh"])
         .output()
         .expect("lean-ctx read");
     let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "read exited {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     assert!(
         text.contains("RAW_DELEGATION_MARKER"),

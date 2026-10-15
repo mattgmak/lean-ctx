@@ -42,7 +42,7 @@ pub fn cmd_cheatsheet() {
   ctx_agent action=read           \x1b[2m# inspect local messages\x1b[0m
 
 \x1b[1;31m━━━ READ MODE DECISION TREE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m
-  Will edit?  → \x1b[1mfull\x1b[0m (re-reads: 13 tokens)  → after edit: \x1b[1mdiff\x1b[0m
+  Will edit?  → \x1b[1mfull\x1b[0m (eligible re-reads use cache references)  → after edit: \x1b[1mdiff\x1b[0m
   API only?   → \x1b[1msignatures\x1b[0m
   Deps/exports? → \x1b[1mmap\x1b[0m
   Very large? → \x1b[1mentropy\x1b[0m (information-dense lines)

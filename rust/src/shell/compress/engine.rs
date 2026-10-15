@@ -424,7 +424,18 @@ fn compress_if_beneficial_with_exit(
             let base = dedup_build_diagnostics(&base);
             return truncate_verbatim(&base, count_tokens_for(&base, family), family);
         }
-        BuildOutputKind::WarningsOnly | BuildOutputKind::Clean | BuildOutputKind::NotBuildTool => {}
+        // A clean build is progress lines plus a verdict. Build commands are
+        // otherwise kept verbatim by the output policy below, so without this
+        // a *successful* `cargo build` shipped hundreds of `Compiling …` lines
+        // while a failing one had them folded.
+        BuildOutputKind::Clean => {
+            if let Some(folded) =
+                maybe_fold_progress(output, count_tokens_for(output, family), family)
+            {
+                return truncate_verbatim(&folded, count_tokens_for(&folded, family), family);
+            }
+        }
+        BuildOutputKind::WarningsOnly | BuildOutputKind::NotBuildTool => {}
     }
 
     if !is_search_output(command) && crate::tools::ctx_shell::contains_auth_flow(output) {
@@ -551,6 +562,9 @@ fn compress_if_beneficial_with_exit(
     if is_verbatim_output(command) {
         return truncate_verbatim(output, original_tokens, family);
     }
+
+    // `cd <dir> && git log …` is `git log …` for compression purposes (#1893).
+    let command = patterns::strip_leading_cd(command);
 
     // Structural output AND version-control history are owned by their
     // dedicated compressor: apply it if it yields a gain, otherwise return the
@@ -1355,5 +1369,24 @@ mod gh1663 {
         let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
         assert!(is_match_shaped(&lines));
         assert!(truncate_match_lines(&lines, 10_000, TokenizerFamily::Cl100k).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cd_prefix_tests {
+    /// #1893: `cd <repo> && git log --stat` must be compressed by the git
+    /// pattern exactly like `git -C <repo> log --stat`, not by generic truncation.
+    #[test]
+    fn cd_prefixed_git_log_matches_git_dash_c() {
+        let mut out = String::new();
+        for i in 0..40 {
+            out.push_str(&format!(
+                "commit {i:040x}\nAuthor: A <a@b.c>\nDate:   Mon Jan 1 00:00:00 2026 +0000\n\n    subject {i}\n\n    - bullet body line\n\n src/f{i}.rs | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)\n\n"
+            ));
+        }
+        let plain = super::compress_if_beneficial("git -C /repo log --stat -40", &out);
+        let cd = super::compress_if_beneficial("cd /repo && git log --stat -40", &out);
+        assert_eq!(cd, plain);
+        assert!(cd.contains("+80/-80 total"), "{cd}");
     }
 }

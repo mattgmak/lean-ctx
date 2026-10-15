@@ -38,6 +38,19 @@ fn compressed_cache_key_distinguishes_task() {
     assert_ne!(density_a, density_b, "density key must vary with task");
 }
 
+/// #1910: an explicit request's raw fallback carries a banner, an `auto` one
+/// does not — both resolve to the same mode, so the key must tell them apart.
+/// Explicit keys stay byte-identical to their pre-#1910 form.
+#[test]
+fn request_scoped_key_separates_auto_from_explicit() {
+    let base = compressed_cache_key("cognitive", CrpMode::Off, None, None, &[]);
+    let explicit = request_scoped_key(base.clone(), false);
+    let auto = request_scoped_key(base.clone(), true);
+    assert_eq!(explicit, base);
+    assert_ne!(auto, explicit);
+    assert_eq!(auto, request_scoped_key(base, true), "deterministic (#498)");
+}
+
 #[test]
 fn compressed_cache_key_distinguishes_aggressiveness() {
     // None → byte-identical to today's keys (#714 must not shift existing cache).
@@ -138,6 +151,81 @@ fn aggressiveness_is_deterministic_and_monotonic() {
     );
 
     crate::test_env::remove_var("LEAN_CTX_SHOW_SAVINGS");
+}
+
+/// #1911: `entropy` on real source used to save 0% (the absolute H/surprise
+/// cut kept every line of a typical Rust file) and `aggressiveness` did not
+/// move it. The file-relative surprise floor must shed real tokens as
+/// aggressiveness rises, strictly more at each step.
+///
+/// Every shed run is marked `[lean-ctx: omitted N lines]`: the #1910 savings
+/// on dense code came largely from *silently* deleting short structural lines
+/// (`Vcs,`, `}`, a table row), which is cheaper than any honest marker. A
+/// setting that cannot honestly beat the raw file therefore takes the labelled
+/// "no compression applied" path instead of inventing savings.
+#[test]
+fn entropy_saves_on_real_source_and_scales_with_aggressiveness() {
+    let _lock = crate::core::data_dir::test_env_lock();
+    crate::test_env::set_var("LEAN_CTX_SHOW_SAVINGS", "0");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/core/compressor.rs");
+    let content = std::fs::read_to_string(&path).unwrap();
+    let raw = count_tokens(&content);
+    let render_at = |a: Option<f64>| -> String {
+        process_mode_tuned(
+            &content,
+            "entropy",
+            "F1",
+            "compressor.rs",
+            "rs",
+            raw,
+            CrpMode::Off,
+            "src/core/compressor.rs",
+            None,
+            ReadTuning {
+                aggressiveness: a,
+                protect: &[],
+            },
+        )
+        .0
+    };
+    let default = render_at(None);
+    // The default threshold is file-adaptive (per-language base plus the
+    // content's compressibility), not a point on the aggressiveness scale;
+    // monotonicity is checked on explicit levels only.
+    let low = count_tokens(&render_at(Some(0.1)));
+    let mid = count_tokens(&render_at(Some(0.5)));
+    let high_out = render_at(Some(0.9));
+    let high = count_tokens(&high_out);
+    let default_tokens = count_tokens(&default);
+    let again = render_at(None);
+    crate::test_env::remove_var("LEAN_CTX_SHOW_SAVINGS");
+
+    assert_eq!(default, again, "entropy output must be deterministic");
+    let honest = |out: &str, tokens: usize| {
+        tokens < raw || out.starts_with("[lean-ctx] no compression applied")
+    };
+    assert!(
+        honest(&default, default_tokens),
+        "default inflated without saying so: {default_tokens} > {raw}"
+    );
+    assert!(
+        !high_out.starts_with("[lean-ctx] no compression applied"),
+        "aggressive entropy fell back on compressor.rs"
+    );
+    // Measured 2026-10-12: a=0.9 keeps 4104 of 4554 tok (~10%) with every
+    // omission marked; the floor leaves headroom for tokenizer/fixture drift.
+    assert!(
+        high * 100 <= raw * 95,
+        "aggressive entropy saves <5%: {high} of {raw} tok"
+    );
+    assert!(
+        high_out.contains("[lean-ctx: omitted "),
+        "shed lines must be marked, never silently dropped"
+    );
+    assert!(
+        high < mid && mid <= low,
+        "not monotonic: a0.1={low} a0.5={mid} a0.9={high}"
+    );
 }
 
 #[test]
@@ -301,6 +389,115 @@ fn instruction_file_detection() {
     assert!(!is_instruction_file("/project/data/report.csv"));
 }
 
+/// A plain `ctx_read` of a large CLAUDE.md returned headings only: the
+/// standing instruction files of every supported agent are read in full.
+#[test]
+fn agent_instruction_files_are_read_in_full() {
+    for path in [
+        "/project/CLAUDE.md",
+        "/project/sub/claude.md",
+        "/project/CLAUDE.local.md",
+        "/home/user/.claude/CLAUDE.md",
+        "/project/GEMINI.md",
+        "/project/.github/copilot-instructions.md",
+        "/project/.windsurfrules",
+        "/project/.claude/agents/reviewer.md",
+        "/project/.claude/commands/release.md",
+        r"C:\Users\nina\project\CLAUDE.md",
+    ] {
+        assert!(is_instruction_file(path), "{path} carries instructions");
+    }
+    assert!(!is_instruction_file("/project/docs/claude-notes.md"));
+    assert!(!is_instruction_file("/project/.claude/commands/run.sh"));
+}
+
+/// #60: `redirect_exclude` was parsed but never applied, so listing CLAUDE.md
+/// there changed nothing. Globs match trailing path components.
+#[test]
+fn redirect_exclude_globs_match_trailing_components() {
+    use super::helpers::excluded_by;
+    let configured = || {
+        vec![
+            "docs/**".to_string(),
+            "*.json".to_string(),
+            "./NOTES.md".to_string(),
+            ".claude/**".to_string(),
+        ]
+    };
+    for path in [
+        "/project/docs/guide.md",
+        "/project/docs/deep/nested/spec.md",
+        "/project/package.json",
+        "/project/sub/NOTES.md",
+        "/home/user/.claude/settings.local.json",
+        r"C:\work\project\docs\guide.md",
+    ] {
+        assert!(excluded_by(path, None, configured), "{path} is excluded");
+    }
+    for path in [
+        "/project/src/docs.rs",
+        "/project/src/main.rs",
+        "/project/NOTES.txt",
+    ] {
+        assert!(
+            !excluded_by(path, None, configured),
+            "{path} is not excluded"
+        );
+    }
+    // Nothing configured: nothing excluded.
+    assert!(!excluded_by("/project/CLAUDE.md", None, Vec::new));
+}
+
+#[test]
+fn hook_exclude_env_takes_precedence_over_config() {
+    use super::helpers::excluded_by;
+    let configured = || vec!["*.json".to_string()];
+    let env = Some(" docs/** , NOTES.md ");
+    assert!(excluded_by("/p/docs/a.md", env, configured));
+    assert!(excluded_by("/p/NOTES.md", env, configured));
+    assert!(
+        !excluded_by("/p/package.json", env, configured),
+        "env replaces config"
+    );
+    // A blank env value falls back to the configured globs.
+    assert!(excluded_by("/p/package.json", Some("  "), configured));
+}
+
+/// #1794: classification is by file, not by ancestor directory. A skill ships
+/// its instructions as documents and its implementation as source; forcing the
+/// latter to `full` turned a bounded `map` request into a truncated dump.
+#[test]
+fn source_files_under_a_skill_are_not_instruction_files() {
+    for path in [
+        "/project/.agents/skills/example/scripts/runtime.ts",
+        "/project/.agents/skills/example/scripts/state.ts",
+        "/project/skills/demo/helper.py",
+        "/project/skills/demo/lib.rs",
+        "/workspace/.cursor/rules/generate.js",
+        "/home/user/.claude/rules/build.sh",
+    ] {
+        assert!(
+            !is_instruction_file(path),
+            "{path} is implementation, not an instruction document"
+        );
+    }
+}
+
+/// The documents themselves must keep their full-read guarantee, including
+/// extensionless rule files.
+#[test]
+fn documents_under_a_skill_remain_instruction_files() {
+    for path in [
+        "/project/.agents/skills/example/SKILL.md",
+        "/project/skills/demo/notes.txt",
+        "/project/skills/demo/guide.markdown",
+        "/workspace/.cursor/rules/house-style.mdc",
+        "/home/user/.claude/rules/PROMPT",
+    ] {
+        assert!(is_instruction_file(path), "{path} carries instructions");
+    }
+}
+
 #[test]
 fn resolve_auto_mode_returns_full_for_instruction_files() {
     let mode = resolve_auto_mode(
@@ -317,4 +514,8 @@ fn resolve_auto_mode_returns_full_for_instruction_files() {
 
     let mode = resolve_auto_mode(None, "/workspace/.cursorrules", 2000, None, None);
     assert_eq!(mode, "full", ".cursorrules must always be read in full");
+
+    // A large CLAUDE.md used to resolve to `map` (headings only).
+    let mode = resolve_auto_mode(None, "/workspace/CLAUDE.md", 6000, None, None);
+    assert_eq!(mode, "full", "CLAUDE.md must always be read in full");
 }

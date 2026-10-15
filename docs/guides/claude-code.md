@@ -2,8 +2,8 @@
 
 > **Status: Available first-class local setup path.** LeanCTX attaches to
 > Claude Code through local Runtime wiring; its coverage is limited to observable
-> context behavior. Product scope and claim discipline are governed by
-> `docs/internal/README.md` (internal, not in this repository).
+> context behavior. See the [canonical positioning](../POSITIONING_CANONICAL.md)
+> for current product scope and claim boundaries.
 
 Complete guide to setting up and optimally using lean-ctx with Claude Code (Anthropic's CLI coding agent).
 
@@ -18,8 +18,8 @@ Complete guide to setting up and optimally using lean-ctx with Claude Code (Anth
 | Setup command | `lean-ctx init --agent claude` |
 
 > **Since 3.8:** there is no `~/.claude/rules/lean-ctx.md` anymore. Claude Code loads every
-> rules file unconditionally at session start, which duplicated the instructions in each
-> session (12k+ token memory footprints). `lean-ctx setup` removes the legacy file and
+> rules file unconditionally at session start, which duplicated instructions in each
+> session. `lean-ctx setup` removes the legacy file and
 > maintains a compact block in `~/.claude/CLAUDE.md` instead; detail docs live in the
 > on-demand skill.
 
@@ -89,8 +89,8 @@ lean-ctx maintains a marker-delimited block in `~/.claude/CLAUDE.md`:
 ## lean-ctx — Context Runtime
 
 When the `ctx_*` MCP tools are listed in this session, prefer them over native equivalents:
-- `ctx_read` instead of `Read` / `cat` for exploration (cached, 10 modes, re-reads ~13 tokens)
-- `ctx_shell` instead of `bash` / `Shell` (95+ compression patterns)
+- `ctx_read` instead of `Read` / `cat` for exploration (10 modes; unchanged reads may use compact cache references)
+- `ctx_shell` instead of `bash` / `Shell` (supported command outputs can be summarized)
 - `ctx_search` instead of `Grep` / `rg` (compact results)
 - `ctx_tree` instead of `ls` / `find` (compact directory maps)
 - Edits: `ctx_read(mode="anchored")` → `ctx_patch` (line+hash anchors, never echo old text; `op=create` for new files). `ctx_edit` (str_replace) is the legacy power-profile fallback.
@@ -133,12 +133,12 @@ Claude Code has shell access, so lean-ctx installs compression hooks for common 
 lean-ctx init --global
 ```
 
-This enables transparent compression for 56 pattern modules (git, npm, cargo, docker, kubectl, terraform, and more).
+This enables transparent handling for supported command patterns, including git, npm, cargo, docker, kubectl, and terraform.
 
 ### Read compression under the read-before-write gate
 
-Two settings work together so Claude Code keeps its native edit safety *and* the
-re-read savings:
+Two settings work together so Claude Code keeps its native edit safety while
+unchanged reads can use the configured compact representation:
 
 - **`read_redirect = auto`** (default): on guard hosts (Claude Code / CodeBuddy) the
   PreToolUse Read redirect stays **off**, so the native Read runs on the real path and
@@ -261,7 +261,7 @@ If you have a project-level `CLAUDE.md`, lean-ctx can inject its rules there too
 # Your existing project rules here
 ...
 
-# lean-ctx — Context Engineering Layer
+# LeanCTX — Context Gateway for AI Systems
 <!-- lean-ctx-rules -->
 ## Mode Selection
 - Editing the file? → `full` first, then `diff` for re-reads
@@ -343,15 +343,15 @@ lean-ctx gain --live
 Claude Code also benefits from lean-ctx's CLI compression when running shell commands:
 
 ```bash
-# These commands are automatically compressed when run through Claude Code:
-git status                    # ~800 → ~120 tokens
-git log --oneline -20         # ~600 → ~150 tokens
-cargo test                    # ~2000 → ~300 tokens
-npm install                   # ~1500 → ~200 tokens
-docker ps                     # ~400 → ~80 tokens
+# Supported commands can return summarized output when run through the hook:
+git status
+git log --oneline -20
+cargo test
+npm install
+docker ps
 ```
 
-The shell hook intercepts these commands transparently — no changes needed to how Claude Code invokes them.
+The shell hook handles supported commands without changing how Claude Code invokes them; the resulting output varies with command, repository state, and configured rules.
 
 ## Further Reading
 

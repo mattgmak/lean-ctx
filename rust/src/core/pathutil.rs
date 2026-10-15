@@ -169,6 +169,8 @@ pub fn normalize_tool_path_lexical(path: &str) -> String {
         && let Some(translated) = translate_msys_drive_prefix(&p)
     {
         p = translated;
+    } else if !cfg!(windows) {
+        p = unescape_shell_path(&p);
     }
 
     p = p.replace('\\', "/");
@@ -184,6 +186,66 @@ pub fn normalize_tool_path_lexical(path: &str) -> String {
     }
 
     p
+}
+
+/// Undo shell quoting that agents copy into tool paths on Unix: one pair of
+/// surrounding quotes (`'/a b/c'`) and backslash escapes (`My\ Project`,
+/// `src/\(app\)`). Without this the separator rewrite below turned
+/// `My\ Project` into `My/ Project` — a directory that does not exist, so
+/// every path below a folder with a space failed. A backslash is never a
+/// separator on Unix and practically never part of a file name; a backslash
+/// before an ordinary character is kept for the rewrite as before.
+fn unescape_shell_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let unquoted = [('\'', '\''), ('"', '"')]
+        .iter()
+        .find_map(|&(open, close)| {
+            trimmed
+                .strip_prefix(open)
+                .and_then(|rest| rest.strip_suffix(close))
+                .filter(|inner| !inner.is_empty())
+        })
+        .unwrap_or(path);
+    if !unquoted.contains('\\') {
+        return unquoted.to_string();
+    }
+    let mut out = String::with_capacity(unquoted.len());
+    let mut chars = unquoted.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+            && matches!(
+                next,
+                ' ' | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '&'
+                    | '\''
+                    | '"'
+                    | '$'
+                    | '!'
+                    | '#'
+                    | ';'
+                    | '*'
+                    | '?'
+                    | '<'
+                    | '>'
+                    | '|'
+                    | '~'
+                    | '`'
+                    | '='
+            )
+        {
+            out.push(next);
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Normalize paths from any client format to a consistent OS-native form.
@@ -237,11 +299,26 @@ pub const AGENT_CONFIG_DIRS: &[&str] = &[
 /// Returns `true` if `dir` is — or lies inside — a known agent/IDE config dir
 /// ([`AGENT_CONFIG_DIRS`]). Separator-agnostic so Windows backslash paths
 /// (`C:\Users\me\.copilot`) match too; #580 is a Windows Copilot report.
+///
+/// A checkout inside `<dir>/worktrees/<name>` (where Claude Code places its
+/// git worktrees, e.g. `<repo>/.claude/worktrees/fix-x`) is a real project,
+/// not agent config, and is exempt; `<dir>/worktrees` itself is not.
 pub fn is_agent_config_dir(dir: &Path) -> bool {
     let s = dir.to_string_lossy().replace('\\', "/");
-    AGENT_CONFIG_DIRS
-        .iter()
-        .any(|name| s.ends_with(&format!("/{name}")) || s.contains(&format!("/{name}/")))
+    AGENT_CONFIG_DIRS.iter().any(|name| {
+        let segment = format!("/{name}");
+        s.match_indices(&segment).any(|(at, _)| {
+            let tail = &s[at + segment.len()..];
+            (tail.is_empty() || tail.starts_with('/')) && !is_worktree_checkout_tail(tail)
+        })
+    })
+}
+
+/// `tail` (the path after an agent dir) names `/worktrees/<name>[/...]`.
+fn is_worktree_checkout_tail(tail: &str) -> bool {
+    tail.strip_prefix("/worktrees/")
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|name| !name.is_empty())
 }
 
 fn is_wsl_windows_user_profile(dir: &Path) -> bool {
@@ -335,7 +412,7 @@ pub fn is_symlink_or_reparse(meta: &std::fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     false
@@ -794,6 +871,30 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn normalize_unescapes_shell_quoting_on_unix() {
+        assert_eq!(
+            normalize_tool_path_lexical(r"/Users/me/Pfadi\ Scouting/app/main.ts"),
+            "/Users/me/Pfadi Scouting/app/main.ts",
+            "an escaped space must not become a separator"
+        );
+        assert_eq!(
+            normalize_tool_path_lexical(r"/srv/\(group\)/a\&b.txt"),
+            "/srv/(group)/a&b.txt"
+        );
+        assert_eq!(
+            normalize_tool_path_lexical("'/Users/me/My Project/src'"),
+            "/Users/me/My Project/src"
+        );
+        assert_eq!(normalize_tool_path_lexical("\"/tmp/a b\""), "/tmp/a b");
+        assert_eq!(
+            normalize_tool_path_lexical("'"),
+            "'",
+            "a lone quote is a name"
+        );
+    }
+
     #[test]
     fn normalize_windows_path_with_spaces_and_backslashes() {
         // The exact "paths with spaces" scenario reported on Windows (#324):
@@ -891,6 +992,31 @@ mod tests {
             let nested = format!("/home/user/{name}/mcp");
             assert!(is_agent_config_dir(Path::new(&nested)), "{nested}");
         }
+    }
+
+    #[test]
+    fn claude_code_worktree_checkout_is_not_agent_config() {
+        // Claude Code puts git worktrees at `<repo>/.claude/worktrees/<name>`;
+        // those are the user's project, not agent config (#1903 regression).
+        for p in [
+            "/repo/.claude/worktrees/fix-x",
+            "/repo/.claude/worktrees/fix-x/rust/src",
+            r"C:\repo\.claude\worktrees\fix-x",
+        ] {
+            assert!(!is_agent_config_dir(Path::new(p)), "{p}");
+            assert!(!is_broad_or_unsafe_root(Path::new(p)), "{p}");
+        }
+        for p in [
+            "/repo/.claude/worktrees",
+            "/repo/.claude/worktrees/",
+            "/repo/.claude/settings",
+            "/repo/.claude/worktrees/fix-x/.claude",
+            "/repo/.claude/worktrees/fix-x/.codex/mcp",
+            "/home/user/.claude/worktreesx/a",
+        ] {
+            assert!(is_agent_config_dir(Path::new(p)), "{p}");
+        }
+        assert!(!is_agent_config_dir(Path::new("/repo/.claudex/a")));
     }
 
     #[test]

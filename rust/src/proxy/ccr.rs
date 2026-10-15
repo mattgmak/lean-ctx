@@ -10,17 +10,15 @@
 //! CCR fixes this by persisting the **verbatim original** to the shared,
 //! content-addressed tee store (`{state}/tee/`, reused from the shell path) and
 //! embedding a **retrieval handle** — the absolute path of that file — in the
-//! stub. Retrieval is MCP-independent: the agent reads the path with its native
-//! file read; no lean-ctx tool has to be attached.
+//! stub. These legacy copies have no source authority and are only available
+//! without an active policy. Protected file recovery uses source-bound archives.
 //!
 //! ## Cache-safety (#448)
 //! The handle is the file path, and the path is a pure function of the content
 //! hash ([`crate::core::hasher::hash_short`]). For a fixed pruned message the
 //! handle is therefore byte-identical on every later turn, so the provider
-//! prompt-cache prefix is never invalidated. The on-disk *write* is best-effort
-//! and never affects the returned handle — only retrievability degrades if the
-//! write (or the 24h TTL cleanup) loses the file, so a stub can never become
-//! non-deterministic based on filesystem state.
+//! prompt-cache prefix is preserved for available copies. Failed or unauthorized
+//! persistence returns no handle; a deterministic path is not proof of recovery.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,8 +36,7 @@ const EXPAND_CLOSE: char = '>';
 pub(crate) const MIN_TEE_BYTES: usize = 512;
 
 /// Throttle the O(dir) TTL cleanup so the prune hot path does at most one
-/// directory scan per this interval (the write itself is content-addressed and
-/// idempotent, so steady-state cost is a single `stat`).
+/// directory scan per this interval.
 const CLEANUP_INTERVAL_SECS: u64 = 600;
 
 /// Length of the content hash in a proxy/json tee name ([`hash_short`]).
@@ -82,11 +79,9 @@ fn maybe_cleanup(tee_dir: &Path) {
 
 /// Persist `content` verbatim (best-effort, secret-redacted) to the
 /// content-addressed tee store and return its retrieval handle (the absolute
-/// path). Returns `None` only when `content` is below [`MIN_TEE_BYTES`] or the
-/// state dir can't be resolved — never because the *write* failed, so the
-/// returned handle is a pure function of the content and the embedding stub
-/// stays deterministic. Re-persisting identical content is idempotent: same
-/// content → same path → the existing file is left untouched.
+/// path). Returns `None` for protected originless data, invalid/oversized input
+/// or persistence failure. Re-persisting identical content keeps the same path;
+/// callers must preserve useful fresh output when no recovery handle is available.
 pub(crate) fn persist(content: &str) -> Option<String> {
     persist_with(content, "proxy")
 }
@@ -147,29 +142,18 @@ fn persist_with(content: &str, prefix: &str) -> Option<String> {
 }
 
 fn persist_with_min(content: &str, prefix: &str, min_bytes: usize) -> Option<String> {
+    debug_assert!(
+        TEE_PREFIXES.contains(&prefix),
+        "tee prefix {prefix} must be resolvable (add it to TEE_PREFIXES)"
+    );
     if content.len() < min_bytes {
         return None;
     }
     let path = tee_path(content, prefix)?;
     let handle = path.to_string_lossy().to_string();
-
-    if !path.exists() {
-        if let Some(dir) = path.parent()
-            && std::fs::create_dir_all(dir).is_ok()
-        {
-            maybe_cleanup(dir);
-        }
-        // Same redaction the shell tee applies, so a recovered original can never
-        // re-introduce a secret the live turn would also have masked.
-        let masked = crate::core::redaction::redact_text(content);
-        let (redacted, _) = crate::core::secret_detection::scan_and_redact_from_config(&masked);
-        if std::fs::write(&path, redacted).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+    storage::write(&path, content)?;
+    if let Some(dir) = path.parent() {
+        maybe_cleanup(dir);
     }
     if path.is_file() {
         let source_tool = match prefix {
@@ -192,25 +176,23 @@ fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Canonical `{prefix}_{16hex}.log` name for a proxy / json / tbl / bare-hash id,
-/// or `None`. A bare 16-hex id defaults to the `proxy_` store (back-compat: that
-/// is the only form pre-#936 stubs carry).
+/// Every prefix [`persist_with_min`] writes. The resolver is driven by the same
+/// table, so a new producer can never mint a handle `ctx_expand` rejects
+/// (#1911: `html_` was persisted but unresolvable).
+const TEE_PREFIXES: &[&str] = &["proxy", "conv", "json", "tbl", "yaml", "html"];
+
+/// Canonical `{prefix}_{16hex}.log` name for a prefixed ([`TEE_PREFIXES`]) or
+/// bare-hash id, or `None`. A bare 16-hex id defaults to the `proxy_` store
+/// (back-compat: that is the only form pre-#936 stubs carry).
 fn canonical_tee_name(name: &str) -> Option<String> {
     let stem = name.strip_suffix(".log").unwrap_or(name);
-    if let Some(hash) = stem.strip_prefix("proxy_") {
-        return is_hex(hash, TEE_HASH_LEN).then(|| format!("proxy_{hash}.log"));
-    }
-    if let Some(hash) = stem.strip_prefix("conv_") {
-        return is_hex(hash, TEE_HASH_LEN).then(|| format!("conv_{hash}.log"));
-    }
-    if let Some(hash) = stem.strip_prefix("json_") {
-        return is_hex(hash, TEE_HASH_LEN).then(|| format!("json_{hash}.log"));
-    }
-    if let Some(hash) = stem.strip_prefix("tbl_") {
-        return is_hex(hash, TEE_HASH_LEN).then(|| format!("tbl_{hash}.log"));
-    }
-    if let Some(hash) = stem.strip_prefix("yaml_") {
-        return is_hex(hash, TEE_HASH_LEN).then(|| format!("yaml_{hash}.log"));
+    for prefix in TEE_PREFIXES {
+        if let Some(hash) = stem
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('_'))
+        {
+            return is_hex(hash, TEE_HASH_LEN).then(|| format!("{prefix}_{hash}.log"));
+        }
     }
     is_hex(stem, TEE_HASH_LEN).then(|| format!("proxy_{stem}.log"))
 }
@@ -235,34 +217,119 @@ fn is_shell_tee_name(name: &str) -> bool {
     }
 }
 
-/// Resolve a retrieval `id` back to a file in the shared `{state}/tee/` store.
-/// Accepts every handle form a stub or footer can carry, with a fixed precedence
-/// so the forms can never collide (#936):
-///
-/// 1. **Prefix forms** — `proxy_<16hex>(.log)`, `conv_<16hex>(.log)`,
-///    `json_<16hex>(.log)`, `tbl_<16hex>(.log)`, `yaml_<16hex>(.log)`, or a bare
-///    `<16hex>` (→ `proxy_`,
-///    back-compat). The proxy history-prune / live stubs and the JSON / tabular /
-///    YAML crushers' lossy originals.
-/// 2. **Shell-tee form** — `<slug>_<8hex>.log` (`save_tee`), so every compressed
-///    shell command's already-teed verbatim output is surgically retrievable.
-///
-/// The 16-vs-8 hex length already disambiguates the two classes; the explicit
-/// order documents intent. Security: only the *file name* is trusted — the path
-/// is always rebuilt under `{state}/tee/`, so a crafted `id` can never escape the
-/// store (no path traversal) and a non-tee id resolves to `None`.
-pub(crate) fn resolve_tee(id: &str) -> Option<PathBuf> {
+/// Why a canonical tee handle could not be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeeResolveError {
+    Malformed,
+    Missing,
+    Refused(&'static str),
+}
+
+/// Resolve a retrieval ID through the same canonical store path used by
+/// `ctx_expand`, while distinguishing malformed IDs and policy refusals.
+pub(crate) fn resolve_tee_checked(id: &str) -> Result<PathBuf, TeeResolveError> {
     let name = Path::new(id)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(id);
-    let canon =
-        canonical_tee_name(name).or_else(|| is_shell_tee_name(name).then(|| name.to_string()))?;
-    let path = crate::core::paths::state_dir()
-        .ok()?
-        .join("tee")
-        .join(canon);
-    path.is_file().then_some(path)
+    let canon = canonical_tee_name(name)
+        .or_else(|| is_shell_tee_name(name).then(|| name.to_string()))
+        .ok_or(TeeResolveError::Malformed)?;
+    let state_dir = crate::core::paths::state_dir().map_err(|_| TeeResolveError::Missing)?;
+    let tee_dir = state_dir.join("tee");
+    let path = tee_dir.join(canon);
+    // The tee store itself must be a real directory: a `tee` link to another
+    // store (archives, references) would let a tee-shaped name read that store.
+    if std::fs::symlink_metadata(&tee_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(TeeResolveError::Refused(
+            "tee store is a symlink to another location",
+        ));
+    }
+
+    let link_metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            TeeResolveError::Refused("tee metadata read refused by filesystem policy")
+        } else {
+            TeeResolveError::Missing
+        }
+    })?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(TeeResolveError::Refused(
+            "tee handles cannot resolve through symlinks",
+        ));
+    }
+    if !link_metadata.is_file() {
+        return Err(TeeResolveError::Missing);
+    }
+
+    let canonical_state = std::fs::canonicalize(&state_dir).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            TeeResolveError::Refused("tee store access refused by filesystem policy")
+        } else {
+            TeeResolveError::Missing
+        }
+    })?;
+    let canonical_tee = std::fs::canonicalize(&tee_dir).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            TeeResolveError::Refused("tee store access refused by filesystem policy")
+        } else {
+            TeeResolveError::Missing
+        }
+    })?;
+    if canonical_tee != canonical_state.join("tee") {
+        return Err(TeeResolveError::Refused(
+            "tee store resolves outside the state directory",
+        ));
+    }
+
+    let canonical_file = std::fs::canonicalize(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            TeeResolveError::Refused("tee read refused by filesystem policy")
+        } else {
+            TeeResolveError::Missing
+        }
+    })?;
+    if !canonical_file.starts_with(&canonical_tee) {
+        return Err(TeeResolveError::Refused(
+            "tee handle resolves outside the tee store",
+        ));
+    }
+    if !canonical_file.is_file() {
+        return Err(TeeResolveError::Missing);
+    }
+    Ok(path)
+}
+
+/// Whether `id` uses one of the handle shapes emitted by the tee producers.
+pub(crate) fn is_tee_handle(id: &str) -> bool {
+    let name = Path::new(id)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(id);
+    canonical_tee_name(name).is_some() || is_shell_tee_name(name)
+}
+
+/// Whether the input is a legacy bare 16-hex CCR ID that can also be tried as
+/// an archive ID after the tee store lookup, matching `ctx_expand` precedence.
+pub(crate) fn is_bare_tee_handle(id: &str) -> bool {
+    is_hex(id, TEE_HASH_LEN)
+}
+
+/// Catch malformed IDs that still declare a known tee producer prefix.
+pub(crate) fn looks_like_tee_handle(id: &str) -> bool {
+    let name = Path::new(id)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(id);
+    let stem = name.strip_suffix(".log").unwrap_or(name);
+    TEE_PREFIXES
+        .iter()
+        .any(|prefix| stem.starts_with(&format!("{prefix}_")))
+}
+
+/// Back-compatible resolver used by `ctx_expand`.
+pub(crate) fn resolve_tee(id: &str) -> Option<PathBuf> {
+    resolve_tee_checked(id).ok()
 }
 
 /// The in-band retrieval marker `<lc_expand:HASH>` for a CCR `handle` (#493).
@@ -293,14 +360,32 @@ pub(crate) fn inband_locator(handle: &str) -> Option<String> {
         .flatten()
 }
 
+/// Read a tee file that [`resolve_tee`] returned. One read path for every
+/// caller: bounded, no-follow and bound to the checked file, re-checked
+/// against the current policy and re-admitted by the context gateway.
+pub(crate) fn read_tee_file(path: &Path) -> Option<String> {
+    read_checked_tee(path)
+}
+
+/// Resolve and read a tee handle in one step.
+pub(crate) fn read_tee(id: &str) -> Option<String> {
+    read_tee_file(&resolve_tee(id)?)
+}
+
 /// Recover the verbatim original for a 16-hex CCR `hash` from the local tee
 /// store, or `None` when the hash is malformed or the file is gone (past TTL).
 fn recover(hash: &str) -> Option<String> {
     if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    std::fs::read_to_string(resolve_tee(hash)?).ok()
+    read_tee(hash)
 }
+
+pub(crate) use storage::{
+    read as read_checked_tee, read_detailed as read_tee_detailed, write as write_tee,
+};
+
+mod storage;
 
 /// Length of a LiteLLM gateway retrieval hash (#702): LiteLLM's headroom
 /// guardrail scans compressed text with `hash=([a-f0-9]{24})`
@@ -330,7 +415,7 @@ pub(crate) fn retrieve_litellm(hash: &str) -> Option<String> {
     {
         return None;
     }
-    std::fs::read_to_string(resolve_tee(&hash[..TEE_HASH_LEN])?).ok()
+    read_tee(&hash[..TEE_HASH_LEN])
 }
 
 /// Replace every `<lc_expand:HASH>` marker in `s` with the verbatim original
@@ -508,6 +593,44 @@ mod tests {
                 "form {form} -> {handle}"
             );
         }
+    }
+
+    /// #1911: the HTML crush's `html_` handle must round-trip through the
+    /// resolver `ctx_expand` uses, in every form the footer can be copied in.
+    #[test]
+    fn persist_html_handle_resolves_in_every_form() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        let content = big("<p>html crush original</p>");
+        let handle = persist_html(&content).expect("html persisted");
+        let hash = crate::core::hasher::hash_short(&content);
+        for form in [
+            handle.clone(),
+            format!("html_{hash}.log"),
+            format!("html_{hash}"),
+        ] {
+            let resolved = resolve_tee(&form).unwrap_or_else(|| panic!("must resolve {form}"));
+            assert_eq!(resolved.to_string_lossy(), handle, "form {form}");
+        }
+        assert!(
+            std::fs::read_to_string(&handle)
+                .unwrap()
+                .contains("html crush original")
+        );
+    }
+
+    /// Every prefix a producer can write is accepted by the resolver, and a
+    /// prefix without its `_` separator is not.
+    #[test]
+    fn canonical_tee_name_covers_every_producer_prefix() {
+        let hash = "0123456789abcdef";
+        for prefix in TEE_PREFIXES {
+            assert_eq!(
+                canonical_tee_name(&format!("{prefix}_{hash}.log")),
+                Some(format!("{prefix}_{hash}.log"))
+            );
+        }
+        assert_eq!(canonical_tee_name(&format!("html{hash}")), None);
+        assert_eq!(canonical_tee_name("html_nothex000000000"), None);
     }
 
     #[test]

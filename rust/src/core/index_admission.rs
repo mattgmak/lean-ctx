@@ -79,6 +79,12 @@ impl Admission {
 /// normal repositories (a few hundred MB of source) are never affected.
 #[must_use]
 pub fn admit(kind: BuildKind, corpus_bytes: u64) -> Admission {
+    // The unit-test binary's RSS is thousands of parallel tests, not a server;
+    // on a small macOS runner it refused trivial fixtures. The decision itself
+    // is covered through `admit_with`.
+    if cfg!(test) {
+        return Admission::admitted();
+    }
     let Some(limit) = super::memory_guard::rss_limit_bytes() else {
         // No platform memory introspection — nothing to enforce.
         return Admission::admitted();

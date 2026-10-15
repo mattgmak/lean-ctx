@@ -45,6 +45,11 @@ pub(crate) fn entry_allows_stub(entry: &DeliveryEntryV2, current: Option<&str>) 
 
 /// Looks up an adapter result across all tiers including cross-process daemon.
 pub fn check(key: &CacheKey, validator: &CacheValidator, adapter: &str) -> Option<DeliveryEntryV2> {
+    // Legacy delivery receipts contain no policy/subject authority and no
+    // original payload to recheck. Protected requests must materialize again.
+    if crate::core::policy::runtime::active().is_some() {
+        return None;
+    }
     let coordinator = coordinator()?;
     let current_conversation = crate::core::conversation::current_conversation_id_fresh();
     let current = current_conversation.as_deref();
@@ -81,6 +86,11 @@ pub fn record(
     content: &str,
     adapter: &str,
 ) {
+    // Do not publish an unscoped receipt (including paths and identities) for
+    // a protected result. The MCP response cache has its own policy binding.
+    if crate::core::policy::runtime::active().is_some() {
+        return;
+    }
     let Some(coordinator) = coordinator() else {
         return;
     };
@@ -154,10 +164,8 @@ fn epoch_ms() -> u64 {
 }
 
 fn agent_id() -> String {
-    std::env::var("CURSOR_TASK_ID")
-        .or_else(|_| std::env::var("CLAUDECODE"))
-        .or_else(|_| std::env::var("CODEX_THREAD_ID"))
-        .unwrap_or_else(|_| "local-agent".into())
+    // One delivery identity for every registry (#1904).
+    crate::core::agent_identity::delivery_agent_id().to_string()
 }
 
 fn agent_host() -> AgentHost {
@@ -209,7 +217,25 @@ mod tests {
     }
 
     #[test]
+    fn entry_allows_stub_in_explicit_legacy_mode() {
+        if crate::test_env::run_with_conversation_scope(
+            "core::ocla::cache_delivery::tests::entry_allows_stub_in_explicit_legacy_mode",
+            false,
+        ) {
+            return;
+        }
+        let entry = entry_with_conversation("conv-a");
+        assert!(entry_allows_stub(&entry, Some("conv-b")));
+    }
+
+    #[test]
     fn entry_allows_stub_withholds_across_conversations() {
+        if crate::test_env::run_with_conversation_scope(
+            "core::ocla::cache_delivery::tests::entry_allows_stub_withholds_across_conversations",
+            true,
+        ) {
+            return;
+        }
         let entry = entry_with_conversation("conv-a");
         assert!(!entry_allows_stub(&entry, Some("conv-b")));
     }

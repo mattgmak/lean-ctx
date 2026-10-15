@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Config path resolution and disk loading.
 
 use std::path::{Path, PathBuf};
@@ -20,6 +22,8 @@ pub(super) fn parse_config_with_profile(
     raw: &str,
     explicit_profile: Option<&str>,
 ) -> Result<Config, String> {
+    let migrated = Config::migrate_v3_compression_document(raw)?;
+    let raw = migrated.as_deref().unwrap_or(raw);
     let mut value: toml::Value = toml::from_str(raw).map_err(|error| error.to_string())?;
     let configured_profile = value.get("config_profile").and_then(toml::Value::as_str);
     let selected = explicit_profile
@@ -129,6 +133,12 @@ pub(crate) fn strip_sensitive_overrides(local: &mut Config) -> Vec<&'static str>
         local.passthrough_urls.clear();
         withheld.push("passthrough_urls");
     }
+    // Paths in `redirect_exclude` skip the native-read redirect, and with it
+    // the redaction that path applies; a cloned repo must not opt itself out.
+    if !local.redirect_exclude.is_empty() {
+        local.redirect_exclude.clear();
+        withheld.push("redirect_exclude");
+    }
     if local.proxy.anthropic_upstream.is_some()
         || local.proxy.openai_upstream.is_some()
         || local.proxy.chatgpt_upstream.is_some()
@@ -139,6 +149,12 @@ pub(crate) fn strip_sensitive_overrides(local: &mut Config) -> Vec<&'static str>
         local.proxy.chatgpt_upstream = None;
         local.proxy.gemini_upstream = None;
         withheld.push("proxy.*_upstream");
+    }
+    // `eager` lets background work start language servers, which execute
+    // project code (build scripts, proc macros). Lowering to off/auto is safe.
+    if local.semantic_mode == super::SemanticMode::Eager {
+        local.semantic_mode = super::SemanticMode::default();
+        withheld.push("semantic_mode");
     }
     if local.rules_scope.is_some() {
         local.rules_scope = None;
@@ -172,6 +188,10 @@ pub(crate) fn strip_sensitive_overrides(local: &mut Config) -> Vec<&'static str>
         local.index.respect_gitignore = true;
         withheld.push("index.respect_gitignore");
     }
+    if !local.shell_allowlist_subcommand_scoping {
+        local.shell_allowlist_subcommand_scoping = true;
+        withheld.push("shell_allowlist_subcommand_scoping");
+    }
 
     withheld
 }
@@ -192,11 +212,10 @@ pub fn local_sensitive_overrides(local_toml: &str) -> Vec<&'static str> {
 impl Config {
     /// Returns the path to the global config file (`$XDG_CONFIG_HOME/lean-ctx/config.toml`).
     ///
-    /// Resolves via [`crate::core::paths::config_dir`] so config lives in the
-    /// RO-safe config category. Behavior-neutral today: `config_dir()` equals the
-    /// legacy data dir for existing/single-dir installs (GH #408 / GL #602).
+    /// Resolves the canonical config category without creating directories or
+    /// repairing permissions; existing single-dir installations retain their path.
     pub fn path() -> Option<PathBuf> {
-        crate::core::paths::config_dir()
+        crate::core::paths::config_dir_read_only()
             .ok()
             .map(|d| d.join("config.toml"))
     }
@@ -387,8 +406,7 @@ impl Config {
             cfg.merge_local(local, trusted);
         }
 
-        cfg.migrate_contribute_to_telemetry();
-        cfg.migrate_cognitive_mode_to_full();
+        cfg.migrate_v4_config_on_disk();
 
         let cfg = Arc::new(cfg);
         if let Ok(mut guard) = CACHE.lock() {
@@ -398,61 +416,239 @@ impl Config {
         cfg
     }
 
+    /// Global config merged with the `.lean-ctx.toml` of `project_root` — not
+    /// of the process's own project. A daemon serving several repositories
+    /// must evaluate per-project settings (and their workspace trust) against
+    /// the project being processed. Uncached; same merge + trust rules as
+    /// [`load_arc`](Self::load_arc).
+    pub fn load_for_project_root(project_root: &str) -> Self {
+        let selected_profile = environment_config_profile();
+        let mut cfg = Self::path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|c| parse_config_with_profile(&c, selected_profile.as_deref()).ok())
+            .unwrap_or_default();
+        let local_path = Self::local_path(project_root);
+        if crate::core::pathutil::may_probe_path(local_path.as_path())
+            && let Ok(local) = std::fs::read_to_string(&local_path)
+        {
+            let trusted = crate::core::workspace_trust::is_trusted_for(
+                std::path::Path::new(project_root),
+                &crate::core::hasher::hash_str(&local),
+            );
+            cfg.merge_local(&local, trusted);
+        }
+        cfg
+    }
+
     // `merge_local` is in `merge.rs` (extracted for #660 LOC gate).
 
-    /// Migrate legacy `[cloud] contribute_enabled` → `[telemetry] enabled`.
-    ///
-    /// If the user opted into the old anonymous contribute system but has not
-    /// yet enabled the new unified telemetry flag, flip `telemetry.enabled`
-    /// on and clear `contribute_enabled` so the migration is one-way.
-    /// Persists the change to disk so subsequent loads see the new state.
-    pub(crate) fn migrate_contribute_to_telemetry(&mut self) {
-        if self.cloud.contribute_enabled && !self.telemetry.enabled {
+    /// Consolidate legacy changes into one recoverable config transaction.
+    /// Preserve explicit telemetry opt-outs and the integrated preference model.
+    pub(crate) fn migrate_v4_config_on_disk(&mut self) {
+        // Telemetry was opt-in before v2, so a persisted `enabled = false`
+        // without an explicit preference is not a choice against v2. Re-enable
+        // it once, in a writable config only: a read-only (declaratively
+        // managed) file keeps exactly what its owner wrote.
+        let path = Self::path();
+        let writable = path
+            .as_deref()
+            .is_some_and(allows_automatic_config_migration);
+        let raw = path
+            .as_deref()
+            .filter(|_| writable)
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        let reset_pending = crate::core::telemetry_consent::legacy_opt_out_reset_pending();
+        let reset = raw
+            .as_deref()
+            .filter(|_| reset_pending)
+            .and_then(reset_legacy_telemetry_opt_out);
+        if reset.is_some() && self.telemetry.preference == super::TelemetryPreference::DefaultOn {
             self.telemetry.enabled = true;
+        }
+        let preserve_opt_out = self.telemetry.explicitly_disabled();
+        if self.cloud.contribute_enabled {
             self.cloud.contribute_enabled = false;
-
-            if let Some(path) = Self::path() {
-                if let Ok(raw) = std::fs::read_to_string(&path) {
-                    let mut updated =
-                        raw.replace("contribute_enabled = true", "contribute_enabled = false");
-                    if !updated.contains("[telemetry]") {
-                        if !updated.ends_with('\n') {
-                            updated.push('\n');
-                        }
-                        updated.push_str("\n[telemetry]\nenabled = true\n");
-                    } else if let Some(tpos) = updated.find("[telemetry]") {
-                        let after = &updated[tpos..];
-                        if let Some(epos) = after.find("enabled = false") {
-                            let abs_pos = tpos + epos;
-                            updated.replace_range(
-                                abs_pos..abs_pos + "enabled = false".len(),
-                                "enabled = true",
-                            );
-                        }
-                    }
-                    let _ = crate::config_io::write_atomic_with_backup(&path, &updated);
-                }
+            if !preserve_opt_out {
+                self.telemetry.enabled = true;
+                self.telemetry.preference = super::TelemetryPreference::ExplicitlyEnabled;
             }
+        }
+        if matches!(self.cognitive_mode, CognitiveMode::Basic) {
+            self.cognitive_mode = CognitiveMode::Full;
+        }
+        let Some(path) = path else {
+            return;
+        };
+        let Some(raw) = raw else {
+            if !writable {
+                tracing::debug!(
+                    "config migration remains in memory: source or directory is read-only"
+                );
+            }
+            // No config yet: there is no legacy opt-out to reset, now or later.
+            if reset_pending && !path.exists() {
+                crate::core::telemetry_consent::mark_legacy_opt_out_reset();
+            }
+            return;
+        };
+        let source = reset.as_deref().unwrap_or(&raw);
+        let migrated = match Self::migrate_v4_config_document(
+            source,
+            environment_config_profile().as_deref(),
+            preserve_opt_out,
+        ) {
+            Ok(Some(updated)) => Some(updated),
+            Ok(None) => (source != raw).then(|| source.to_string()),
+            Err(error) => {
+                tracing::warn!("config migration failed: {error}");
+                return;
+            }
+        };
+        let persisted = match migrated {
+            Some(updated) => crate::config_io::write_atomic_config_migration_checked(
+                &path,
+                &updated,
+                Some(raw.as_bytes()),
+            )
+            .map_err(|error| tracing::warn!("config migration could not be persisted: {error}"))
+            .is_ok(),
+            None => true,
+        };
+        if persisted && reset_pending {
+            crate::core::telemetry_consent::mark_legacy_opt_out_reset();
         }
     }
 
-    /// Migrate `cognitive_mode` from `basic` (old default) to `full` (new default).
-    /// The old default gave users only basic science features; `full` enables the
-    /// complete adaptive compression suite. One-way: only upgrades `basic` → `full`,
-    /// never touches `off` (explicit opt-out). Persists to disk.
-    pub(crate) fn migrate_cognitive_mode_to_full(&mut self) {
-        if !matches!(self.cognitive_mode, CognitiveMode::Basic) {
-            return;
+    pub(super) fn migrate_v4_config_document(
+        raw: &str,
+        selected_profile: Option<&str>,
+        preserve_opt_out: bool,
+    ) -> Result<Option<String>, String> {
+        let document = raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| error.to_string())?;
+        let legacy_telemetry = document
+            .get("cloud")
+            .and_then(|table| table.get("contribute_enabled"))
+            .and_then(toml_edit::Item::as_bool)
+            == Some(true);
+        let persisted_opt_out = document
+            .get("telemetry")
+            .and_then(|table| table.get("enabled"))
+            .and_then(toml_edit::Item::as_bool)
+            == Some(false);
+        let mut updated = if legacy_telemetry {
+            migrate_legacy_contribute_document(raw, preserve_opt_out || persisted_opt_out)
+                .ok_or_else(|| "invalid legacy telemetry configuration".to_string())?
+        } else {
+            raw.to_string()
+        };
+        if let Some(next) = Self::validated_v3_compression_document(&updated, selected_profile)? {
+            updated = next;
         }
-        self.cognitive_mode = CognitiveMode::Full;
+        let mut document = updated
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| error.to_string())?;
+        if document
+            .get("cognitive_mode")
+            .and_then(toml_edit::Item::as_str)
+            == Some("basic")
+        {
+            document["cognitive_mode"] = toml_edit::value("full");
+            updated = document.to_string();
+        }
+        parse_config_with_profile(&updated, selected_profile)?;
+        Ok((updated != raw).then_some(updated))
+    }
 
-        if let Some(path) = Self::path() {
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                let updated =
-                    raw.replace("cognitive_mode = \"basic\"", "cognitive_mode = \"full\"");
-                let _ = crate::config_io::write_atomic_with_backup(&path, &updated);
+    pub(crate) fn validated_v3_compression_document(
+        raw: &str,
+        selected_profile: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let migrated = Self::migrate_v3_compression_document(raw)?;
+        if let Some(ref updated) = migrated {
+            parse_config_with_profile(updated, selected_profile)?;
+        }
+        Ok(migrated)
+    }
+
+    pub(crate) fn migrate_v3_compression_document(raw: &str) -> Result<Option<String>, String> {
+        fn migrate_table(table: &mut toml_edit::Table) -> Result<bool, String> {
+            let has_legacy = ["terse_agent", "output_density", "ultra_compact"]
+                .iter()
+                .any(|key| table.get(key).is_some());
+            if !has_legacy {
+                return Ok(false);
+            }
+
+            let terse = match table.get("terse_agent") {
+                Some(item) => Some(
+                    item.as_str()
+                        .ok_or_else(|| "terse_agent must be a string".to_string())?,
+                ),
+                None => None,
+            };
+            if terse.is_some_and(|value| !matches!(value, "off" | "lite" | "full" | "ultra")) {
+                return Err("invalid terse_agent".to_string());
+            }
+            let density = match table.get("output_density") {
+                Some(item) => Some(
+                    item.as_str()
+                        .ok_or_else(|| "output_density must be a string".to_string())?,
+                ),
+                None => None,
+            };
+            if density.is_some_and(|value| !matches!(value, "normal" | "terse" | "ultra")) {
+                return Err("invalid output_density".to_string());
+            }
+            let ultra = match table.get("ultra_compact") {
+                Some(item) => Some(
+                    item.as_bool()
+                        .ok_or_else(|| "ultra_compact must be a boolean".to_string())?,
+                ),
+                None => None,
+            };
+
+            let level = if let Some(item) = table.get("compression_level") {
+                let value = item
+                    .as_str()
+                    .ok_or_else(|| "compression_level must be a string".to_string())?;
+                if !matches!(value, "off" | "lite" | "standard" | "max" | "raw") {
+                    return Err(format!("invalid compression_level: {value}"));
+                }
+                value
+            } else if ultra == Some(true) || terse == Some("ultra") || density == Some("ultra") {
+                "max"
+            } else if terse == Some("full") {
+                "standard"
+            } else if terse == Some("lite") || density == Some("terse") {
+                "lite"
+            } else {
+                "off"
+            };
+
+            table["compression_level"] = toml_edit::value(level);
+            for key in ["terse_agent", "output_density", "ultra_compact"] {
+                table.remove(key);
+            }
+            Ok(true)
+        }
+
+        let mut document = raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| error.to_string())?;
+        let mut changed = migrate_table(document.as_table_mut())?;
+        if let Some(profiles) = document
+            .get_mut("profiles")
+            .and_then(toml_edit::Item::as_table_mut)
+        {
+            for (_, profile) in profiles.iter_mut() {
+                if let Some(table) = profile.as_table_mut() {
+                    changed |= migrate_table(table)?;
+                }
             }
         }
+        Ok(changed.then(|| document.to_string()))
     }
 
     /// Loads ONLY the global config file — never merging project-local
@@ -467,14 +663,129 @@ impl Config {
         Self::path().map_or_else(Self::default, |p| Self::load_global_from(&p))
     }
 
+    /// Strict variant of [`Config::load_global`]: an unreadable or unparseable
+    /// global config is an error instead of silently becoming the defaults.
+    /// Consent-gated paths (telemetry send) must use this so a corrupt file
+    /// never turns into default-on behaviour.
+    pub fn try_load_global() -> Result<Self, super::error::LeanCtxError> {
+        let path = Self::path().ok_or_else(|| {
+            super::error::LeanCtxError::Config("cannot determine home directory".into())
+        })?;
+        Self::try_load_global_from(&path)
+    }
+
+    pub(super) fn try_load_global_from(path: &Path) -> Result<Self, super::error::LeanCtxError> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) if !raw.trim().is_empty() => toml::from_str(&raw).map_err(|error| {
+                super::error::LeanCtxError::Config(
+                    format!("refusing invalid global config.toml ({error})").into(),
+                )
+            }),
+            Ok(_) => Ok(Self::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Path-parameterized core of [`Config::load_global`] (unit-testable without
     /// the real config dir). Missing, empty, or unparseable files yield
     /// defaults; persisting callers that must not clobber a corrupt file use
     /// [`Config::update_global`], which refuses instead.
     pub(super) fn load_global_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(raw) if !raw.trim().is_empty() => toml::from_str(&raw).unwrap_or_default(),
-            _ => Self::default(),
-        }
+        Self::try_load_global_from(path).unwrap_or_default()
+    }
+}
+
+// Respect declared read-only permissions even when a privileged process could
+// bypass them. Other access restrictions still fail at the transactional writer.
+fn allows_automatic_config_migration(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        [path, parent].iter().all(|entry| {
+            std::fs::metadata(entry).is_ok_and(|metadata| !metadata.permissions().readonly())
+        })
+    })
+}
+
+/// Re-enables a pre-v2 `telemetry.enabled = false` that carries no explicit
+/// preference. Returns `None` when there is nothing to reset, including every
+/// explicit choice (`explicitly_disabled` stays off).
+pub(super) fn reset_legacy_telemetry_opt_out(raw: &str) -> Option<String> {
+    let mut document = raw.parse::<toml_edit::DocumentMut>().ok()?;
+    let telemetry = document.get("telemetry")?;
+    let disabled = telemetry.get("enabled").and_then(toml_edit::Item::as_bool) == Some(false);
+    let implicit = matches!(
+        telemetry.get("preference").map(toml_edit::Item::as_str),
+        None | Some(Some("default_on"))
+    );
+    if !(disabled && implicit) {
+        return None;
+    }
+    document["telemetry"]["enabled"] = toml_edit::value(true);
+    Some(document.to_string())
+}
+
+fn migrate_legacy_contribute_document(raw: &str, preserve_opt_out: bool) -> Option<String> {
+    let mut document = raw.parse::<toml_edit::DocumentMut>().ok()?;
+    document["cloud"]["contribute_enabled"] = toml_edit::value(false);
+    if !preserve_opt_out {
+        document["telemetry"]["enabled"] = toml_edit::value(true);
+        document["telemetry"]["preference"] = toml_edit::value("explicitly_enabled");
+    }
+    Some(document.to_string())
+}
+
+#[cfg(test)]
+mod telemetry_migration_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn automatic_migration_respects_readonly_file_and_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("migration directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "ultra_compact = true\n").expect("legacy config");
+        assert!(allows_automatic_config_migration(&path));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let readonly_file = allows_automatic_config_migration(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let readonly_directory = allows_automatic_config_migration(&path);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!readonly_file);
+        assert!(!readonly_directory);
+        assert!(!allows_automatic_config_migration(
+            &directory.path().join("missing.toml")
+        ));
+    }
+
+    #[test]
+    fn legacy_opt_in_becomes_explicit_and_send_eligible() {
+        let migrated = migrate_legacy_contribute_document(
+            "# keep me\n[cloud]\ncontribute_enabled = true\n",
+            false,
+        )
+        .expect("valid TOML");
+        assert!(migrated.contains("# keep me"));
+        let cfg: Config = toml::from_str(&migrated).expect("migrated config");
+        assert!(!cfg.cloud.contribute_enabled);
+        assert!(cfg.telemetry.enabled);
+        assert_eq!(
+            cfg.telemetry.preference,
+            super::super::TelemetryPreference::ExplicitlyEnabled
+        );
+        assert!(cfg.telemetry.send_eligible(None, None));
+    }
+
+    #[test]
+    fn legacy_contribute_never_overrides_explicit_opt_out() {
+        let migrated = migrate_legacy_contribute_document(
+            "[cloud]\ncontribute_enabled = true\n[telemetry]\nenabled = false\n",
+            true,
+        )
+        .expect("valid TOML");
+        let cfg: Config = toml::from_str(&migrated).expect("migrated config");
+        assert!(!cfg.cloud.contribute_enabled);
+        assert!(cfg.telemetry.explicitly_disabled());
     }
 }
