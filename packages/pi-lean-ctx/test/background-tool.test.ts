@@ -176,7 +176,7 @@ describe("ctx_bg", () => {
 
 		await execute({ command: "sleep 60" }, { mode: "tui", ui: { setWidget } });
 
-		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function));
+		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function), { placement: "belowEditor" });
 	});
 
 	it("accepts Python's (?i) prefix in wake_on", async () => {
@@ -287,7 +287,7 @@ describe("ctx_bg", () => {
 		await runStart({ mode: "tui", ui: { setWidget } });
 
 		await execute({ command: "cargo test" });
-		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function));
+		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function), { placement: "belowEditor" });
 
 		await vi.advanceTimersByTimeAsync(2000);
 		const factory = setWidget.mock.calls.at(-1)?.[1] as (
@@ -304,5 +304,27 @@ describe("ctx_bg", () => {
 
 		await runShutdown();
 		expect(setWidget).toHaveBeenLastCalledWith("lean-ctx-jobs", undefined);
+	});
+
+	it("renders the agent-supplied job name instead of the raw job id", async () => {
+		const callTool = vi
+			.fn()
+			.mockResolvedValueOnce({ content: [{ type: "text", text: STARTED("shell_n1") }] })
+			.mockResolvedValue({ content: [{ type: "text", text: RUNNING("shell_n1", "compiling core") }] });
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+
+		await execute({ command: "nix build .#piCompiled", name: "compiled pi build" }, { mode: "tui", ui: { setWidget } });
+		await vi.advanceTimersByTimeAsync(2000);
+
+		const factory = setWidget.mock.calls.at(-1)?.[1] as (
+			tui: { requestRender: () => void },
+			theme: { fg: (color: string, text: string) => string },
+		) => { render(width: number): string[] };
+		const lines = factory({ requestRender: () => {} }, { fg: (_color, text) => text }).render(120);
+
+		expect(lines[0]).toContain("compiled pi build");
+		expect(lines[0]).toContain("compiling core");
+		expect(lines[0]).not.toContain("shell_n1");
 	});
 });

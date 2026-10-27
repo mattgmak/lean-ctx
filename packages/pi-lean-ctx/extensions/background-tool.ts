@@ -10,6 +10,7 @@ import type { McpBridge } from "./mcp-bridge.js";
 const POLL_MS = 2000;
 const MAX_TRACKED_JOBS = 8;
 const WIDGET_KEY = "lean-ctx-jobs";
+const WIDGET_BG = "customMessageBg";
 const MAX_WIDGET_JOBS = 3;
 const LAST_LINE_MAX = 60;
 const MAX_WAKE_MESSAGES = 10;
@@ -19,6 +20,7 @@ const STILL_RUNNING = /\[background:[A-Za-z0-9_]+ running\]/;
 
 interface Job {
 	id: string;
+	name: string;
 	command: string;
 	timer: ReturnType<typeof setInterval>;
 	wake: RegExp | undefined;
@@ -39,6 +41,9 @@ interface Deps {
 
 const TEXT = Type.Object({
 	command: Type.Optional(Type.String({ description: "Shell command to run in the background" })),
+	name: Type.Optional(
+		Type.String({ description: "Short label the user sees in the jobs widget, e.g. 'full test suite'" }),
+	),
 	background_action: Type.Optional(
 		Type.Union([Type.Literal("status"), Type.Literal("cancel")], {
 			description: "Inspect or cancel a job instead of starting one",
@@ -54,8 +59,18 @@ const TEXT = Type.Object({
 	),
 });
 
-function textOf(result: { content: Array<{ text?: string }> }): string {
-	return result.content
+function plainWidth(text: string): number {
+	return text.replace(/\u001b\[[0-9;]*m/g, "").length;
+}
+
+// Fill the widget line with the theme background. Falls back to plain text on an
+// older theme object without a bg helper.
+function background(theme: unknown, text: string): string {
+	const bg = (theme as { bg?: (color: string, text: string) => string }).bg;
+	return typeof bg === "function" ? bg.call(theme, WIDGET_BG, text) : text;
+}
+
+function textOf(result: { content: Array<{ text?: string }> }): string {	return result.content
 		.map((part) => part.text ?? "")
 		.join("\n")
 		.trim();
@@ -96,33 +111,59 @@ function compileWake(source: string | undefined): RegExp | undefined {
 export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): void {
 	const jobs = new Map<string, Job>();
 	let ui: ExtensionContext["ui"] | undefined;
+	let requestRender: (() => void) | undefined;
+	let ticker: ReturnType<typeof setInterval> | undefined;
+
+	const stopTicker = () => {
+		if (ticker) clearInterval(ticker);
+		ticker = undefined;
+	};
 
 	// One line per running job above the editor: elapsed time and latest output.
 	const showJobs = () => {
 		if (!ui) return;
-		if (jobs.size === 0) return ui.setWidget(WIDGET_KEY, undefined);
+		if (jobs.size === 0) {
+			stopTicker();
+			return ui.setWidget(WIDGET_KEY, undefined);
+		}
+		// The subagents widget claims the above-editor slot, so this one takes the
+		// below-editor slot and the two never compete for the same position.
 		ui.setWidget(WIDGET_KEY, (tui, theme) => {
-			const timer = setInterval(() => tui.requestRender(), 1000);
+			requestRender = () => tui.requestRender();
+			if (!ticker) {
+				ticker = setInterval(() => requestRender?.(), 1000);
+				ticker.unref?.();
+			}
+			const paint = (line: string, width: number): string => {
+				// Trailing blank cells get trimmed, so a subtle dot fills the band out
+				// to the terminal edge and keeps the background visible.
+				const pad = Math.max(0, width - plainWidth(line) - 2);
+				return background(theme, " " + line + theme.fg("borderMuted", "·".repeat(pad)) + " ");
+			};
+			// The last output line sits in muted text and yields to the label on a
+			// narrow terminal, so the job name never gets cut.
+			const row = (job: Job, width: number): string => {
+				const head = theme.fg("accent", "⏵ ")
+					+ theme.fg("toolTitle", job.name || job.id)
+					+ theme.fg("muted", ` ${job.command.replace(/\s+/g, " ")}`)
+					+ theme.fg("dim", ` · ${elapsed(job)}`);
+				const room = width - plainWidth(head) - 3;
+				const tail = job.lastLine && room > 3 ? theme.fg("muted", ` · ${truncateToWidth(job.lastLine, room)}`) : "";
+				return truncateToWidth(head + tail, width);
+			};
 			return {
-				dispose: () => clearInterval(timer),
 				invalidate() {},
 				render(width: number) {
+					const inner = Math.max(1, width - 2);
 					const all = [...jobs.values()];
-					const lines = all.slice(0, MAX_WIDGET_JOBS).map((job) =>
-						truncateToWidth(
-							theme.fg("accent", " ⏵ ")
-								+ theme.fg("toolTitle", `${job.id} ${job.command.replace(/\s+/g, " ")}`)
-								+ theme.fg("dim", ` · ${elapsed(job)}${job.lastLine ? ` · ${job.lastLine}` : ""}`),
-							width,
-						),
-					);
+					const lines = all.slice(0, MAX_WIDGET_JOBS).map((job) => paint(row(job, inner), width));
 					if (all.length > MAX_WIDGET_JOBS) {
-						lines.push(theme.fg("dim", `   +${all.length - MAX_WIDGET_JOBS} more`));
+						lines.push(paint(theme.fg("dim", `+${all.length - MAX_WIDGET_JOBS} more`), width));
 					}
 					return lines;
 				},
 			};
-		});
+		}, { placement: "belowEditor" });
 	};
 
 	// The factory awaits the MCP bridge, so this extension registers its
@@ -176,7 +217,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 					job.wokenLines.add(match);
 					job.wakes += 1;
 					wake(
-						`lean-ctx background job ${job.id} matched your wake pattern and still runs.\n$ ${job.command}\n\n${clip(output)}`,
+						`lean-ctx background job ${job.name || job.id} matched your wake pattern and still runs.\n$ ${job.command}\n\n${clip(output)}`,
 						{ jobId: job.id, kind: "wake" },
 					);
 				}
@@ -230,6 +271,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		}
 		const job: Job = {
 			id,
+			name: String(args.name ?? "").trim().slice(0, 60),
 			command,
 			timer: setInterval(() => void poll(job), POLL_MS),
 			wake: compileWake(typeof args.wake_on === "string" ? args.wake_on : undefined),
@@ -283,6 +325,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			+ "Use background_action \"status\" or \"cancel\" with a job_id only when you must inspect or stop a job early.",
 		promptSnippet: "Run a long shell command in the background and get woken when it finishes",
 		promptGuidelines: [
+			"Always pass name: a short human label for the command, so the user can tell the job apart in the jobs widget.",
 			"Use ctx_bg instead of ctx_shell for commands that may take longer than about 30 seconds: builds, full test suites, installs, large downloads, training runs.",
 			"After ctx_bg, continue with other work or end the turn. A follow-up message with the result arrives by itself, so never poll or sleep to wait for a job.",
 			"Jobs stop when Pi exits, because they live in the lean-ctx process attached to this session.",
@@ -322,6 +365,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 	});
 
 	pi.on("session_shutdown", async () => {
+		stopTicker();
 		for (const job of jobs.values()) clearInterval(job.timer);
 		jobs.clear();
 		ui?.setWidget(WIDGET_KEY, undefined);
