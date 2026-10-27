@@ -25,6 +25,7 @@ import { readFile, stat } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { homedir, platform } from "node:os";
 import { McpBridge } from "./mcp-bridge.js";
+import { registerBackgroundTool } from "./background-tool.js";
 import {
   createMcpSchemaCacheKey,
   identifyBinary,
@@ -442,6 +443,7 @@ export default async function (pi: ExtensionAPI) {
     promptSnippet: "Run shell commands (not for file reading — use ctx_read)",
     promptGuidelines: [
       "Use ctx_shell only for commands with side effects: build, test, install, git, run scripts.",
+      "Use ctx_bg instead of ctx_shell for commands that may run longer than about 30 seconds, so the turn does not block.",
     ],
     parameters: bashSchemaWithRaw,
     renderCall(args, theme) {
@@ -994,6 +996,12 @@ export default async function (pi: ExtensionAPI) {
       }
     }
   }
+
+  registerBackgroundTool({
+    pi,
+    registerTool: registerTool as (def: unknown) => void,
+    getBridge: () => bridge ?? undefined,
+  });
 
   pi.registerCommand("lean-ctx", {
     description: "Show lean-ctx status: binary path, MCP bridge, and registered tools",
