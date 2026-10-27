@@ -26,6 +26,7 @@ interface Job {
 	polls: number;
 	startedAt: number;
 	lastLine: string;
+	wokenLines: Set<string>;
 }
 
 type RegisterTool = (def: unknown) => void;
@@ -124,6 +125,15 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		});
 	};
 
+	// The factory awaits the MCP bridge, so this extension registers its
+	// session_start handler after that event fired. A tool call carries the same
+	// context, so the first call also adopts the widget target.
+	const adoptContext = (ctx?: ExtensionContext): void => {
+		if (!ctx) return;
+		ui = ctx.mode === "tui" ? ctx.ui : undefined;
+		showJobs();
+	};
+
 	const stopTracking = (job: Job) => {
 		clearInterval(job.timer);
 		jobs.delete(job.id);
@@ -158,12 +168,18 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		if (!done) {
 			job.lastLine = tailLine(output);
 			showJobs();
-			if (job.wake && job.wakes < MAX_WAKE_MESSAGES && job.wake.test(output)) {
-				job.wakes += 1;
-				wake(
-					`lean-ctx background job ${job.id} matched your wake pattern and still runs.\n$ ${job.command}\n\n${clip(output)}`,
-					{ jobId: job.id, kind: "wake" },
-				);
+			if (job.wake && job.wakes < MAX_WAKE_MESSAGES) {
+				// Status output repeats earlier lines, so wake only on a matching line
+				// that did not wake before.
+				const match = output.split("\n").find((line) => job.wake!.test(line) && !job.wokenLines.has(line));
+				if (match) {
+					job.wokenLines.add(match);
+					job.wakes += 1;
+					wake(
+						`lean-ctx background job ${job.id} matched your wake pattern and still runs.\n$ ${job.command}\n\n${clip(output)}`,
+						{ jobId: job.id, kind: "wake" },
+					);
+				}
 			}
 			return;
 		}
@@ -221,6 +237,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			polls: 0,
 			startedAt: Date.now(),
 			lastLine: "",
+			wokenLines: new Set<string>(),
 		};
 		job.timer.unref?.();
 		jobs.set(id, job);
@@ -271,7 +288,14 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			"Jobs stop when Pi exits, because they live in the lean-ctx process attached to this session.",
 		],
 		parameters: TEXT,
-		async execute(_toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal) {
+		async execute(
+			_toolCallId: string,
+			params: Record<string, unknown>,
+			_signal: AbortSignal,
+			_onUpdate?: unknown,
+			ctx?: ExtensionContext,
+		) {
+			adoptContext(ctx);
 			if (params.background_action === "status" || params.background_action === "cancel") {
 				const jobId = String(params.job_id ?? "");
 				if (!jobId) {

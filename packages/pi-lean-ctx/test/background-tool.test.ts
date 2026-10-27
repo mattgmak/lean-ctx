@@ -50,7 +50,7 @@ function harness(
 		sent,
 		shutdown,
 		callTool: bridge?.callTool ?? vi.fn(),
-		execute: (params) => registered!.execute("call-1", params),
+		execute: (params, ctx) => registered!.execute("call-1", params, undefined, undefined, ctx as never),
 		runShutdown: async () => {
 			for (const handler of shutdown) await handler();
 		},
@@ -140,19 +140,43 @@ describe("ctx_bg", () => {
 		expect(sent[0].message.content).toContain("finished");
 	});
 
-	it("wakes once per matching output while the job still runs, up to the cap", async () => {
+	it("wakes once for a matching line that a later poll re-reports", async () => {
 		const callTool = vi.fn();
 		callTool.mockResolvedValueOnce({ content: [{ type: "text", text: STARTED("shell_d1") }] });
-		for (let i = 0; i < 12; i += 1) {
+		for (let i = 0; i < 5; i += 1) {
 			callTool.mockResolvedValueOnce({ content: [{ type: "text", text: RUNNING("shell_d1", "listening on :3000") }] });
 		}
 		const { execute, sent } = harness({ callTool });
 
 		await execute({ command: "npm run dev", wake_on: "listening on" });
+		await vi.advanceTimersByTimeAsync(2000 * 5);
+
+		expect(sent).toHaveLength(1);
+	});
+
+	it("wakes once per distinct matching line, up to the cap", async () => {
+		const callTool = vi.fn();
+		callTool.mockResolvedValueOnce({ content: [{ type: "text", text: STARTED("shell_d2") }] });
+		for (let i = 0; i < 12; i += 1) {
+			callTool.mockResolvedValueOnce({ content: [{ type: "text", text: RUNNING("shell_d2", `epoch ${i + 1}/10 loss 0.4${i}`) }] });
+		}
+		const { execute, sent } = harness({ callTool });
+
+		await execute({ command: "python3 train.py", wake_on: "epoch \\d+" });
 		await vi.advanceTimersByTimeAsync(2000 * 12);
 
 		expect(sent).toHaveLength(10);
 		expect(sent.every((entry) => String(entry.message.details.kind) === "wake")).toBe(true);
+	});
+
+	it("adopts the tool-call context so the jobs widget renders", async () => {
+		const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: STARTED("shell_h1") }] });
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+
+		await execute({ command: "sleep 60" }, { mode: "tui", ui: { setWidget } });
+
+		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function));
 	});
 
 	it("accepts Python's (?i) prefix in wake_on", async () => {
