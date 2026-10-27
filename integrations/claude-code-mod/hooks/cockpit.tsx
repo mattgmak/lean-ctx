@@ -1127,7 +1127,16 @@ export function registerCockpit(
       )
     }
 
-    if (pulseEnabled && b.isWorking) return handoff(ui, 'band-handoff', cols, b, tick, now)
+    // The handoff line sits on top; the rest of the chain still renders (#2142).
+    if (pulseEnabled && b.isWorking) {
+      const below = await next(e)
+      return (
+        <Box flexDirection="column">
+          {handoff(ui, 'band-handoff', cols, b, tick, now)}
+          {below}
+        </Box>
+      )
+    }
     return next(e)
   })
 

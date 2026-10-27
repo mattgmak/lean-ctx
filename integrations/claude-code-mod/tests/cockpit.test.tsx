@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { expect, test } from "claude-code/testing";
+import { expect, mock, test } from "claude-code/testing";
 
 const PANE = {
   plugin: "lean-ctx",
@@ -60,6 +60,22 @@ test("an idle band leaves the engine its own band: no number twice", async ($, o
   const ui = await $.ui.mount({ ...BAND, surface: "terminal" });
   expect(await ui.find({ type: "Text", text: "engine band" })).toBeDefined();
   expect(await ui.find({ type: "Raster", key: "band-handoff" })).toBeUndefined();
+  await ui.unmount();
+});
+
+// GitHub #2142: while a turn ran, the band answered without next(), so every
+// later AbovePrompt mod vanished until the turn ended.
+test("a working band draws the handoff line and keeps the mods beneath it", async ($, on) => {
+  on("ui.render", { component: "AbovePrompt" }, ($, e) => {
+    const { Text } = $.ui.resolve(e);
+    return <Text>engine band</Text>;
+  });
+  mock.clock(on);
+  on("turn.start", ($, event) => ({ turnId: event.turnId }));
+  await $.turn.start({ text: "build it", turnId: "turn-1" });
+  const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, isWorking: true }, surface: "terminal" });
+  expect(await ui.find({ type: "Raster", key: "band-handoff" })).toBeDefined();
+  expect(await ui.find({ type: "Text", text: "engine band" })).toBeDefined();
   await ui.unmount();
 });
 

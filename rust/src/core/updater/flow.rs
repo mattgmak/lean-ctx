@@ -8,8 +8,33 @@ use super::{
     rollback_to_previous, sha256_hex, verify_download_integrity,
 };
 
+/// Flags that change state on their own; `--dry-run` must not run them.
+const STATEFUL_FLAGS: &[&str] = &[
+    "--schedule",
+    "--rollback",
+    "--unpin",
+    "--pin",
+    "--recover-update",
+];
+
+/// The stateful flag combined with `--dry-run`, if any.
+fn dry_run_conflict(args: &[String]) -> Option<&str> {
+    if !args.iter().any(|a| a == "--dry-run") {
+        return None;
+    }
+    args.iter()
+        .map(String::as_str)
+        .find(|a| STATEFUL_FLAGS.contains(a))
+}
+
 pub(super) fn run_with_mode(args: &[String], mode: UpdateMode) {
-    let mut check_only = args.iter().any(|a| a == "--check");
+    if let Some(flag) = dry_run_conflict(args) {
+        eprintln!("  \x1b[31m✗\x1b[0m --dry-run cannot be combined with {flag}");
+        std::process::exit(2);
+    }
+    // `--dry-run` = `--check` plus a preview of the setup refresh.
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let mut check_only = dry_run || args.iter().any(|a| a == "--check");
     let quiet = args.iter().any(|a| a == "--quiet");
     let skip_rules = args.iter().any(|a| a == "--skip-rules");
     let force = args.iter().any(|a| a == "--force");
@@ -291,6 +316,10 @@ pub(super) fn run_with_mode(args: &[String], mode: UpdateMode) {
             post_update_rewire(skip_rules);
             println!();
         }
+        if dry_run {
+            println!("  Running `lean-ctx update` would refresh this setup:");
+            print_rewire_plan(skip_rules);
+        }
         return;
     }
 
@@ -334,6 +363,10 @@ pub(super) fn run_with_mode(args: &[String], mode: UpdateMode) {
             }
             UpdateMode::Normal => println!("Run 'lean-ctx update' to install."),
             UpdateMode::EnableGpu => println!("Run 'lean-ctx enable-gpu' to install {asset_name}."),
+        }
+        if dry_run {
+            println!("  After installing {asset_name} it would refresh this setup:");
+            print_rewire_plan(skip_rules);
         }
         return;
     }
@@ -500,6 +533,32 @@ pub(super) fn run_with_mode(args: &[String], mode: UpdateMode) {
                 crate::core::update_scheduler::set_auto_update(false, false, 6);
                 println!("  \x1b[2m○ Skipped — enable later: lean-ctx update --schedule\x1b[0m");
             }
+        }
+    }
+}
+
+/// Preview of `post_update_rewire`: it runs setup with the saved agent
+/// selection, so the setup plan is exactly what it would touch.
+fn print_rewire_plan(skip_rules: bool) {
+    let selection = crate::core::config::Config::load().setup.agents;
+    if let Err(e) = crate::setup::run_dry_run(selection.as_deref(), skip_rules, false) {
+        eprintln!("  \x1b[31m✗\x1b[0m {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dry_run_refuses_stateful_flags() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(super::dry_run_conflict(&args(&["--dry-run"])), None);
+        assert_eq!(super::dry_run_conflict(&args(&["--rollback"])), None);
+        for flag in super::STATEFUL_FLAGS {
+            assert_eq!(
+                super::dry_run_conflict(&args(&["--dry-run", flag])),
+                Some(*flag),
+                "{flag}"
+            );
         }
     }
 }

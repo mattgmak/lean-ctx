@@ -4,11 +4,11 @@ authority = "THIRD_PARTY_NOTICES"
 
 [inputs]
 cargo_lock = "rust/Cargo.lock"
-cargo_lock_sha256 = "0ec5dfcb060f102cf34e9017b1e21ad073082903d9b794a0cb3272645b4dbbd1"
+cargo_lock_sha256 = "82a6fc6a46a03a37c27c28880d31338f511fddd965bb8eb4133ac5c9e7c1da6e"
 sbom = "SBOM.cdx.json"
-sbom_sha256 = "53d31e4b08b708f8b21f70cacfd347dd4808d0106014f4ed4f3f90c1290cd72e"
+sbom_sha256 = "391a1618bcd0b8329fe81daf1d030abea2529abc68ff2570896822da30f97db8"
 npm_lock = "packages/pi-lean-ctx/package-lock.json"
-npm_lock_sha256 = "df993605fd30412428c0ac5ab7b8caaee9b4ad5e49ff069cc07939fd705fd5a4"
+npm_lock_sha256 = "1f4451809926e44c5edc0651f117aa9aed436ac8efdb927ea5001a9fade4c883"
 
 [license_texts]
 isc = """
@@ -246,7 +246,7 @@ evidence_paths = [
 [[assets]]
 id = "mcp-sdk-bundle"
 path = "packages/pi-lean-ctx/extensions/vendor/mcp-sdk.cjs"
-sha256 = "6a30e0f16413dd59f3b56eb5aabbe4afb60dbf8f2ffb0a9f83f79b9a8f97714e"
+sha256 = "c80e3574a7910c95a57d7d39ece30174a7c2dd7e923e030a3191666b331af77c"
 version = "1.32.1"
 source = "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.32.1.tgz"
 spdx = "MIT"

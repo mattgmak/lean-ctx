@@ -89,6 +89,14 @@ pub fn invalidate(path: &str) {
     lock(seen_paths()).remove(path);
 }
 
+/// Forgets every recorded delivery but keeps the cumulative statistics. After
+/// a host compaction nothing delivered earlier is still in the model's
+/// context, so no read may be answered with `already in context` (#2147).
+pub fn forget_deliveries() {
+    lock(dedup()).clear();
+    lock(seen_paths()).clear();
+}
+
 /// Clears cached content and all cumulative deduplication statistics.
 pub fn reset_dedup() {
     lock(dedup()).clear();

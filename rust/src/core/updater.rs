@@ -63,6 +63,7 @@ enum UpdateMode {
 /// change the scheduler, config, or installed binary.
 const KNOWN_FLAGS: &[&str] = &[
     "--check",
+    "--dry-run",
     "--quiet",
     "--skip-rules",
     "--scheduled",
@@ -110,6 +111,8 @@ fn print_help(mode: UpdateMode) {
     println!();
     println!("  VERSION                install this release instead of the latest");
     println!("  --check                only report whether an update is available");
+    println!("  --dry-run              show the update and the AI tools it would reconfigure;");
+    println!("                         write nothing (choose tools: lean-ctx setup --agents)");
     println!("  --quiet                suppress output unless something changes");
     println!("  --skip-rules           do not refresh agent rules after updating");
     if mode == UpdateMode::EnableGpu {
@@ -142,7 +145,6 @@ fn run_with_mode(args: &[String], mode: UpdateMode) {
             std::process::exit(2);
         }
     }
-
     flow::run_with_mode(args, mode);
 }
 
@@ -196,6 +198,8 @@ mod argument_guard_tests {
             &["--insecure"][..],
             &["--force"][..],
             &["--rewire"][..],
+            &["--dry-run"][..],
+            &["3.10.3", "--dry-run", "--skip-rules"][..],
         ] {
             assert_eq!(check_flags(&args(ok)), FlagCheck::Run, "{ok:?}");
         }
@@ -939,6 +943,11 @@ fn post_update_rewire(skip_rules: bool) {
         eprintln!("  \u{2139} Refreshing shell hooks in ~/.zshenv / ~/.bashenv.");
         eprintln!("    Set shell_hook_disabled=true to prevent this in future updates.");
     }
+    eprintln!(
+        "  \u{2139} AI tools: {}.",
+        crate::setup::describe_selection(cfg.setup.agents.as_deref())
+    );
+    eprintln!("    Choose which: lean-ctx setup --agents claude,cursor (preview: --dry-run)");
     let opts = crate::setup::SetupOptions {
         non_interactive: true,
         yes: true,
@@ -1389,7 +1398,7 @@ fn extract_from_zip(data: &[u8]) -> Result<Vec<u8>, String> {
 
     for i in 0..zip.len() {
         let mut file = zip.by_index(i).map_err(|e| e.to_string())?;
-        let name = file.name().to_string();
+        let name = file.name().map_err(|e| e.to_string())?.into_owned();
         if name == "lean-ctx.exe" || name == "lean-ctx" {
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;

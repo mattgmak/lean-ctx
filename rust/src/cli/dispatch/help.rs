@@ -31,7 +31,7 @@ Docs: https://leanctx.com
 /// from the README / feature catalog.
 pub(super) fn capability_banner() -> String {
     format!(
-        "{} MCP tools | local context selection, shaping, reuse, recovery, and measurement",
+        "{} MCP tools | Select · Control · Learn · Prove (supported Engine paths)",
         crate::server::registry::tool_count()
     )
 }
@@ -56,6 +56,7 @@ GETTING STARTED:
     lean-ctx onboard               Connect all AI tools at once (zero questions)
     lean-ctx setup                 Guided setup with full control over every option
     lean-ctx doctor                Check that everything is wired up correctly
+    lean-ctx inspect               Inspect recorded context operations and evidence
     lean-ctx gain                  Inspect local context-usage estimates (not a benchmark)
 
 EVERYDAY COMMANDS:
@@ -245,7 +246,7 @@ COMMANDS:
     enable-gpu [--check]           Install CUDA-enabled binary (x86_64 Linux/Windows)
     stop                           Stop ALL lean-ctx processes (daemon, proxy, orphans)
     restart                        Restart daemon (applies config.toml changes)
-    dev-install                    Build release + atomic install + restart (for development)
+    dev-install [--fast|--release] Fast incremental build + atomic install + restart
     codesign-setup                 macOS: one-time stable signing identity (stops repeating TCC prompt, #356)
     gotchas [list|clear|export|stats] Bug Memory: view/manage auto-detected error patterns
     doctor integrations [--json]   Integration health checks (Cursor/Claude Code/CodeBuddy)
@@ -466,7 +467,7 @@ ACCOUNT SYNC (accounts under an existing agreement; local tooling needs no accou
     cloud status                   Show account, plan and last sync
     cloud pull                     Restore your synchronized knowledge onto this machine
     cloud autosync <on|off|status> Daily background push of your synchronized context
-    cloud upgrade                  Unavailable: paid plans are application-only (hello@leanctx.com)
+    cloud upgrade                  Unavailable: paid plans are application-only (hello@thinkery.ch)
     contribute                     Share anonymized compression data
 
 TROUBLESHOOTING:

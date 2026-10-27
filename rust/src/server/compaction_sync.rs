@@ -57,6 +57,10 @@ pub fn sync_if_compacted(cache: &mut SessionCache, data_dir: &Path) -> bool {
     // have this". Writes the emptied index synchronously so a restart in the
     // crash window can't resurrect a pre-compaction stub.
     crate::core::read_stub_index::reset_in_dir(data_dir);
+    // The Context Kernel's content-dedup ledger answers re-reads with
+    // `unchanged (ref:…), already in context` on its own; it must forget the
+    // summarised deliveries as well, or the model re-reads with fresh=true (#2147).
+    crate::core::context_kernel::dedup_wiring::forget_deliveries();
     if reset_count > 0 {
         // #1781: `eprintln!` panics when the write fails, and a host closing the
         // pipe is routine for an MCP server (restart, aborted call, IDE reload).
@@ -313,5 +317,36 @@ mod tests {
         // Corrupt marker ignored → radar scan finds the compaction
         assert!(sync_if_compacted(&mut cache, dir.path()));
         assert!(!cache.is_full_delivered("/tmp/fallback.rs"));
+    }
+
+    /// GitHub #2147: after compaction the kernel's content-dedup ledger still
+    /// answered a re-read with `unchanged (ref:…), already in context`, so the
+    /// model had to re-read with fresh=true.
+    #[test]
+    #[serial]
+    fn compaction_clears_the_kernel_dedup_ledger() {
+        use crate::core::context_kernel::{ctx_read_dedup, dedup_wiring, kernel_config};
+        let _kernel = kernel_config::KERNEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kernel_config::reset_features();
+        dedup_wiring::reset_dedup();
+
+        assert_eq!(ctx_read_dedup::try_dedup("/tmp/k.rs", "body", false), None);
+        assert!(ctx_read_dedup::try_dedup("/tmp/k.rs", "body", false).is_some());
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("last_compaction.json"), r#"{"ts":7000}"#).unwrap();
+        std::fs::write(dir.path().join("context_radar.jsonl"), "").unwrap();
+        LAST_COMPACTION_TS.store(0, Ordering::Relaxed);
+        let mut cache = SessionCache::default();
+        assert!(sync_if_compacted(&mut cache, dir.path()));
+
+        assert_eq!(
+            ctx_read_dedup::try_dedup("/tmp/k.rs", "body", false),
+            None,
+            "a read after compaction must deliver the content, not a stub"
+        );
+        dedup_wiring::reset_dedup();
     }
 }

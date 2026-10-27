@@ -352,6 +352,10 @@ fn rules_file_without_section_strips_lean_ctx_block() {
 
 #[test]
 fn inject_rules_for_agent_opencode() {
+    // Injection reads LEAN_CTX_RULES_INJECTION, which other tests set to "off"
+    // under the env lock; without the lock this test raced them.
+    let _guard = crate::core::data_dir::test_env_lock();
+    let _injection_guard = crate::setup::EnvVarGuard::set("LEAN_CTX_RULES_INJECTION", "shared");
     let home = std::env::temp_dir().join("test_inject_rules_agent");
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::create_dir_all(&home);
@@ -377,6 +381,8 @@ fn inject_rules_for_agent_opencode() {
 
 #[test]
 fn inject_rules_for_agent_cursor() {
+    let _guard = crate::core::data_dir::test_env_lock();
+    let _injection_guard = crate::setup::EnvVarGuard::set("LEAN_CTX_RULES_INJECTION", "shared");
     let home = std::env::temp_dir().join("test_inject_rules_cursor");
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::create_dir_all(&home);
@@ -485,6 +491,8 @@ fn skill_targets_count() {
 
 #[test]
 fn install_skill_creates_file() {
+    let _guard = crate::core::data_dir::test_env_lock();
+    let _injection_guard = crate::setup::EnvVarGuard::set("LEAN_CTX_RULES_INJECTION", "shared");
     let home = std::env::temp_dir().join("test_skill_install");
     let _ = std::fs::create_dir_all(&home);
     let fake_cursor = home.join(".cursor");
@@ -501,6 +509,8 @@ fn install_skill_creates_file() {
 
 #[test]
 fn install_skill_idempotent() {
+    let _guard = crate::core::data_dir::test_env_lock();
+    let _injection_guard = crate::setup::EnvVarGuard::set("LEAN_CTX_RULES_INJECTION", "shared");
     let home = std::env::temp_dir().join("test_skill_idempotent");
     let _ = std::fs::create_dir_all(&home);
     let fake_cursor = home.join(".cursor");
@@ -550,6 +560,28 @@ fn match_agent_name_no_false_positives() {
     assert!(!match_agent_name("cursor", "Claude Code"));
     assert!(!match_agent_name("opencode", "Cursor"));
     assert!(!match_agent_name("unknown_agent", "Cursor"));
+}
+
+#[test]
+fn rules_targets_follow_agent_selection() {
+    let mut cfg = crate::core::config::Config::default();
+    assert!(
+        rules_target_selected(&cfg, None, "Cursor"),
+        "no selection = all"
+    );
+
+    cfg.setup.agents = Some(vec!["vscode".to_string(), "antigravity".to_string()]);
+    let names = ["VS Code", "Antigravity IDE"];
+    assert!(rules_target_selected(&cfg, Some(&names), "VS Code"));
+    assert!(rules_target_selected(&cfg, Some(&names), "Antigravity"));
+    assert!(!rules_target_selected(&cfg, Some(&names), "Cursor"));
+    assert!(!rules_target_selected(&cfg, Some(&names), "Gemini CLI"));
+
+    cfg.setup.agents = Some(vec![" ".to_string()]);
+    assert!(
+        !rules_target_selected(&cfg, Some(&[]), "Cursor"),
+        "a blank entry must not match every target"
+    );
 }
 
 // ── InjectResult ─────────────────────────────────────────────

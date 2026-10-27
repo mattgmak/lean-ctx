@@ -130,8 +130,25 @@ pub(in crate::server) async fn dispatch_primitive(
     // Ledger and security events recorded during this call commit the
     // session id into their hashes, so `lean-ctx value` can scope to it.
     crate::core::value::set_current_session(&server.session.read().await.id);
+    // Before dispatch: a `cd` in the command moves the session's shell cwd,
+    // but the command's relative paths are relative to where it started.
+    let shell_base = if name == "ctx_shell" {
+        shell_command_base_dir(server, args).await
+    } else {
+        None
+    };
     let (dispatched, archive_authority) =
         crate::core::archive::authority::capture(server.dispatch_tool(name, args, minimal)).await;
+    if name == "ctx_shell"
+        && let Ok((_, _, outcome, _)) = &dispatched
+        && !matches!(
+            outcome,
+            Some(crate::server::tool_trait::ShellOutcome::Blocked)
+        )
+    {
+        let cmd = helpers::get_str(args, "command").unwrap_or_default();
+        record_shell_file_effects(&cmd, shell_base.as_deref());
+    }
     let (result_text, tool_saved_tokens, shell_outcome, content_blocks) = match dispatched {
         Ok(tuple) => tuple,
         Err(e) if e.code == crate::server::tool_trait::TOOL_EXECUTION_ERROR => {
@@ -364,13 +381,7 @@ pub(in crate::server) async fn reversible_post_process(
                     .is_some_and(|c| crate::core::firewall::is_raw_command(&c, &config))));
 
     let pre_terse_len = result_text.len();
-    let output_tokens = {
-        let tokens = crate::core::tokens::count_tokens(&result_text) as u64;
-        crate::core::budget_tracker::BudgetTracker::global().record_tokens(tokens);
-        tokens
-    };
-
-    crate::core::anomaly::record_metric("tokens_per_call", output_tokens as f64);
+    let output_tokens = crate::core::tokens::count_tokens(&result_text) as u64;
 
     // Capture Context IR now; the lifecycle writes it after post-processing.
     let ir_intent = server.context_ir.as_ref().map(|_| {
@@ -422,15 +433,6 @@ pub(in crate::server) async fn reversible_post_process(
         }
         let correction_count = detector.correction_count();
         let retrieve_count = detector.retrieve_count();
-        if correction_count > 0 {
-            crate::core::anomaly::record_metric(
-                "correction_loop_rate",
-                f64::from(correction_count),
-            );
-        }
-        if retrieve_count > 0 {
-            crate::core::anomaly::record_metric("ccr_retrieve_rate", f64::from(retrieve_count));
-        }
         // Auto-degrade: reduce compression when the agent keeps re-fetching what
         // we squeezed out. Correction loops (re-reads/re-runs) and CCR retrieves
         // (ctx_expand/ctx_retrieve) are two views of the same "too aggressive"
@@ -443,11 +445,6 @@ pub(in crate::server) async fn reversible_post_process(
         ));
         detector.prune_corrections();
     }
-
-    // Persist anomaly detector — debounced to reduce I/O in burst sequences.
-    crate::core::anomaly::save_debounced();
-
-    let budget_warning = post_process::budget_warning_message();
 
     // Out-of-band archive + optional context firewall for large tool outputs.
     // For firewallable tools (ctx_shell/ctx_execute/ctx_search/ctx_tree) whose output
@@ -786,7 +783,6 @@ pub(in crate::server) async fn reversible_post_process(
     let auto_context = auto_context.filter(|_| legacy_context_allowed);
     let had_auto_context = auto_context.is_some();
     let mut had_legacy_context = had_auto_context;
-    let had_budget_warning = budget_warning.is_some();
     let had_throttle_warning = throttle_warning.is_some();
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -826,10 +822,6 @@ pub(in crate::server) async fn reversible_post_process(
     }
     if let Some(warning) = throttle_warning {
         result_text = format!("{result_text}\n\n{warning}");
-    }
-
-    if let Some(bw) = budget_warning {
-        result_text = format!("{result_text}\n\n{bw}");
     }
 
     // Additive, best-effort reference advice. Resolver failures become empty
@@ -882,11 +874,6 @@ pub(in crate::server) async fn reversible_post_process(
                 );
             }
         }
-    }
-
-    {
-        // Evaluate SLOs for observability (watch/dashboard), but keep tool outputs clean.
-        let _ = crate::core::slo::evaluate();
     }
 
     let mut ledger_intent = None;
@@ -997,13 +984,6 @@ pub(in crate::server) async fn reversible_post_process(
 
     if !minimal && !is_raw_shell && name == "ctx_shell" {
         let cmd = helpers::get_str(args, "command").unwrap_or_default();
-
-        if let Some(file_path) = extract_file_read_from_shell(&cmd)
-            && let Ok(mut bt) = crate::core::bounce_tracker::global().lock()
-        {
-            bt.next_seq();
-            bt.record_shell_file_access(&file_path);
-        }
 
         if profile_hints.efficiency_hint() {
             let calls = server.tool_calls.read().await;
@@ -1387,7 +1367,7 @@ pub(in crate::server) async fn reversible_post_process(
         result.is_error = Some(true);
         record_error_category(crate::core::telemetry_v2::ErrorCategory::Internal);
     }
-    let has_dynamic = had_auto_context || had_budget_warning || had_throttle_warning;
+    let has_dynamic = had_auto_context || had_throttle_warning;
     let mut meta = rmcp::model::Meta::new();
     meta.0.insert(
         "cache_hint".to_owned(),
@@ -1439,6 +1419,10 @@ use terminal::{policy_blocked_output, protect_terminal_result};
 use telemetry::shell_error_category;
 pub(in crate::server) use telemetry::{error_failure, result_failure};
 use telemetry::{mcp_error_category, record_error_category, record_shell_error_category};
+
+#[path = "pipeline_shell_effects.rs"]
+mod shell_effects;
+use shell_effects::{record_shell_file_effects, shell_command_base_dir};
 
 #[path = "pipeline_triage.rs"]
 mod triage;

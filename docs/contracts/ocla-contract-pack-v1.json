@@ -26,11 +26,11 @@
     },
     {
       "path": "docs/contracts/DEPRECATION.md",
-      "sha256": "8eb19ce8a4cfd04046b0e19d92bf0af9d81c740a53d116522e2d05284e5b7c09"
+      "sha256": "db0b0aa382e3a4e1595937234b150b3a88d96eb330b19534d60841a1a2daa01a"
     },
     {
       "path": "docs/contracts/README.md",
-      "sha256": "8b1628db858c4a004d00b170e4df963dd579e65ce6e92b182b08e6e988dc7d96"
+      "sha256": "f61fed796ff70a0d1989c10e0482086a85807bdb43d773b2542abbe9fdde8162"
     },
     {
       "path": "docs/contracts/capabilities-contract-v1.md",

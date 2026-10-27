@@ -30,7 +30,7 @@ license = "Apache-2.0"
 repository = "https://github.com/yvgude/lean-ctx"
 homepage = "https://leanctx.com"
 readme = "README.md"
-keywords = ["mcp", "llm", "tokens", "compression", "ai"]
+keywords = ["context-gateway", "mcp", "llm", "ai-agents", "context"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["examples/", "tests/", "crates/"]
 
@@ -248,7 +248,7 @@ ureq = { version = "3.3", features = ["platform-verifier"] }
 # 0.12 pulls lopdf >=0.42 (RUSTSEC-2026-0187: stack overflow on deeply nested PDFs).
 pdf-extract = "0.12"
 tar = "0.4"
-zip = "8.6"
+zip = "9.0.4"
 tree-sitter-bash = { version = "0.25", optional = true }
 tree-sitter-scala = { version = "0.26", optional = true }
 tree-sitter-elixir = { version = "0.3", optional = true }
@@ -338,7 +338,7 @@ blake3 = "1.8"
 rayon = "1.12"
 moka = { version = "0.12", features = ["sync"] }
 postcard = { version = "1.1", features = ["use-std"] }
-zstd = "0.13"
+zstd = "0.14.3"
 lsp-types = "0.97"
 fs2 = "0.4"
 unicode-width = "0.2"
@@ -464,6 +464,16 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "unwind"
+
+# Frequent source installs keep optimized runtime behavior without whole-program
+# LTO. dev-install enables incremental compilation even with a global CI default.
+[profile.dev-fast]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 16
+incremental = true
+strip = false
 
 [target.'cfg(windows)'.dependencies]
 leanctx-native-storage = { path = "crates/leanctx-native-storage", version = "=0.1.0" }

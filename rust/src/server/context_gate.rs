@@ -21,8 +21,8 @@ pub(super) fn protected_path_requested(
 }
 
 /// #843: precise, pinned reads (`diff`, `lines:N-M`, `anchored`/`anchored:N-M`)
-/// must pass through every mode-override path untouched — bounce-prevention,
-/// pressure-downgrade, and the graph/knowledge heuristics below must never
+/// must pass through every mode-override path untouched — bounce-prevention
+/// and the graph/knowledge heuristics below must never
 /// silently reinterpret one of these to e.g. `full`, which would discard the
 /// exact window/anchors/delta the caller asked for. Classifies off the typed
 /// `ReadMode` (single source of truth, see `tools::ctx_read::mode`) rather than
@@ -40,7 +40,6 @@ fn is_precise_pinned_mode(requested_mode: &str) -> bool {
 pub struct PreDispatchResult {
     pub overridden_mode: Option<String>,
     pub reason: Option<&'static str>,
-    pub pressure_downgraded: bool,
     pub budget_blocked: bool,
     pub budget_warning: Option<String>,
     /// Triage-based output filter aggressiveness: 0=passthrough, 1=moderate, 2=aggressive.
@@ -73,17 +72,8 @@ pub fn pre_dispatch_read(
     requested_mode: &str,
     task: Option<&str>,
     project_root: Option<&str>,
-    pressure: Option<&PressureAction>,
 ) -> PreDispatchResult {
-    pre_dispatch_read_for_agent(
-        path,
-        requested_mode,
-        task,
-        project_root,
-        pressure,
-        None,
-        false,
-    )
+    pre_dispatch_read_for_agent(path, requested_mode, task, project_root, None, false)
 }
 
 enum AgentBudgetDecision {
@@ -96,7 +86,6 @@ fn no_change_result() -> PreDispatchResult {
     PreDispatchResult {
         overridden_mode: None,
         reason: None,
-        pressure_downgraded: false,
         budget_blocked: false,
         budget_warning: None,
         triage_filter_level: 0,
@@ -167,7 +156,6 @@ pub fn pre_dispatch_read_for_agent(
     requested_mode: &str,
     task: Option<&str>,
     project_root: Option<&str>,
-    pressure: Option<&PressureAction>,
     agent_id: Option<&str>,
     fresh: bool,
 ) -> PreDispatchResult {
@@ -181,8 +169,7 @@ pub fn pre_dispatch_read_for_agent(
             if is_precise_pinned_mode(requested_mode) {
                 return result;
             }
-            let rest =
-                pre_dispatch_inner(path, requested_mode, task, project_root, pressure, fresh);
+            let rest = pre_dispatch_inner(path, requested_mode, task, project_root, fresh);
             return PreDispatchResult {
                 budget_warning: result.budget_warning,
                 ..rest
@@ -191,7 +178,7 @@ pub fn pre_dispatch_read_for_agent(
         AgentBudgetDecision::Allowed => {}
     }
 
-    pre_dispatch_inner(path, requested_mode, task, project_root, pressure, fresh)
+    pre_dispatch_inner(path, requested_mode, task, project_root, fresh)
 }
 
 /// Does `norm` (a normalized path) actually name the intent target `target`?
@@ -221,18 +208,25 @@ fn path_matches_target(norm: &str, target: &str) -> bool {
     })
 }
 
+/// Explicitly requested views that drop content: the lossy summaries plus
+/// `reference` and `density:`. Lossless, pinned and `auto` requests are not.
+fn is_explicit_compressing_mode(mode: &str) -> bool {
+    use crate::tools::ctx_read::ReadMode;
+    mode.parse::<ReadMode>().is_ok_and(|parsed| {
+        parsed.is_lossy_summary() || matches!(parsed, ReadMode::Reference | ReadMode::Density(_))
+    })
+}
+
 fn pre_dispatch_inner(
     path: &str,
     requested_mode: &str,
     task: Option<&str>,
     project_root: Option<&str>,
-    pressure: Option<&PressureAction>,
     fresh: bool,
 ) -> PreDispatchResult {
     let no_change = PreDispatchResult {
         overridden_mode: None,
         reason: None,
-        pressure_downgraded: false,
         budget_blocked: false,
         budget_warning: None,
         triage_filter_level: 0,
@@ -249,28 +243,10 @@ fn pre_dispatch_inner(
         }
     }
 
-    // Explicit mode=full must not be downgraded by pressure or other heuristics.
+    // Explicit mode=full must not be rewritten by heuristics.
     // Only overlays (user-explicit) above can override it.
     if requested_mode == "full" {
         return no_change;
-    }
-
-    if let Some(action) = pressure {
-        let no_degrade = crate::core::config::Config::load().no_degrade_effective();
-        let profile = crate::core::profiles::active_profile();
-        if !no_degrade
-            && profile.degradation.enforce_effective()
-            && let Some(downgraded) = pressure_downgrade(requested_mode, action)
-        {
-            return PreDispatchResult {
-                overridden_mode: Some(downgraded),
-                reason: Some("pressure-auto-downgrade"),
-                pressure_downgraded: true,
-                budget_blocked: false,
-                budget_warning: None,
-                triage_filter_level: 0,
-            };
-        }
     }
 
     // `fresh` is the documented way out (#1588): the caller re-requested this
@@ -283,7 +259,23 @@ fn pre_dispatch_inner(
         return PreDispatchResult {
             overridden_mode: Some("full".to_string()),
             reason: Some("bounce-prevention"),
-            pressure_downgraded: false,
+            budget_blocked: false,
+            budget_warning: None,
+            triage_filter_level: 0,
+        };
+    }
+
+    // #496 learned per-path memory: a file the agent keeps re-reading in full
+    // after compressed views is delivered in full for explicit compressing
+    // modes too (`auto` consults the same memory in its resolver). The caller
+    // sees the stable `[mode overridden: … reason=learned-full …]` notice.
+    if !fresh
+        && is_explicit_compressing_mode(requested_mode)
+        && crate::core::path_mode_memory::should_force_full(path)
+    {
+        return PreDispatchResult {
+            overridden_mode: Some("full".to_string()),
+            reason: Some("learned-full"),
             budget_blocked: false,
             budget_warning: None,
             triage_filter_level: 0,
@@ -300,7 +292,6 @@ fn pre_dispatch_inner(
             return PreDispatchResult {
                 overridden_mode: Some("full".to_string()),
                 reason: Some("intent-target"),
-                pressure_downgraded: false,
                 budget_blocked: false,
                 budget_warning: None,
                 triage_filter_level: 0,
@@ -325,7 +316,6 @@ fn pre_dispatch_inner(
                     return PreDispatchResult {
                         overridden_mode: Some("map".to_string()),
                         reason: Some("graph-direct-import"),
-                        pressure_downgraded: false,
                         budget_blocked: false,
                         budget_warning: None,
                         triage_filter_level: 0,
@@ -339,7 +329,6 @@ fn pre_dispatch_inner(
                 return PreDispatchResult {
                     overridden_mode: Some("map".to_string()),
                     reason: Some("graph-hub-file"),
-                    pressure_downgraded: false,
                     budget_blocked: false,
                     budget_warning: None,
                     triage_filter_level: 0,
@@ -361,7 +350,6 @@ fn pre_dispatch_inner(
             return PreDispatchResult {
                 overridden_mode: Some("map".to_string()),
                 reason: Some("knowledge-high-relevance"),
-                pressure_downgraded: false,
                 budget_blocked: false,
                 budget_warning: None,
                 triage_filter_level: 0,
@@ -410,10 +398,6 @@ fn estimate_read_tokens(path: &str, mode: &str) -> usize {
     }
 }
 
-fn pressure_downgrade(requested_mode: &str, action: &PressureAction) -> Option<String> {
-    crate::core::auto_mode_resolver::pressure_downgrade(requested_mode, action)
-}
-
 fn check_overlay_mode_override(
     path: &str,
     requested_mode: &str,
@@ -430,7 +414,6 @@ fn check_overlay_mode_override(
                     return Some(PreDispatchResult {
                         overridden_mode: Some(mode_str.to_string()),
                         reason: Some("overlay-set-view"),
-                        pressure_downgraded: false,
                         budget_blocked: false,
                         budget_warning: None,
                         triage_filter_level: 0,
@@ -441,7 +424,6 @@ fn check_overlay_mode_override(
                 return Some(PreDispatchResult {
                     overridden_mode: Some("full".to_string()),
                     reason: Some("pinned"),
-                    pressure_downgraded: false,
                     budget_blocked: false,
                     budget_warning: None,
                     triage_filter_level: 0,
@@ -451,7 +433,6 @@ fn check_overlay_mode_override(
                 return Some(PreDispatchResult {
                     overridden_mode: Some("signatures".to_string()),
                     reason: Some("excluded"),
-                    pressure_downgraded: false,
                     budget_blocked: false,
                     budget_warning: None,
                     triage_filter_level: 0,

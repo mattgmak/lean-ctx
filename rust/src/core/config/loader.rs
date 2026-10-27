@@ -125,6 +125,11 @@ pub(crate) fn strip_sensitive_overrides(local: &mut Config) -> Vec<&'static str>
         local.allow_symlink_roots.clear();
         withheld.push("allow_symlink_roots");
     }
+    // Destinations ctx_shell redirects and downloads may write to.
+    if !local.write_allow_paths.is_empty() {
+        local.write_allow_paths.clear();
+        withheld.push("write_allow_paths");
+    }
     if !local.custom_aliases.is_empty() {
         local.custom_aliases.clear();
         withheld.push("custom_aliases");
@@ -337,13 +342,18 @@ impl Config {
     /// hit is a cheap `Arc::clone`.
     pub fn load_arc() -> Arc<Self> {
         static CACHE: Mutex<ConfigCacheSlot> = Mutex::new(None);
+        Self::load_arc_with(Self::find_project_root().as_deref(), &CACHE)
+    }
 
+    pub(super) fn load_arc_with(
+        project_root: Option<&str>,
+        cache: &Mutex<ConfigCacheSlot>,
+    ) -> Arc<Self> {
         let Some(path) = Self::path() else {
             return Arc::new(Self::default());
         };
 
-        let project_root = Self::find_project_root();
-        let local_path = project_root.as_deref().map(Self::local_path);
+        let local_path = project_root.map(Self::local_path);
 
         // Read raw content up front so the cache key is a content hash.
         let global_content = std::fs::read_to_string(&path).ok();
@@ -360,11 +370,33 @@ impl Config {
         let local_hash = local_content.as_deref().map(crate::core::hasher::hash_str);
         let selected_profile = environment_config_profile();
 
-        if let Ok(guard) = CACHE.lock()
-            && let Some((ref cfg, ref cached_global, ref cached_local, ref cached_profile)) = *guard
+        // Finding 4: a project-local `.lean-ctx.toml`'s SECURITY-sensitive
+        // overrides (shell allowlist, path-jail widening, proxy upstream, …)
+        // are honoured only for a workspace the user has explicitly trusted.
+        // `local_hash` is exactly the content hash workspace-trust pins, so
+        // editing the file after trust re-gates it (see `workspace_trust`).
+        // Decided before the cache lookup and part of the key, so `trust` /
+        // `untrust` reach a running server without a file change (#2144).
+        let trusted = local_content.is_some()
+            && project_root.is_some_and(|r| {
+                crate::core::workspace_trust::is_trusted_for(
+                    std::path::Path::new(r),
+                    local_hash.as_deref().unwrap_or_default(),
+                )
+            });
+
+        if let Ok(guard) = cache.lock()
+            && let Some((
+                ref cfg,
+                ref cached_global,
+                ref cached_local,
+                ref cached_profile,
+                cached_trusted,
+            )) = *guard
             && *cached_global == global_hash
             && *cached_local == local_hash
             && *cached_profile == selected_profile
+            && cached_trusted == trusted
         {
             return Arc::clone(cfg);
         }
@@ -392,25 +424,20 @@ impl Config {
         };
 
         if let Some(ref local) = local_content {
-            // Finding 4: a project-local `.lean-ctx.toml`'s SECURITY-sensitive
-            // overrides (shell allowlist, path-jail widening, proxy upstream, …)
-            // are honoured only for a workspace the user has explicitly trusted.
-            // `local_hash` is exactly the content hash workspace-trust pins, so
-            // editing the file after trust re-gates it (see `workspace_trust`).
-            let trusted = project_root.as_deref().is_some_and(|r| {
-                crate::core::workspace_trust::is_trusted_for(
-                    std::path::Path::new(r),
-                    local_hash.as_deref().unwrap_or_default(),
-                )
-            });
             cfg.merge_local(local, trusted);
         }
 
         cfg.migrate_v4_config_on_disk();
 
         let cfg = Arc::new(cfg);
-        if let Ok(mut guard) = CACHE.lock() {
-            *guard = Some((Arc::clone(&cfg), global_hash, local_hash, selected_profile));
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some((
+                Arc::clone(&cfg),
+                global_hash,
+                local_hash,
+                selected_profile,
+                trusted,
+            ));
         }
 
         cfg

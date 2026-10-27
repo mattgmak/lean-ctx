@@ -220,7 +220,6 @@ impl CtxReadTool {
             fresh = true;
         }
 
-        let pressure_action = ctx.pressure_snapshot.as_ref().map(|p| &p.recommendation);
         let resolved_agent_id = ctx.agent_id.as_ref().and_then(|a| match a.try_read() {
             Ok(guard) => guard.clone(),
             Err(_) => None,
@@ -237,7 +236,6 @@ impl CtxReadTool {
                 &mode,
                 task_ref,
                 Some(&ctx.project_root),
-                pressure_action,
                 resolved_agent_id.as_deref(),
                 fresh,
             )
@@ -260,7 +258,10 @@ impl CtxReadTool {
                 let reason = gate_result.reason.unwrap_or("context-gate");
                 // #1588: an override the caller cannot escape is a dead end.
                 // Name the escape hatch for the two heuristics that honour it.
-                let escape = if matches!(reason, "bounce-prevention" | "intent-target") {
+                let escape = if matches!(
+                    reason,
+                    "bounce-prevention" | "intent-target" | "learned-full"
+                ) {
                     ", pass fresh=true to keep the requested mode"
                 } else {
                     ""
@@ -273,21 +274,7 @@ impl CtxReadTool {
         }
 
         let (instruction_mode, instruction_mode_note) = resolve_instruction_file_mode(path, &mode);
-        let (mut mode, degrade_warning) =
-            if instruction_mode_note.is_some() || instruction_mode != mode {
-                (instruction_mode, None)
-            } else if pinned_mode
-                || mode == "raw"
-                || mode.starts_with("anchored")
-                || mode.starts_with("lines:")
-            {
-                // #513: raw bypasses context-pressure degradation (which would
-                // otherwise downgrade to signatures under Block), exactly like
-                // instruction files — explicit lossless modes mean lossless.
-                (mode, None)
-            } else {
-                auto_degrade_read_mode(&mode)
-            };
+        let mut mode = instruction_mode;
         engine::require_aggressive(
             engine_interface_v1,
             &mode,
@@ -1031,7 +1018,9 @@ impl CtxReadTool {
                     };
 
                     computed = crate::core::redaction::redact_text_if_enabled(&computed);
-                    if let Some(note) = crate::core::context_admission::note_for(&compute_content) {
+                    if let Some(note) =
+                        crate::core::context_admission::note_for(&compute_content, &computed)
+                    {
                         computed.push('\n');
                         computed.push_str(&note);
                     }
@@ -1238,9 +1227,6 @@ impl CtxReadTool {
         if let Some(ref w) = budget_warning {
             warnings.push(w.as_str());
         }
-        if let Some(ref w) = degrade_warning {
-            warnings.push(w.as_str());
-        }
         if let Some(ref w) = delta_explicit_note {
             warnings.push(w.as_str());
         }
@@ -1252,7 +1238,7 @@ impl CtxReadTool {
         }
         let file_summary = extract_file_summary(&output, path);
         let graph_suffix = graph_hint.map(|h| format!("\n{h}")).unwrap_or_default();
-        // #977: notices (mode override, budget, degradation, delta) go BEFORE the
+        // #977: notices (mode override, budget, delta) go BEFORE the
         // payload so client-side truncation of large outputs cannot hide them.
         let final_output = if !warnings.is_empty() {
             format!(
@@ -1342,11 +1328,7 @@ use image::read_image_file;
 #[path = "ctx_read_helpers.rs"]
 mod helpers;
 pub(crate) use helpers::task_intent_steers_read;
-// `apply_verdict`'s only caller in this module is the inline test file, which
-// reaches it as `super::apply_verdict` — hence the cfg(test) import.
-#[cfg(test)]
-use helpers::apply_verdict;
-use helpers::{auto_degrade_read_mode, extract_file_summary, record_attribution_result};
+use helpers::{extract_file_summary, record_attribution_result};
 
 // #660 LOC gate: cache-lock deadline and the uncached fallback (#1925).
 #[path = "ctx_read_uncached.rs"]

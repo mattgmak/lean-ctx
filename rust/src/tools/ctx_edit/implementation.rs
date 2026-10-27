@@ -345,15 +345,14 @@ pub fn run_io(params: &EditParams, last_mode: &str) -> (String, CacheEffect) {
         );
     }
 
-    if content.contains(new_str) {
-        return (
-            format!(
-                "ERROR: old_string not found in {file_path}, but new_string already exists in the file. \
-                 The edit was likely already applied (by a previous tool call or another agent)."
-            ),
-            CacheEffect::None,
-        );
-    }
+    // new_string often overlaps unchanged context, so its presence does not
+    // prove the edit landed (#2143): report it as a fact, keep the diagnosis.
+    let present_note = if content.contains(new_str) {
+        "\nnew_string exists in the file, but that does not establish the edit was \
+         already applied. Re-read the target region."
+    } else {
+        ""
+    };
 
     let preview = if old_str.len() > 80 {
         format!("{}...", &old_str[..old_str.floor_char_boundary(77)])
@@ -375,7 +374,7 @@ pub fn run_io(params: &EditParams, last_mode: &str) -> (String, CacheEffect) {
         format!(
             "ERROR: old_string not found in {file_path}{hint}. \
              Make sure it matches exactly (including whitespace/indentation).\n\
-             Searched for: {preview}{closest_hint}{cross_file}{escalation}"
+             Searched for: {preview}{present_note}{closest_hint}{cross_file}{escalation}"
         ),
         effect,
     )

@@ -753,7 +753,7 @@ pub fn run() {
                 return;
             }
             "dev-install" => {
-                cmd_dev_install();
+                cmd_dev_install(&rest);
                 return;
             }
             "codesign-setup" => {
@@ -1054,6 +1054,10 @@ fn print_setup_help() {
     println!("  --json              Machine-readable report (implies non-interactive)");
     println!("  --no-auto-approve   Skip auto-approve configuration");
     println!("  --skip-rules        Do not write agent rules files");
+    println!("  --agents LIST       Only configure these AI tools, e.g. claude,cursor");
+    println!("                      (all = every detected tool, none = no tool).");
+    println!("                      Saved as setup.agents; `update` honors it.");
+    println!("  --dry-run           Show what setup would configure; write nothing");
     println!("  --help, -h          Show this help (never runs setup)");
     println!();
     println!("See also: lean-ctx onboard (one-command setup), lean-ctx doctor");
@@ -1276,8 +1280,12 @@ fn handle_setup(rest: &[String]) {
         "--no-auto-approve",
         "--skip-rules",
         "--no-agent-aliases",
+        "--dry-run",
     ];
-    if let Some(unknown) = rest.iter().find(|a| !KNOWN.contains(&a.as_str())) {
+    if let Some(unknown) = setup::strip_agents_flag(rest)
+        .into_iter()
+        .find(|a| !KNOWN.contains(&a.as_str()))
+    {
         eprintln!("setup: unknown flag or argument '{unknown}'\n");
         print_setup_help();
         std::process::exit(2);
@@ -1289,6 +1297,16 @@ fn handle_setup(rest: &[String]) {
     let no_auto_approve = rest.iter().any(|a| a == "--no-auto-approve");
     let skip_rules = rest.iter().any(|a| a == "--skip-rules");
     let no_agent_aliases = rest.iter().any(|a| a == "--no-agent-aliases");
+    let dry_run = rest.iter().any(|a| a == "--dry-run");
+    let agents = setup::resolve_agents_flag_or_exit("setup", rest);
+
+    if dry_run {
+        setup::run_dry_run_or_exit(agents, skip_rules, json);
+        return;
+    }
+    if let Some(setup::RequestedAgents(selection)) = agents.clone() {
+        setup::persist_agents_or_exit(selection, json);
+    }
 
     if no_agent_aliases {
         let _ = crate::core::config::setter::set_by_key("skip_agent_aliases", "true");
@@ -1306,25 +1324,38 @@ fn handle_setup(rest: &[String]) {
         };
         run_setup_options(opts, json);
     } else {
-        setup::run_setup();
+        setup::run_setup_wizard(agents.is_none());
     }
 }
 
 fn handle_onboard(rest: &[String]) {
     if rest.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Usage: lean-ctx onboard [--no-agent-aliases]");
+        println!("Usage: lean-ctx onboard [--agents LIST] [--dry-run] [--no-agent-aliases]");
         println!("Connect your AI tools with one command: detects installed");
         println!("agents, installs hooks/rules/MCP registrations, verifies.");
+        println!("On a terminal it first asks which detected tools to connect;");
+        println!("without one (CI, agents) it connects every detected tool.");
         println!();
+        println!("  --agents LIST       Only these tools, e.g. claude,cursor (all / none);");
+        println!("                      saved as setup.agents and honored by `update`");
+        println!("  --dry-run           Show what would be configured; write nothing");
         println!("  --no-agent-aliases  Do not install claude/codex/gemini shell aliases");
         println!();
         println!("Fine-grained control: lean-ctx setup --help");
         return;
     }
+    let agents = setup::resolve_agents_flag_or_exit("onboard", rest);
+    if rest.iter().any(|a| a == "--dry-run") {
+        setup::run_dry_run_or_exit(agents, false, false);
+        return;
+    }
+    if let Some(setup::RequestedAgents(selection)) = agents.clone() {
+        setup::persist_agents_or_exit(selection, false);
+    }
     if rest.iter().any(|a| a == "--no-agent-aliases") {
         let _ = crate::core::config::setter::set_by_key("skip_agent_aliases", "true");
     }
-    setup::run_onboard();
+    setup::run_onboard(agents.is_none());
 }
 
 fn handle_install(rest: &[String]) {

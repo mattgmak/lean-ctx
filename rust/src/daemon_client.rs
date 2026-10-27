@@ -204,11 +204,31 @@ pub async fn daemon_tool_call(name: &str, arguments: Option<&serde_json::Value>)
 }
 
 fn format_daemon_tool_call_body(name: &str, arguments: Option<&serde_json::Value>) -> String {
-    serde_json::json!({
+    // The project this process acts for (`--root`, LEAN_CTX_PROJECT_ROOT, its
+    // working directory): the daemon runs the call in that project's server,
+    // not in the session of whichever project it served last. Outside any
+    // project (home, `/`) nothing is named and the daemon's own root serves.
+    let args: Vec<String> = std::env::args().collect();
+    let root = crate::cli::common::detect_project_root(&args);
+    let project_root =
+        (!crate::core::pathutil::is_broad_or_unsafe_root(std::path::Path::new(&root)))
+            .then_some(root.as_str());
+    tool_call_body(name, arguments, project_root)
+}
+
+fn tool_call_body(
+    name: &str,
+    arguments: Option<&serde_json::Value>,
+    project_root: Option<&str>,
+) -> String {
+    let mut body = serde_json::json!({
         "name": name,
         "arguments": arguments,
-    })
-    .to_string()
+    });
+    if let Some(root) = project_root {
+        body["projectRoot"] = serde_json::Value::String(root.to_string());
+    }
+    body.to_string()
 }
 
 fn format_http_request(method: &str, path: &str, body: &str) -> String {
@@ -268,12 +288,10 @@ pub fn notify_cache_clear() -> bool {
     let Ok(rt) = tokio::runtime::Runtime::new() else {
         return false;
     };
-    let body = serde_json::json!({
-        "name": "ctx_cache",
-        "arguments": { "action": "clear" },
-    });
+    let body =
+        format_daemon_tool_call_body("ctx_cache", Some(&serde_json::json!({ "action": "clear" })));
     rt.block_on(async {
-        try_daemon_request("POST", "/v1/tools/call", &body.to_string())
+        try_daemon_request("POST", "/v1/tools/call", &body)
             .await
             .is_some()
     })

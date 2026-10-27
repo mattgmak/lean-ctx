@@ -124,8 +124,31 @@ pub(super) fn cmd_restart() {
     }
 }
 
-pub(super) fn cmd_dev_install() {
+fn dev_install_profile(args: &[String]) -> Result<&'static str, &'static str> {
+    match args {
+        [] => Ok("dev-fast"),
+        [flag] if flag == "--fast" => Ok("dev-fast"),
+        [flag] if flag == "--release" => Ok("release"),
+        _ => Err("Usage: lean-ctx dev-install [--fast | --release]"),
+    }
+}
+
+pub(super) fn cmd_dev_install(args: &[String]) {
     use crate::ipc;
+
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("Usage: lean-ctx dev-install [--fast | --release]");
+        println!("  --fast     Incremental development build without LTO (default)");
+        println!("  --release  Build with the production release profile");
+        return;
+    }
+    let profile = match dev_install_profile(args) {
+        Ok(profile) => profile,
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    };
 
     let cargo_root = find_cargo_project_root();
     let Some(cargo_root) = cargo_root else {
@@ -147,11 +170,17 @@ pub(super) fn cmd_dev_install() {
          downloads a prebuilt\n  binary in seconds, no toolchain required.\x1b[0m"
     );
     eprintln!();
-    eprintln!("\x1b[2m→ cargo build --release\x1b[0m");
-    let build = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(&cargo_root)
-        .status();
+    eprintln!("\x1b[2m→ cargo build --profile {profile} --timings\x1b[0m");
+    let mut build_command = std::process::Command::new("cargo");
+    build_command
+        .args(["build", "--locked", "--profile", profile, "--timings"])
+        .current_dir(&cargo_root);
+    if profile == "dev-fast" {
+        // Override global non-incremental CI defaults without CARGO_INCREMENTAL=1,
+        // which sccache rejects before it can pass workspace compiles to rustc.
+        build_command.args(["--config", "build.incremental=true"]);
+    }
+    let build = build_command.status();
 
     match build {
         Ok(s) if s.success() => {}
@@ -167,7 +196,7 @@ pub(super) fn cmd_dev_install() {
 
     let target_dir = resolve_cargo_target_dir(&cargo_root);
     let built_binary = target_dir
-        .join("release")
+        .join(profile)
         .join(format!("lean-ctx{}", std::env::consts::EXE_SUFFIX));
     if !built_binary.exists() {
         eprintln!(
@@ -237,19 +266,26 @@ pub(super) fn cmd_dev_install() {
     eprintln!("  ✓ dev-install complete: {version}");
 
     eprintln!("  Re-enabling autostart…");
+    // The installer may still be running from Cargo's mutable target directory.
+    // Services must execute the atomic copy we just installed instead.
+    let installed_binary = install_path.to_string_lossy();
     // #356: re-install (not just bootstrap) so the LaunchAgent plists are
     // regenerated with the current deny-~/Documents seatbelt wrapper — a plain
     // restart would keep the previous, unwrapped plist.
     if crate::proxy_autostart::is_installed() {
-        crate::proxy_autostart::install(crate::proxy_setup::default_port(), true);
+        crate::proxy_autostart::install_with_binary(
+            &installed_binary,
+            crate::proxy_setup::default_port(),
+            true,
+        );
     }
 
     if crate::daemon_autostart::is_installed() {
-        crate::daemon_autostart::install(true);
+        crate::daemon_autostart::install_with_binary(&installed_binary, true);
         eprintln!("  ✓ Daemon restarted via autostart.");
     } else {
         eprintln!("  Starting daemon…");
-        match crate::daemon::start_daemon(&[]) {
+        match crate::daemon::start_daemon_with_binary(&[], Some(&install_path)) {
             Ok(()) => {}
             Err(e) => eprintln!("  Warning: daemon start: {e} (will be started by editor)"),
         }
@@ -668,6 +704,18 @@ pub(super) fn spawn_proxy_if_needed() {
 mod target_dir_tests {
     use super::{resolve_cargo_target_dir, should_spawn_proxy_locally, target_dir_from_metadata};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn dev_install_rejects_unknown_profiles_and_conflicting_modes() {
+        for args in [
+            vec!["--profile", "../../outside-target"],
+            vec!["--fast", "--release"],
+            vec!["--release", "unexpected"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert!(super::dev_install_profile(&args).is_err());
+        }
+    }
 
     #[test]
     fn managed_proxy_service_prevents_a_duplicate_local_spawn() {

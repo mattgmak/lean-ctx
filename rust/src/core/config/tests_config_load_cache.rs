@@ -30,3 +30,47 @@ fn load_honors_content_change_with_preserved_mtime() {
         "Config::load() must honor a content change with unchanged mtime (#406)"
     );
 }
+
+/// #2144 regression: `lean-ctx trust` / `untrust` change no config file, so a
+/// cache keyed only on content kept a running MCP server on the trust state of
+/// its first load — the project's narrower `shell_allowlist` never applied.
+#[test]
+fn load_arc_follows_trust_changes_without_a_file_change() {
+    let _iso = isolated_data_dir();
+    let path = Config::path().expect("config path under isolated data dir");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, "# global\n").unwrap();
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        Config::local_path(project.path().to_str().unwrap()),
+        "shell_allowlist = [\"git\"]\n",
+    )
+    .unwrap();
+    let root_str = project.path().to_string_lossy().into_owned();
+    let root = Some(root_str.as_str());
+    let cache = std::sync::Mutex::new(None);
+    let narrow = vec!["git".to_string()];
+
+    let untrusted = Config::load_arc_with(root, &cache);
+    assert_ne!(
+        untrusted.shell_allowlist, narrow,
+        "untrusted: override withheld"
+    );
+
+    crate::core::workspace_trust::trust(project.path()).unwrap();
+    let trusted = Config::load_arc_with(root, &cache);
+    assert_eq!(
+        trusted.shell_allowlist, narrow,
+        "trust must reach a warm cache"
+    );
+
+    crate::core::workspace_trust::untrust(project.path()).unwrap();
+    let revoked = Config::load_arc_with(root, &cache);
+    assert_ne!(
+        revoked.shell_allowlist, narrow,
+        "untrust must reach a warm cache"
+    );
+}

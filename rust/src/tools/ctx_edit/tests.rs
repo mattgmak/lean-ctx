@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_already_applied_detected() {
+    fn present_new_string_is_not_reported_as_applied() {
         let f = make_temp("fn updated() {}\n");
         let (text, effect) = run_io(
             &mk_params(
@@ -654,9 +654,30 @@ mod tests {
             ),
             "",
         );
-        assert!(text.contains("already exists"));
-        assert!(text.contains("already applied"));
+        assert!(text.starts_with("ERROR: old_string not found"), "{text}");
+        assert!(text.contains("does not establish"), "{text}");
+        assert!(!text.contains("likely already applied"), "{text}");
         assert!(matches!(effect, CacheEffect::None));
+    }
+
+    // GitHub #2143: old_string expected an active line, the file held a
+    // commented-out variant, and new_string was the hunk's unchanged anchor.
+    #[test]
+    fn mismatch_with_overlapping_new_string_points_at_the_real_line() {
+        let f = make_temp("// let retries = 3;\n// retry();\nconnect();\n");
+        let (text, _) = run_io(
+            &mk_params(
+                f.path(),
+                "let retries = 3;\nconnect();",
+                "connect();",
+                false,
+                false,
+            ),
+            "",
+        );
+        assert!(text.starts_with("ERROR: old_string not found"), "{text}");
+        assert!(!text.contains("likely already applied"), "{text}");
+        assert!(text.contains("// let retries = 3;"), "{text}");
     }
 
     #[test]

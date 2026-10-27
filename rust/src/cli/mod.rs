@@ -22,7 +22,7 @@ pub mod cloud;
 mod codex_protected_cmd;
 #[allow(dead_code, unreachable_pub)]
 pub(crate) mod cognitive;
-mod common;
+pub(crate) mod common;
 pub mod completions;
 mod compliance_cmd;
 mod compress_cmd;

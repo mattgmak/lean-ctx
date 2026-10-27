@@ -118,15 +118,19 @@ pub(super) fn validate_v1_request_shape(
     if !enabled {
         return Ok(());
     }
+    // The messages name the way out: agents that sent `paths` with the engine
+    // interface kept retrying the same call (802 times on one installation).
     if args.contains_key("paths") {
         return Err(ErrorData::invalid_params(
-            "engine_interface=\"v1\" supports only single-path ctx_read",
+            "engine_interface=\"v1\" reads one file per call: pass `path` instead of `paths` \
+             and call once per file, or leave out engine_interface to read several files at once",
             None,
         ));
     }
     if args.get("mode").and_then(Value::as_str) != Some("aggressive") {
         return Err(ErrorData::invalid_params(
-            "engine_interface=\"v1\" requires mode=\"aggressive\"",
+            "engine_interface=\"v1\" requires mode=\"aggressive\"; leave out engine_interface \
+             to read in any other mode",
             None,
         ));
     }
@@ -219,7 +223,6 @@ struct GateAdmissionIdentityV1<'a> {
     requested_mode: &'a str,
     overridden_mode: Option<&'a str>,
     reason: Option<&'a str>,
-    pressure_downgraded: bool,
     budget_blocked: bool,
     triage_filter_level: u8,
 }
@@ -242,7 +245,6 @@ pub(super) fn admission_from_gate(
         requested_mode,
         overridden_mode: gate.overridden_mode.as_deref(),
         reason: gate.reason,
-        pressure_downgraded: gate.pressure_downgraded,
         budget_blocked: gate.budget_blocked,
         triage_filter_level: gate.triage_filter_level,
     };
@@ -254,7 +256,6 @@ pub(super) fn admission_from_gate(
         ))
         .map_err(|error| error.to_string())?,
         decision: if gate.budget_blocked
-            || gate.pressure_downgraded
             || gate.overridden_mode.is_some()
             || gate.triage_filter_level > 0
         {
@@ -460,7 +461,6 @@ mod tests {
         PreDispatchResult {
             overridden_mode: overridden_mode.map(str::to_owned),
             reason: overridden_mode.map(|_| "fixture-override"),
-            pressure_downgraded: overridden_mode.is_some(),
             budget_blocked: blocked,
             budget_warning: None,
             triage_filter_level: u8::from(overridden_mode.is_some()),

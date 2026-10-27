@@ -2,7 +2,7 @@
 
 Pre-built binary distribution of **LeanCTX Engine**, the open-source runtime for [LeanCTX](https://github.com/yvgude/lean-ctx), the **Context Gateway for AI Systems**.
 
-**Control what your AI can see.** Select relevant context, apply supported access and content controls, and inspect evidence of observed context operations. The [LeanCTX SDK](https://github.com/Thinkery-AG/leanctx-sdk) provides the separate application integration surface.
+**Control what your AI can see.** Select relevant context, apply supported access and content controls, retain local task and knowledge records, and inspect evidence of observed context operations: **Select · Control · Learn · Prove**. The [LeanCTX SDK](https://github.com/Thinkery-AG/leanctx-sdk) provides the separate application integration surface.
 
 No Rust toolchain required. The correct binary for your platform is downloaded automatically during `npm install`.
 
@@ -47,4 +47,4 @@ cargo install lean-ctx
 - [Documentation](https://leanctx.com/docs/getting-started)
 - [GitHub](https://github.com/yvgude/lean-ctx)
 - [crates.io](https://crates.io/crates/lean-ctx)
-- [Discord](https://discord.gg/pTHkG9Hew9)
+- [Discord](https://discord.gg/6qUJ3QmDyP)

@@ -100,6 +100,74 @@ struct AppState {
     project_root: String,
     timeout: Duration,
     server: LeanCtxServer,
+    /// Serving the local daemon socket: a tool call may name its project.
+    local_ipc: bool,
+    project_servers: Arc<ProjectServers>,
+}
+
+/// One server per project a CLI call named, so a call from project B never
+/// runs in the session of project A (a CLI `knowledge recall` in B answered
+/// with A's facts, 24.10.). Bounded: past [`ProjectServers::KEPT`] projects
+/// the oldest servers are dropped and rebuilt on their next call.
+struct ProjectServers {
+    servers: tokio::sync::Mutex<Vec<(std::path::PathBuf, LeanCtxServer)>>,
+    factory: Box<dyn Fn(&str) -> LeanCtxServer + Send + Sync>,
+}
+
+impl ProjectServers {
+    const KEPT: usize = 32;
+
+    /// For a test state: no server built yet, each named project gets a
+    /// plain server.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Arc<Self> {
+        Arc::new(Self {
+            servers: tokio::sync::Mutex::new(Vec::new()),
+            factory: Box::new(|root| {
+                LeanCtxServer::new_shared_with_context(root, "default", "default")
+            }),
+        })
+    }
+
+    /// The server for `root`, or why `root` may not be served: it must be an
+    /// existing directory and not a broad root (home, `/`).
+    async fn for_root(
+        &self,
+        root: &str,
+        default_root: &str,
+        default: &LeanCtxServer,
+    ) -> Result<LeanCtxServer, &'static str> {
+        let root = std::path::Path::new(root)
+            .canonicalize()
+            .map_err(|_| "project root unavailable")?;
+        // A canonical filesystem root has no parent: `/`, and on Windows the
+        // verbatim drive root `\\?\C:\`, which `is_broad_or_unsafe_root`
+        // does not spell out.
+        if !root.is_dir()
+            || root.parent().is_none()
+            || crate::core::pathutil::is_broad_or_unsafe_root(&root)
+        {
+            return Err("project root is not a project");
+        }
+        if std::path::Path::new(default_root)
+            .canonicalize()
+            .ok()
+            .as_deref()
+            == Some(root.as_path())
+        {
+            return Ok(default.clone());
+        }
+        let mut servers = self.servers.lock().await;
+        if let Some((_, server)) = servers.iter().find(|(known, _)| *known == root) {
+            return Ok(server.clone());
+        }
+        if servers.len() >= Self::KEPT {
+            servers.remove(0);
+        }
+        let server = (self.factory)(&root.to_string_lossy());
+        servers.push((root, server.clone()));
+        Ok(server)
+    }
 }
 
 #[derive(Debug)]
@@ -294,6 +362,12 @@ struct ToolCallBody {
     name: String,
     #[serde(default)]
     arguments: Option<Value>,
+    /// The project the calling CLI process resolved (`--root`,
+    /// `LEAN_CTX_PROJECT_ROOT`, its working directory). Honoured only on the
+    /// local daemon socket: the call then runs in that project's own server,
+    /// never in the session of whichever project the daemon served last.
+    #[serde(default)]
+    project_root: Option<String>,
     #[serde(default)]
     _workspace_id: Option<String>,
     #[serde(default)]
@@ -384,7 +458,30 @@ async fn v1_tool_call(
     State(state): State<AppState>,
     Json(body): Json<ToolCallBody>,
 ) -> impl IntoResponse {
-    let engine = ContextEngine::from_server(state.server.clone());
+    let server = match body.project_root.as_deref() {
+        None => state.server.clone(),
+        // Only the local socket's own user may pick a directory on this host.
+        Some(_) if !state.local_ipc => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "project_root_refused",
+                "only the local daemon socket names a project root",
+            )
+            .into_response();
+        }
+        Some(root) => match state
+            .project_servers
+            .for_root(root, &state.project_root, &state.server)
+            .await
+        {
+            Ok(server) => server,
+            Err(reason) => {
+                return json_error(StatusCode::BAD_REQUEST, "project_root_invalid", reason)
+                    .into_response();
+            }
+        },
+    };
+    let engine = ContextEngine::from_server(server);
     match tokio::time::timeout(
         state.timeout,
         engine.call_tool_value(&body.name, body.arguments),
@@ -875,8 +972,33 @@ fn build_app_router_with_auth(
     require_auth: bool,
     receipt_authority: Option<Arc<crate::core::execution_ledger::host::HostReceiptAuthority>>,
 ) -> Router {
+    build_router(cfg, require_auth, false, receipt_authority)
+}
+
+/// The router of the local daemon socket: tool calls may name their project.
+pub(crate) fn build_ipc_router(
+    cfg: &HttpServerConfig,
+    receipt_authority: Option<Arc<crate::core::execution_ledger::host::HostReceiptAuthority>>,
+) -> Router {
+    build_router(cfg, false, true, receipt_authority)
+}
+
+fn build_router(
+    cfg: &HttpServerConfig,
+    require_auth: bool,
+    local_ipc: bool,
+    receipt_authority: Option<Arc<crate::core::execution_ledger::host::HostReceiptAuthority>>,
+) -> Router {
     let project_root = cfg.project_root.to_string_lossy().to_string();
     let service_project_root = project_root.clone();
+    let project_authority = receipt_authority.clone();
+    let project_factory = move |root: &str| {
+        let mut server = LeanCtxServer::new_shared_with_context(root, "default", "default");
+        server
+            .native_receipt_authority
+            .clone_from(&project_authority);
+        server
+    };
     // REST and Streamable HTTP share the same startup authority snapshot.
     let server_factory = move || {
         let mut server =
@@ -924,6 +1046,11 @@ fn build_app_router_with_auth(
         project_root,
         timeout: Duration::from_millis(cfg.request_timeout_ms.max(1)),
         server: rest_server,
+        local_ipc,
+        project_servers: Arc::new(ProjectServers {
+            servers: tokio::sync::Mutex::new(Vec::new()),
+            factory: Box::new(project_factory),
+        }),
     };
 
     let ocla = match (
@@ -1106,7 +1233,7 @@ pub async fn serve_ipc(cfg: HttpServerConfig, addr: crate::ipc::DaemonAddr) -> R
     match addr {
         #[cfg(unix)]
         crate::ipc::DaemonAddr::Unix(ref path) => {
-            let app = build_app_router_with_auth(&cfg, false, receipt_authority);
+            let app = build_ipc_router(&cfg, receipt_authority);
             let listener = crate::ipc::bind_listener(&addr)?;
 
             tracing::info!(
@@ -1125,7 +1252,7 @@ pub async fn serve_ipc(cfg: HttpServerConfig, addr: crate::ipc::DaemonAddr) -> R
         }
         #[cfg(windows)]
         crate::ipc::DaemonAddr::NamedPipe(ref name) => {
-            let app = build_app_router_with_auth(&cfg, false, receipt_authority);
+            let app = build_ipc_router(&cfg, receipt_authority);
             let listener = crate::ipc::bind_listener(&addr)?;
 
             tracing::info!(

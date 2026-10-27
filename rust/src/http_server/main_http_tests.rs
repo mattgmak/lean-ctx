@@ -130,6 +130,87 @@ async fn ipc_router_allows_local_tools_without_bearer_header() {
     assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// 24.10.: a CLI `knowledge recall` in project B answered with project A's
+/// facts, because every daemon tool call ran in the session of the project
+/// the daemon served last. A call on the local socket names its project and
+/// runs there: two projects behind one daemon never see each other's
+/// knowledge, and only the local socket may name a project at all.
+#[tokio::test]
+async fn daemon_tool_calls_run_in_the_project_they_name() {
+    let _data = crate::core::data_dir::isolated_data_dir();
+    let project_a = tempfile::tempdir().expect("project a");
+    let project_b = tempfile::tempdir().expect("project b");
+    for project in [&project_a, &project_b] {
+        std::fs::create_dir(project.path().join(".git")).expect("git marker");
+    }
+    let root = |dir: &tempfile::TempDir| {
+        dir.path()
+            .canonicalize()
+            .expect("root")
+            .display()
+            .to_string()
+    };
+    let cfg = HttpServerConfig {
+        project_root: project_a.path().to_path_buf(),
+        ..HttpServerConfig::default()
+    };
+    let call = |app: Router, project: Option<String>, arguments: Value| async move {
+        let mut body = json!({"name": "ctx_knowledge", "arguments": arguments});
+        if let Some(project) = project {
+            body["projectRoot"] = json!(project);
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/call")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 4_000_000)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let remember = json!({
+        "action": "remember", "category": "finding", "key": "only-in-b",
+        "value": "this fact lives in project b"
+    });
+    let recall = json!({"action": "recall", "query": "lives in project b"});
+
+    let ipc = build_ipc_router(&cfg, None);
+    let (status, _) = call(ipc.clone(), Some(root(&project_b)), remember.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, in_b) = call(ipc.clone(), Some(root(&project_b)), recall.clone()).await;
+    assert!(
+        in_b.contains("only-in-b"),
+        "project b sees its fact: {in_b}"
+    );
+    let (_, in_a) = call(ipc.clone(), Some(root(&project_a)), recall.clone()).await;
+    assert!(!in_a.contains("only-in-b"), "project a must not: {in_a}");
+    let (_, unnamed) = call(ipc.clone(), None, recall.clone()).await;
+    assert!(
+        !unnamed.contains("only-in-b"),
+        "the daemon's own root is a: {unnamed}"
+    );
+
+    let (status, _) = call(ipc, Some("/".to_string()), recall.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a broad root is no project"
+    );
+    let tcp = build_app_router_with_auth(&cfg, false, None);
+    let (status, body) = call(tcp, Some(root(&project_b)), recall).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("project_root_refused"), "{body}");
+}
+
 #[tokio::test]
 async fn auth_token_blocks_requests_without_bearer_header() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -164,6 +245,8 @@ async fn auth_token_blocks_requests_without_bearer_header() {
         relay_quotas: None,
         a2a_task_authority: Arc::new(crate::core::a2a::task::TaskAuthorityConfigV1::default()),
         concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
+        local_ipc: false,
+        project_servers: crate::http_server::ProjectServers::for_tests(),
         rate: Arc::new(RateLimiter::new(50, 100)),
         remote_replays: Arc::new(remote_replay::RemoteReplayGuard::new(
             &root_str,
@@ -588,6 +671,11 @@ async fn relay_two_servers_deliver_and_replay_signed_evidence() {
     use crate::core::context_kernel::evidence_bundle::EvidenceBundle;
     use lean_ctx_protocol::DataClassification;
 
+    // Both servers and the client share this test's single-threaded runtime,
+    // so every blocking file write on the forwarding path stalls the whole
+    // chain. 5 s timed out on slow Windows and loaded CI hosts (2026-10-17);
+    // the ceiling only matters when something hangs.
+    const RELAY_TEST_TIMEOUT: Duration = Duration::from_secs(30);
     struct Server(tokio::task::JoinHandle<()>);
     impl Drop for Server {
         fn drop(&mut self) {
@@ -628,7 +716,7 @@ async fn relay_two_servers_deliver_and_replay_signed_evidence() {
         a2a_tenant_id: Some("tenant-a".into()),
         a2a_project_id: Some("project-a".into()),
         a2a_peers: table(peers),
-        request_timeout_ms: 5000,
+        request_timeout_ms: 30_000,
         ..HttpServerConfig::default()
     };
     let relay_cfg = config(
@@ -660,7 +748,7 @@ async fn relay_two_servers_deliver_and_replay_signed_evidence() {
     let transport = RemoteTransport::for_peer_table(
         table(vec![peer("relay", "relay", &relay_url, "origin")]),
         "origin",
-        Duration::from_secs(5),
+        RELAY_TEST_TIMEOUT,
         true,
     )
     .unwrap();
@@ -730,7 +818,7 @@ async fn relay_two_servers_deliver_and_replay_signed_evidence() {
             .post(format!("{relay_url}/a2a/deliver"))
             .header(crate::core::a2a::relay::RELAY_PEER_HEADER, "origin")
             .bearer_auth("origin-bearer")
-            .timeout(Duration::from_secs(10))
+            .timeout(RELAY_TEST_TIMEOUT)
             .json(&signed)
             .send()
             .await
@@ -756,7 +844,7 @@ async fn relay_two_servers_deliver_and_replay_signed_evidence() {
     let retry_transport = RemoteTransport::for_peer_table(
         relay_cfg.a2a_peers.clone(),
         "relay",
-        Duration::from_secs(5),
+        RELAY_TEST_TIMEOUT,
         true,
     )
     .unwrap();
@@ -1005,6 +1093,8 @@ async fn relay_http_quota_returns_retry_after_without_charging_failed_auth() {
         relay_quotas: Some(Arc::new(tokio::sync::Mutex::new(quotas))),
         a2a_task_authority: Arc::new(crate::core::a2a::task::TaskAuthorityConfigV1::default()),
         concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
+        local_ipc: false,
+        project_servers: crate::http_server::ProjectServers::for_tests(),
         rate: Arc::new(RateLimiter::new(50, 100)),
         remote_replays: Arc::new(remote_replay::RemoteReplayGuard::new(
             &root_str,

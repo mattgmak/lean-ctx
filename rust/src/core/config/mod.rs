@@ -32,8 +32,15 @@ mod value_display;
 /// Cache payload for [`Config::load_arc`]: the shared config alongside the
 /// content hashes of the global and project-local files plus the environment-
 /// selected config profile it was built from, so a later load only reuses an
-/// entry with identical inputs (#406, #1159).
-type ConfigCacheSlot = Option<(Arc<Config>, Option<String>, Option<String>, Option<String>)>;
+/// entry with identical inputs (#406, #1159). The trailing `bool` is the
+/// workspace-trust decision the entry was merged under (#2144).
+type ConfigCacheSlot = Option<(
+    Arc<Config>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+)>;
 
 pub use defaults::*;
 #[allow(unreachable_pub, unused_imports)]

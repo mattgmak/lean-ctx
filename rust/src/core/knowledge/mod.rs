@@ -360,6 +360,43 @@ mod tests {
     }
 
     #[test]
+    fn batches_of_prebuilt_facts_settle_at_the_cap() {
+        let _iso = crate::core::data_dir::isolated_data_dir();
+        let root = tempfile::tempdir().unwrap();
+        // Regression: the session-save path adds pre-built facts with add_fact()
+        // and never ran the lifecycle, so a store grew to 638 records against a
+        // budget of 200. enforce_capacity() after the batch settles it. The store
+        // is filled under a generous budget, then held to the real one.
+        let mut generous = default_policy();
+        generous.knowledge.max_facts = 1000;
+        let mut k = ProjectKnowledge::new(root.path().to_str().unwrap());
+        for i in 0..40 {
+            k.remember(
+                "finding",
+                &format!("key-{i}"),
+                &format!("value number {i}"),
+                "s1",
+                0.7,
+                &generous,
+            );
+        }
+        let mut policy = default_policy();
+        policy.knowledge.max_facts = 5;
+        assert!(
+            k.facts.len() > policy.knowledge.max_facts,
+            "{}",
+            k.facts.len()
+        );
+        k.enforce_capacity(&policy);
+        assert!(
+            k.facts.len() <= policy.knowledge.max_facts,
+            "expected <= {} facts after the batch, got {}",
+            policy.knowledge.max_facts,
+            k.facts.len()
+        );
+    }
+
+    #[test]
     fn import_facts_evict_down_to_cap_not_double() {
         let _iso = crate::core::data_dir::isolated_data_dir();
         let root = tempfile::tempdir().unwrap();
