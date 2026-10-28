@@ -223,6 +223,41 @@ function clip(text: string): string {
 	return text.length > POLL_TEXT_MAX ? `${text.slice(0, POLL_TEXT_MAX)}\n[output clipped]` : text;
 }
 
+// A follow-up message shows its whole body in the chat, so the body is bounded
+// twice: the head and the tail keep the shape of the output, and a char cap
+// keeps the message small enough to read on one screen.
+const MESSAGE_BODY_MAX = 1300;
+const MESSAGE_HEAD_LINES = 2;
+const MESSAGE_TAIL_LINES = 4;
+
+export function boundMessageBody(output: string): string {
+	const lines = output.split("\n");
+	if (lines.length <= MESSAGE_HEAD_LINES + MESSAGE_TAIL_LINES) return output;
+	let head = lines.slice(0, MESSAGE_HEAD_LINES);
+	let tail = lines.slice(-MESSAGE_TAIL_LINES);
+	let hidden = lines.length - head.length - tail.length;
+	const marker = () => `… ${hidden} lines hidden`;
+	const body = () => [...head, marker(), ...tail].join("\n");
+	while (body().length > MESSAGE_BODY_MAX) {
+		// Whole lines leave the middle of the kept block first, so no line is cut
+		// in half and the marker keeps the count of every removed line.
+		if (head.length > 1) {
+			head = head.slice(0, -1);
+			hidden += 1;
+			continue;
+		}
+		if (tail.length > 1) {
+			tail = tail.slice(1);
+			hidden += 1;
+			continue;
+		}
+		const budget = MESSAGE_BODY_MAX - marker().length - 2;
+		const lead = Math.floor(budget / 2);
+		return `${head[0].slice(0, lead)}\n${marker()}\n${tail[0].slice(-(budget - lead))}`;
+	}
+	return body();
+}
+
 function elapsed(job: Job): string {
 	const seconds = Math.floor((Date.now() - job.startedAt) / 1000);
 	if (seconds < 60) return `${seconds}s`;
@@ -622,7 +657,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 					job.wokenLines.add(match);
 					job.wakes += 1;
 					wake(
-						`lean-ctx background job ${job.name || job.id} matched your wake pattern and still runs.\n$ ${job.command}\n\n${clip(output)}`,
+						`lean-ctx background job ${job.name || job.id} matched your wake pattern and still runs.\n$ ${job.command}\n\n${boundMessageBody(output)}`,
 						{ jobId: job.id, kind: "wake" },
 					);
 				}
@@ -631,7 +666,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		}
 		stopTracking(job);
 		wake(
-			`lean-ctx background job ${job.id} finished.\n$ ${job.command}\n\n${clip(output)}`,
+			`lean-ctx background job ${job.id} finished.\n$ ${job.command}\n\n${boundMessageBody(output)}`,
 			{ jobId: job.id, kind: "done" },
 		);
 	};

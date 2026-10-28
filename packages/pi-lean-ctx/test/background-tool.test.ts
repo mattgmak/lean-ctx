@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+	boundMessageBody,
 	classifyOutcome,
 	killSignal,
 	ownGroups,
@@ -237,6 +238,46 @@ describe("ctx_bg", () => {
 		await vi.advanceTimersByTimeAsync(6000);
 		expect(sent).toHaveLength(1);
 		expect(callTool).toHaveBeenCalledTimes(3);
+	});
+
+	it("bounds a chatty body at the terminal wake", async () => {
+		const chatty = Array.from({ length: 200 }, (_v, i) => `compiling unit ${i + 1}`);
+		const callTool = vi
+			.fn()
+			.mockResolvedValueOnce({ content: [{ type: "text", text: STARTED("shell_b2") }] })
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: `[background:shell_b2 completed exit=0]\n${chatty.join("\n")}` }],
+			});
+		const { execute, sent } = harness({ callTool });
+
+		await execute({ command: "make build" });
+		await vi.advanceTimersByTimeAsync(2000);
+		const content = sent[0].message.content;
+
+		expect(content).toContain("$ make build");
+		expect(content).toContain("… 195 lines hidden");
+		expect(content).not.toContain("compiling unit 50");
+		expect(content.length).toBeLessThan(1500);
+	});
+
+	it("bounds a chatty body at the wake-pattern site", async () => {
+		const chatty = Array.from({ length: 200 }, (_v, i) => `compiling unit ${i + 1}`);
+		chatty[100] = "listening on :3000";
+		const callTool = vi
+			.fn()
+			.mockResolvedValueOnce({ content: [{ type: "text", text: STARTED("shell_b3") }] })
+			.mockResolvedValueOnce({ content: [{ type: "text", text: RUNNING("shell_b3", chatty.join("\n")) }] });
+		const { execute, sent } = harness({ callTool });
+
+		await execute({ command: "npm run dev", wake_on: "listening on" });
+		await vi.advanceTimersByTimeAsync(2000);
+		const content = sent[0].message.content;
+
+		expect(String(sent[0].message.details.kind)).toBe("wake");
+		expect(content).toContain("$ npm run dev");
+		expect(content).toContain("… 195 lines hidden");
+		expect(content).not.toContain("compiling unit 50");
+		expect(content.length).toBeLessThan(1500);
 	});
 
 	it("keeps tracking through a transient bridge failure", async () => {
@@ -1234,6 +1275,47 @@ describe("ctx_bg", () => {
 		expect(blockPad).toHaveLength(2);
 		expect(blockPad.every((band) => band.token === "toolSuccessBg")).toBe(true);
 		for (const row of block.slice(1, -1)) expect((row.match(/┃/g) ?? []).length).toBe(1);
+	});
+});
+
+describe("boundMessageBody", () => {
+	const lines = (count: number, text = (index: number) => `line ${index + 1}`) =>
+		Array.from({ length: count }, (_v, i) => text(i));
+
+	it("keeps the first two lines and the last four of a long body", () => {
+		const kept = boundMessageBody(lines(200).join("\n")).split("\n");
+
+		expect(kept[0]).toBe("line 1");
+		expect(kept[1]).toBe("line 2");
+		expect(kept.slice(-4)).toEqual(["line 197", "line 198", "line 199", "line 200"]);
+		expect(kept).toHaveLength(7);
+	});
+
+	it("returns a body of six lines or fewer byte-identical", () => {
+		const short = "line 1\nline 2\nline 3\nline 4";
+
+		expect(boundMessageBody(short)).toBe(short);
+		expect(boundMessageBody(lines(6).join("\n"))).toBe(lines(6).join("\n"));
+	});
+
+	it("states the hidden line count in the marker", () => {
+		const body = boundMessageBody(lines(200).join("\n"));
+		const markers = body.split("\n").filter((line) => line.includes("lines hidden"));
+
+		expect(markers).toEqual(["… 194 lines hidden"]);
+	});
+
+	it("drops whole middle lines to stay inside the char cap", () => {
+		const wide = lines(200, (i) => `${i + 1} ${"x".repeat(40)}`).join("\n");
+		const body = boundMessageBody(wide);
+		const kept = body.split("\n");
+
+		expect(body.length).toBeLessThanOrEqual(1300);
+		expect(kept[0]).toMatch(/^1 x+$/);
+		expect(kept.at(-1)).toMatch(/^200 x+$/);
+		expect(kept).toContain(`… ${200 - (kept.length - 1)} lines hidden`);
+		// Every kept line is still a whole line of the input, in its own order.
+		for (const line of kept.filter((entry) => !entry.includes("lines hidden"))) expect(wide.split("\n")).toContain(line);
 	});
 });
 
