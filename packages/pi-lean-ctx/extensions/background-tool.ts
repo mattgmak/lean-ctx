@@ -1034,6 +1034,8 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			const glyph = GLYPH[outcome];
 			const name = String(details.name || details.jobId || "ctx_bg");
 			const rpc = RPC_LINE.exec(text)?.[1];
+			// Box paints its padding rows through bgFn, so padY 1 gives the band one
+			// blank row above and below, like a regular tool block.
 			const box = new Box(1, 1, (line: string) => background(theme, line, BAND[outcome]));
 			box.addChild(new Text(
 				barred(
@@ -1085,7 +1087,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		const tail = expanded ? rest : rest.slice(0, MESSAGE_BODY_LINES);
 		const lines = [theme.fg("toolTitle", `● ${head}`), ...tail.map((line: string) => theme.fg("text", ` ${line}`))];
 		if (!expanded && rest.length > tail.length) lines.push(theme.fg("dim", ` +${rest.length - tail.length} lines`));
-		const box = new Box(1, 0, (line: string) => background(theme, line, BAND[outcome]));
+		const box = new Box(1, 1, (line: string) => background(theme, line, BAND[outcome]));
 		for (const line of lines) box.addChild(new Text(barred(theme, outcome, line), 0, 0));
 		return box;
 	});

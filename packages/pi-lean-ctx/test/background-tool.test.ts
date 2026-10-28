@@ -65,12 +65,15 @@ interface Harness {
 function bandTheme(): {
 	theme: Record<string, unknown>;
 	tokens: string[];
+	bands: Array<{ token: string; text: string }>;
 	fg: Array<{ token: string; text: string }>;
 } {
 	const tokens: string[] = [];
+	const bands: Array<{ token: string; text: string }> = [];
 	const fg: Array<{ token: string; text: string }> = [];
 	return {
 		tokens,
+		bands,
 		fg,
 		theme: {
 			fg: (token: string, text: string) => {
@@ -80,6 +83,7 @@ function bandTheme(): {
 			bold: (text: string) => text,
 			bg: (token: string, text: string) => {
 				tokens.push(token);
+				bands.push({ token, text });
 				return text;
 			},
 		},
@@ -1194,6 +1198,42 @@ describe("ctx_bg", () => {
 			done.theme,
 		));
 		expect(done.tokens).toContain("toolSuccessBg");
+	});
+
+	it("pads both ctx_bg blocks by one banded row and leaves the rows unbarred", async () => {
+		const callTool = vi.fn().mockResolvedValue({
+			content: [{ type: "text", text: `${DONE("shell_pad", 0)}\nrpc_ms=12` }],
+		});
+		const { execute, tool, renderer } = harness({ callTool });
+
+		const message = bandTheme();
+		const rows = renderer()(
+			{
+				content: "lean-ctx background job shell_pad finished.\n$ make\nok",
+				details: { outcome: "success" },
+			},
+			{ expanded: false },
+			message.theme,
+		).render(80);
+		expect(rows.length).toBe(5);
+		expect(rows[0].trim()).toBe("");
+		expect(rows[rows.length - 1].trim()).toBe("");
+		const messagePad = message.bands.filter((band) => band.text.trim() === "" && band.text.length === 80);
+		expect(messagePad).toHaveLength(2);
+		expect(messagePad.every((band) => band.token === "toolSuccessBg")).toBe(true);
+		for (const row of [rows[0], rows[rows.length - 1]]) expect((row.match(/┃/g) ?? []).length).toBe(0);
+		for (const row of rows.slice(1, -1)) expect((row.match(/┃/g) ?? []).length).toBe(1);
+
+		const blockTheme = bandTheme();
+		const result = await execute({ background_action: "status", job_id: "shell_pad" });
+		const block = tool().renderResult(result, { expanded: false }, blockTheme.theme).render(80);
+		expect(block[0].trim()).toBe("");
+		expect(block[block.length - 1].trim()).toBe("");
+		expect(block.filter((row) => row.trim() === "")).toHaveLength(2);
+		const blockPad = blockTheme.bands.filter((band) => band.text.trim() === "" && band.text.length === 80);
+		expect(blockPad).toHaveLength(2);
+		expect(blockPad.every((band) => band.token === "toolSuccessBg")).toBe(true);
+		for (const row of block.slice(1, -1)) expect((row.match(/┃/g) ?? []).length).toBe(1);
 	});
 });
 
