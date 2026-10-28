@@ -40,7 +40,6 @@ type Renderer = (message: unknown, options: { expanded: boolean }, theme: unknow
 
 interface ToolDef {
 	execute: Execute;
-	renderCall: (args: Record<string, unknown>, theme: unknown) => Component;
 	renderResult: RenderResult;
 }
 
@@ -60,14 +59,24 @@ interface Harness {
 	runStart: (ctx: unknown) => Promise<void>;
 }
 
-// A theme that records the band token of every painted line instead of adding
-// escape codes, so a test can name the band a block wears.
-function bandTheme(): { theme: Record<string, unknown>; tokens: string[] } {
+// A theme that records the band token of every painted line and every fg token
+// instead of adding escape codes, so a test can name the band and the colour a
+// block wears.
+function bandTheme(): {
+	theme: Record<string, unknown>;
+	tokens: string[];
+	fg: Array<{ token: string; text: string }>;
+} {
 	const tokens: string[] = [];
+	const fg: Array<{ token: string; text: string }> = [];
 	return {
 		tokens,
+		fg,
 		theme: {
-			fg: (_token: string, text: string) => text,
+			fg: (token: string, text: string) => {
+				fg.push({ token, text });
+				return text;
+			},
 			bold: (text: string) => text,
 			bg: (token: string, text: string) => {
 				tokens.push(token);
@@ -1064,6 +1073,9 @@ describe("ctx_bg", () => {
 		expect(ok.tokens).toContain("toolSuccessBg");
 		expect(body).toContain("all tests passed");
 		expect(body).toContain("rpc_ms=");
+		const okBars = ok.fg.filter((call) => call.text === "┃ ");
+		expect(okBars.length).toBeGreaterThan(0);
+		expect(okBars.every((call) => call.token === "success")).toBe(true);
 
 		callTool.mockResolvedValue({ content: [{ type: "text", text: "ERROR: command timed out" }] });
 		const bad = bandTheme();
@@ -1071,6 +1083,29 @@ describe("ctx_bg", () => {
 		const failedBody = drawn(tool().renderResult(failed, { expanded: false }, bad.theme));
 		expect(bad.tokens).toContain("toolErrorBg");
 		expect(failedBody).toContain("ERROR: command timed out");
+		const badBars = bad.fg.filter((call) => call.text === "┃ ");
+		expect(badBars.length).toBeGreaterThan(0);
+		expect(badBars.every((call) => call.token === "error")).toBe(true);
+	});
+
+	it("paints a finished status reply from its exit code", async () => {
+		const callTool = vi.fn().mockResolvedValue({
+			content: [{ type: "text", text: DONE("shell_e0", 0) }],
+		});
+		const { execute, tool } = harness({ callTool });
+
+		const ok = bandTheme();
+		const done = await execute({ background_action: "status", job_id: "shell_e0" });
+		expect(done.details).toMatchObject({ outcome: "success", exitCode: 0 });
+		drawn(tool().renderResult(done, { expanded: false }, ok.theme));
+		expect(ok.tokens).toContain("toolSuccessBg");
+
+		callTool.mockResolvedValue({ content: [{ type: "text", text: DONE("shell_e3", 3) }] });
+		const bad = bandTheme();
+		const failed = await execute({ background_action: "status", job_id: "shell_e3" });
+		expect(failed.details).toMatchObject({ outcome: "failure", exitCode: 3 });
+		drawn(tool().renderResult(failed, { expanded: false }, bad.theme));
+		expect(bad.tokens).toContain("toolErrorBg");
 	});
 
 	it("paints a running reply pending and truncates a long body", async () => {
@@ -1086,6 +1121,9 @@ describe("ctx_bg", () => {
 
 		const body = drawn(tool().renderResult(result, { expanded: false }, theme.theme));
 		expect(theme.tokens).toContain("toolPendingBg");
+		const pendingBars = theme.fg.filter((call) => call.text === "┃ ");
+		expect(pendingBars.length).toBeGreaterThan(0);
+		expect(pendingBars.every((call) => call.token === "warning")).toBe(true);
 		expect(body).toContain("line 0");
 		expect(body).toContain("… 4 more lines");
 		expect(body).not.toContain("line 7");
@@ -1096,17 +1134,29 @@ describe("ctx_bg", () => {
 		expect(full).not.toContain("more lines");
 	});
 
-	it("renders the call line from the action or the job", () => {
-		const { tool } = harness({ callTool: vi.fn() });
+	it("wears one outcome bar per line and paints the body as text", async () => {
+		const callTool = vi.fn().mockResolvedValue({
+			content: [{ type: "text", text: DONE("shell_bar", 0) }],
+		});
+		const { execute, tool } = harness({ callTool });
 		const theme = bandTheme();
+		const result = await execute({ background_action: "status", job_id: "shell_bar" });
 
-		const start = drawn(tool().renderCall({ command: "cargo test", name: "suite" }, theme.theme));
-		expect(start).toContain("ctx_bg suite");
-		expect(start).toContain("cargo test");
+		const body = drawn(tool().renderResult(result, { expanded: false }, theme.theme));
+		const lines = body.split("\n").filter((line) => line.trim() !== "");
+		expect(lines.length).toBeGreaterThan(0);
+		for (const line of lines) expect((line.match(/┃/g) ?? []).length).toBe(1);
 
-		const status = drawn(tool().renderCall({ background_action: "status", job_id: "shell_x" }, theme.theme));
-		expect(status).toContain("ctx_bg status");
-		expect(status).toContain("shell_x");
+		const bars = theme.fg.filter((call) => call.text === "┃ ");
+		expect(bars.length).toBe(lines.length);
+		expect(bars.every((call) => call.token === "success")).toBe(true);
+		expect(theme.fg.find((call) => call.text === "all tests passed")?.token).toBe("text");
+		expect(theme.fg.find((call) => call.text.startsWith("rpc_ms="))?.token).toBe("dim");
+	});
+
+	it("leaves the call line to Pi's default renderer", () => {
+		const { tool } = harness({ callTool: vi.fn() });
+		expect(tool()).not.toHaveProperty("renderCall");
 	});
 
 	it("paints the follow-up message from the carried outcome", () => {
@@ -1115,12 +1165,27 @@ describe("ctx_bg", () => {
 
 		const failed = bandTheme();
 		const failedBody = drawn(renderer()(
-			{ content: "lean-ctx background job shell_x finished.\n$ make\nBUILD FAILED", details: { outcome: "failure" } },
+			{
+				content: [
+					"lean-ctx background job shell_x finished.",
+					"$ make",
+					"BUILD FAILED",
+					...Array.from({ length: 6 }, (_v, i) => `warning ${i}`),
+				].join("\n"),
+				details: { outcome: "failure" },
+			},
 			{ expanded: false },
 			failed.theme,
 		));
 		expect(failed.tokens).toContain("toolErrorBg");
 		expect(failedBody).toContain("BUILD FAILED");
+		const lines = failedBody.split("\n").filter((line) => line.trim() !== "");
+		for (const line of lines) expect((line.match(/┃/g) ?? []).length).toBe(1);
+		const bars = failed.fg.filter((call) => call.text === "┃ ");
+		expect(bars.length).toBe(lines.length);
+		expect(bars.every((call) => call.token === "error")).toBe(true);
+		expect(failed.fg.find((call) => call.text === " $ make")?.token).toBe("text");
+		expect(failed.fg.find((call) => /^ \+\d+ lines$/.test(call.text))?.token).toBe("dim");
 
 		const done = bandTheme();
 		drawn(renderer()(

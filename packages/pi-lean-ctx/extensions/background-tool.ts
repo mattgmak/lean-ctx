@@ -30,6 +30,18 @@ const GLYPH: Record<Outcome, { token: string; mark: string }> = {
 	failure: { token: "error", mark: "✗" },
 	pending: { token: "warning", mark: "…" },
 };
+// The palette gives every band token one base colour, so the band alone cannot
+// tell a finished job from a running one. Each line also wears a bar in the
+// outcome colour.
+const BAR = "┃ ";
+
+function barred(
+	theme: { fg: (token: string, text: string) => string },
+	outcome: Outcome,
+	line: string,
+): string {
+	return theme.fg(GLYPH[outcome].token, BAR) + line;
+}
 // mcp-bridge drops `structuredContent` and `isError`, so no exit code field
 // reaches us and the text alone carries the outcome.
 const FAILURE_HINTS = [
@@ -1001,19 +1013,9 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			"Jobs stop when Pi exits, because they live in the lean-ctx process attached to this session.",
 		],
 		parameters: TEXT,
-		renderCall(args: Record<string, unknown>, theme: any) {
-			const action = typeof args.background_action === "string" ? args.background_action : "";
-			const label = action || String(args.name ?? "").trim() || "start";
-			const target = action ? String(args.job_id ?? "") : String(args.command ?? "");
-			return new Text(
-				theme.fg("toolTitle", `ctx_bg ${label}`) + (target ? theme.fg("dim", ` ${target}`) : ""),
-				0,
-				0,
-			);
-		},
 		// The reply text carries the body, then the rpc footer, then an optional
-		// hint. The band and the glyph follow details.outcome, so a failed job is
-		// told apart from a finished one at a glance.
+		// hint. The band, the bar and the glyph follow details.outcome, so a failed
+		// job is told apart from a finished one at a glance.
 		renderResult(
 			result: { content?: Array<{ text?: string }>; details?: unknown },
 			{ expanded }: { expanded: boolean; isPartial?: boolean },
@@ -1034,16 +1036,24 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			const rpc = RPC_LINE.exec(text)?.[1];
 			const box = new Box(1, 1, (line: string) => background(theme, line, BAND[outcome]));
 			box.addChild(new Text(
-				`${theme.fg(glyph.token, glyph.mark)} ${theme.fg("toolTitle", name)}`
-					+ (rpc ? theme.fg("dim", ` · ${rpc}ms`) : ""),
+				barred(
+					theme,
+					outcome,
+					`${theme.fg(glyph.token, glyph.mark)} ${theme.fg("toolTitle", name)}`
+						+ (rpc ? theme.fg("dim", ` · ${rpc}ms`) : ""),
+				),
 				0,
 				0,
 			));
-			for (const line of shown) box.addChild(new Text(theme.fg("text", line), 0, 0));
-			if (body.length > shown.length) {
-				box.addChild(new Text(theme.fg("dim", `… ${body.length - shown.length} more lines`), 0, 0));
+			for (const line of shown) {
+				box.addChild(new Text(barred(theme, outcome, theme.fg("text", line)), 0, 0));
 			}
-			if (footer) box.addChild(new Text(theme.fg("dim", footer), 0, 0));
+			if (body.length > shown.length) {
+				box.addChild(
+					new Text(barred(theme, outcome, theme.fg("dim", `… ${body.length - shown.length} more lines`)), 0, 0),
+				);
+			}
+			if (footer) box.addChild(new Text(barred(theme, outcome, theme.fg("dim", footer)), 0, 0));
 			return box;
 		},
 		async execute(
@@ -1076,7 +1086,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		const lines = [theme.fg("toolTitle", `● ${head}`), ...tail.map((line: string) => theme.fg("text", ` ${line}`))];
 		if (!expanded && rest.length > tail.length) lines.push(theme.fg("dim", ` +${rest.length - tail.length} lines`));
 		const box = new Box(1, 0, (line: string) => background(theme, line, BAND[outcome]));
-		for (const line of lines) box.addChild(new Text(line, 0, 0));
+		for (const line of lines) box.addChild(new Text(barred(theme, outcome, line), 0, 0));
 		return box;
 	});
 
