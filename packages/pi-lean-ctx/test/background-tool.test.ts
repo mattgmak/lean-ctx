@@ -10,6 +10,7 @@ import {
 	parseElapsed,
 	psTable,
 	registerBackgroundTool,
+	widgetState,
 } from "../extensions/background-tool.js";
 
 // force_kill reads the process table through execFile; the fake table below
@@ -334,7 +335,7 @@ describe("ctx_bg", () => {
 
 		await execute({ command: "sleep 60" }, { mode: "tui", ui: { setWidget } });
 
-		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function), { placement: "belowEditor" });
+		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function), { placement: "aboveEditor" });
 	});
 
 	it("accepts Python's (?i) prefix in wake_on", async () => {
@@ -541,7 +542,7 @@ describe("ctx_bg", () => {
 		await runStart({ mode: "tui", ui: { setWidget } });
 
 		await execute({ command: "cargo test" });
-		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function), { placement: "belowEditor" });
+		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function), { placement: "aboveEditor" });
 
 		await vi.advanceTimersByTimeAsync(2000);
 		const factory = setWidget.mock.calls.at(-1)?.[1] as (
@@ -953,8 +954,8 @@ describe("ctx_bg", () => {
 		const { execute, runShutdown } = harness({ callTool });
 		const setWidget = vi.fn();
 
-		// The widget factory holds the only 1 s ticker, so a second registration
-		// after shutdown is what a revived ticker would look like.
+		// A factory component is reused across repaints, so a revived widget shows
+		// as a second registration after shutdown.
 		await execute({ command: "sleep 30" }, { mode: "tui", ui: { setWidget } });
 		const painted = setWidget.mock.calls.length;
 		expect(painted).toBeGreaterThan(0);
@@ -1412,6 +1413,127 @@ describe("boundMessageBody", () => {
 		expect(kept).toContain(`… ${200 - (kept.length - 1)} lines hidden`);
 		// Every kept line is still a whole line of the input, in its own order.
 		for (const line of kept.filter((entry) => !entry.includes("lines hidden"))) expect(wide.split("\n")).toContain(line);
+	});
+});
+
+describe("ctx_bg jobs widget", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+		vi.mocked(execFile).mockReset();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	const factoryOf = (setWidget: ReturnType<typeof vi.fn>) =>
+		setWidget.mock.calls.at(-1)![1] as (tui: unknown, theme: unknown) => Component;
+
+	it("sets the widget once for the session, even after five polls", async () => {
+		const callTool = vi.fn();
+		callTool.mockResolvedValueOnce({ content: [{ type: "text", text: STARTED("shell_w1") }] });
+		for (let i = 0; i < 5; i += 1) {
+			callTool.mockResolvedValueOnce({
+				content: [{ type: "text", text: RUNNING("shell_w1", `step ${i + 2} of 10`) }],
+			});
+		}
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+
+		await execute({ command: "go test ./...", name: "unit tests" }, { mode: "tui", ui: { setWidget } });
+		await vi.advanceTimersByTimeAsync(2000 * 5);
+
+		expect(setWidget).toHaveBeenCalledTimes(1);
+		expect(setWidget).toHaveBeenCalledWith("lean-ctx-jobs", expect.any(Function), { placement: "aboveEditor" });
+		expect(widgetState.registered).toBe(true);
+	});
+
+	it("rebuilds the stored lines when a job finishes", async () => {
+		const callTool = vi
+			.fn()
+			.mockResolvedValueOnce({ content: [{ type: "text", text: STARTED("shell_w2") }] })
+			.mockResolvedValueOnce({ content: [{ type: "text", text: RUNNING("shell_w2", "step 2 of 10") }] })
+			.mockResolvedValueOnce({ content: [{ type: "text", text: DONE("shell_w2") }] });
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+
+		await execute({ command: "cargo test", name: "unit tests" }, { mode: "tui", ui: { setWidget } });
+		expect(widgetState.lines).toHaveLength(1);
+		expect(widgetState.lines[0]).toMatchObject({ name: "unit tests", tail: "cargo test" });
+
+		const started = widgetState.lines[0];
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(widgetState.lines[0]!.tail).toBe("step 2 of 10");
+		expect(widgetState.lines[0]).not.toBe(started);
+
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(widgetState.lines).toEqual([]);
+		expect(widgetState.overflow).toBe(0);
+	});
+
+	it("renders the stored lines and never the jobs map", async () => {
+		const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: STARTED("shell_w3") }] });
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+
+		await execute({ command: "sleep 60", name: "unit tests" }, { mode: "tui", ui: { setWidget } });
+		const component = factoryOf(setWidget)({ requestRender: () => {} }, bandTheme().theme);
+		const body = drawn(component);
+
+		expect(body).toContain("unit tests");
+		expect(body).toContain(ICON.clock);
+
+		// The map still holds the job, so only the stored lines can empty the widget.
+		widgetState.lines = [];
+		widgetState.overflow = 0;
+		expect(component.render(80)).toEqual([]);
+	});
+
+	it("repaints once per rebuild and adds none for an unchanged line", async () => {
+		let calls = 0;
+		const callTool = vi.fn(async () => {
+			calls += 1;
+			const text = calls === 1 ? STARTED("shell_w4") : RUNNING("shell_w4", "step 2 of 10");
+			return { content: [{ type: "text", text }] };
+		});
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+		const requestRender = vi.fn();
+
+		await execute({ command: "make build", name: "build" }, { mode: "tui", ui: { setWidget } });
+		factoryOf(setWidget)({ requestRender }, bandTheme().theme);
+		expect(requestRender).not.toHaveBeenCalled();
+
+		// The first poll replaces the command with the reported line: one rebuild.
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(widgetState.lines[0]!.tail).toBe("step 2 of 10");
+
+		requestRender.mockClear();
+		// Two elapsed ticks change the cell, then the poll repeats the same line.
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(requestRender).toHaveBeenCalledTimes(2);
+	});
+
+	it("caps the widget at three rows and counts the rest", async () => {
+		let id = 0;
+		const callTool = vi.fn(async () => {
+			id += 1;
+			return { content: [{ type: "text", text: STARTED(`shell_x${id}`) }] };
+		});
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+
+		for (const name of ["alpha", "beta", "gamma", "delta"]) {
+			await execute({ command: `sleep ${name.length}`, name }, { mode: "tui", ui: { setWidget } });
+		}
+		const lines = factoryOf(setWidget)({ requestRender: () => {} }, bandTheme().theme).render(80);
+
+		expect(setWidget).toHaveBeenCalledTimes(1);
+		expect(lines).toHaveLength(4);
+		expect(lines.slice(0, 3).every((line) => line.includes(ICON.clock))).toBe(true);
+		expect(lines[0]).toContain("alpha");
+		expect(lines[3]).toContain("+1 more");
 	});
 });
 

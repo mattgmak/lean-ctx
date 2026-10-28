@@ -547,78 +547,133 @@ export function psTable(rows: PsRow[], own: OwnGroups): string[] {
 	return [head, ...lines];
 }
 
+// A setWidget call deletes the widget key, then re-inserts it. A repeat call
+// would move the band to the bottom of its group. The widget therefore takes
+// one factory component per session and keeps its lines here. A repaint reads
+// this state alone and never the jobs map, so it cannot reorder a poll.
+export interface WidgetLine {
+	elapsed: string;
+	name: string;
+	tail: string;
+}
+
+export const widgetState: {
+	registered: boolean;
+	tui: { requestRender(): void } | undefined;
+	theme: any;
+	lines: WidgetLine[];
+	overflow: number;
+} = { registered: false, tui: undefined, theme: undefined, lines: [], overflow: 0 };
+
+function resetWidget(): void {
+	widgetState.registered = false;
+	widgetState.tui = undefined;
+	widgetState.theme = undefined;
+	widgetState.lines = [];
+	widgetState.overflow = 0;
+}
+
+function sameLines(left: WidgetLine[], right: WidgetLine[]): boolean {
+	if (left.length !== right.length) return false;
+	return left.every((line, index) => {
+		const other = right[index] as WidgetLine;
+		return line.elapsed === other.elapsed && line.name === other.name && line.tail === other.tail;
+	});
+}
+
+// The elapsed column keeps a fixed width, so the name starts at the same column
+// on every row. The pad is a plain space, which keeps the band.
+function clockCell(theme: any, elapsed: string): string {
+	const room = ELAPSED_COL - plainWidth(ICON.clock);
+	return theme.fg("dim", ICON.clock) + theme.fg("accent", elapsed.padStart(room).slice(-room));
+}
+
+// Order: elapsed, name, command. The name yields first, so a long label never
+// pushes the elapsed column or the command out of the row.
+function widgetRow(theme: any, line: WidgetLine, width: number): string {
+	const cell = clockCell(theme, line.elapsed);
+	const room = width - plainWidth(cell) - 4;
+	if (room < 2) return truncateToWidth(cell, width);
+	const nameRoom = Math.min(plainWidth(line.name), Math.max(1, Math.floor(room / 2)));
+	const name = truncateToWidth(line.name, nameRoom);
+	const tailRoom = room - plainWidth(name);
+	const tail = tailRoom > 0 ? `  ${theme.fg("muted", truncateToWidth(line.tail, tailRoom))}` : "";
+	return truncateToWidth(cell + "  " + theme.fg("toolTitle", name) + tail, width);
+}
+
+// Trailing blank cells get trimmed, so a subtle dot fills the band out to the
+// terminal edge and keeps the background visible.
+function paintRow(theme: any, line: string, width: number): string {
+	const pad = Math.max(0, width - plainWidth(line) - 2);
+	return background(theme, " " + line + theme.fg("borderMuted", "·".repeat(pad)) + " ");
+}
+
+// The widget output is a function of the stored lines alone, so a repaint that
+// lands inside a poll shows the set the last rebuild captured.
+function widgetRender(theme: any, width: number): string[] {
+	if (widgetState.lines.length === 0 && widgetState.overflow === 0) return [];
+	const inner = Math.max(1, width - 2);
+	const lines = widgetState.lines.map((line) => paintRow(theme, widgetRow(theme, line, inner), width));
+	if (widgetState.overflow > 0) {
+		lines.push(paintRow(theme, theme.fg("dim", `+${widgetState.overflow} more`), width));
+	}
+	return lines;
+}
+
 export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): void {
 	const jobs = new Map<string, Job>();
 	let ui: ExtensionContext["ui"] | undefined;
-	let requestRender: (() => void) | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	// Set on session_shutdown, so a late timer cannot reopen the turn.
 	let stopped = false;
+	resetWidget();
 
 	const stopTicker = () => {
 		if (ticker) clearInterval(ticker);
 		ticker = undefined;
 	};
 
-	// One line per running job above the editor: elapsed time and latest output.
-	const showJobs = () => {
+	// A start, a finish, a cancel and a changed last line rebuild the stored
+	// lines. A rebuild that finds the same lines repaints nothing.
+	const rebuildWidget = (): void => {
+		const all = [...jobs.values()].map((job) => ({
+			elapsed: formatElapsed(Date.now() - job.startedAt),
+			name: job.name || job.id,
+			tail: (job.lastLine || job.command).replace(/\s+/g, " ") + (job.slow ? " · poll 30s" : ""),
+		}));
+		const lines = all.slice(0, MAX_WIDGET_JOBS);
+		const overflow = Math.max(0, all.length - MAX_WIDGET_JOBS);
+		if (overflow === widgetState.overflow && sameLines(lines, widgetState.lines)) return;
+		widgetState.lines = lines;
+		widgetState.overflow = overflow;
+		widgetState.tui?.requestRender();
+	};
+
+	// The widget keeps one component for the whole session, so this call happens
+	// once per session. The ticker refreshes the elapsed cell of that component.
+	const showJobs = (): void => {
 		// After shutdown the handle is gone, so a late wall retry cannot reopen the
 		// widget or start its ticker again.
+		if (stopped) return;
 		const target = ui;
 		if (!target) return;
-		if (jobs.size === 0) {
-			stopTicker();
-			return target.setWidget(WIDGET_KEY, undefined);
+		if (!widgetState.registered) {
+			widgetState.registered = true;
+			target.setWidget(WIDGET_KEY, (tui: any, theme: any) => {
+				widgetState.tui = tui;
+				widgetState.theme = theme;
+				return {
+					invalidate() {},
+					render: (width: number) => widgetRender(widgetState.theme ?? theme, width),
+				};
+			}, { placement: "aboveEditor" });
 		}
-		// The subagents widget claims the above-editor slot, so this one takes the
-		// below-editor slot and the two never compete for the same position.
-		target.setWidget(WIDGET_KEY, (tui, theme) => {
-			requestRender = () => tui.requestRender();
-			if (!ticker) {
-				ticker = setInterval(() => requestRender?.(), 1000);
-				ticker.unref?.();
-			}
-			const paint = (line: string, width: number): string => {
-				// Trailing blank cells get trimmed, so a subtle dot fills the band out
-				// to the terminal edge and keeps the background visible.
-				const pad = Math.max(0, width - plainWidth(line) - 2);
-				return background(theme, " " + line + theme.fg("borderMuted", "·".repeat(pad)) + " ");
-			};
-			// The elapsed column keeps a fixed width, so the name starts at the same
-			// column on every row. The pad is a plain space, which keeps the band.
-			const clockCell = (job: Job): string => {
-				const room = ELAPSED_COL - plainWidth(ICON.clock);
-				const value = formatElapsed(Date.now() - job.startedAt);
-				return theme.fg("dim", ICON.clock) + theme.fg("accent", value.padStart(room).slice(-room));
-			};
-			// Order: elapsed, name, command. The name yields first, so a long label
-			// never pushes the elapsed column or the command out of the row.
-			const row = (job: Job, width: number): string => {
-				const cell = clockCell(job);
-				const room = width - plainWidth(cell) - 4;
-				if (room < 2) return truncateToWidth(cell, width);
-				const nameText = job.name || job.id;
-				const nameRoom = Math.min(plainWidth(nameText), Math.max(1, Math.floor(room / 2)));
-				const name = truncateToWidth(nameText, nameRoom);
-				const tailText = (job.lastLine || job.command).replace(/\s+/g, " ")
-					+ (job.slow ? " · poll 30s" : "");
-				const tailRoom = room - plainWidth(name);
-				const tail = tailRoom > 0 ? `  ${theme.fg("muted", truncateToWidth(tailText, tailRoom))}` : "";
-				return truncateToWidth(cell + "  " + theme.fg("toolTitle", name) + tail, width);
-			};
-			return {
-				invalidate() {},
-				render(width: number) {
-					const inner = Math.max(1, width - 2);
-					const all = [...jobs.values()];
-					const lines = all.slice(0, MAX_WIDGET_JOBS).map((job) => paint(row(job, inner), width));
-					if (all.length > MAX_WIDGET_JOBS) {
-						lines.push(paint(theme.fg("dim", `+${all.length - MAX_WIDGET_JOBS} more`), width));
-					}
-					return lines;
-				},
-			};
-		}, { placement: "belowEditor" });
+		if (jobs.size === 0) stopTicker();
+		else if (!ticker) {
+			ticker = setInterval(showJobs, 1000);
+			ticker.unref?.();
+		}
+		rebuildWidget();
 	};
 
 	// The factory awaits the MCP bridge, so this extension registers its
@@ -1229,6 +1284,9 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 
 	pi.on("session_start", async (_event, ctx) => {
 		stopped = false;
+		// A session boundary opens a fresh widget slot, so this session registers
+		// once and keeps that component for its whole life.
+		widgetState.registered = false;
 		ui = ctx.mode === "tui" ? ctx.ui : undefined;
 		showJobs();
 	});
@@ -1242,9 +1300,10 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		}
 		jobs.clear();
 		ui?.setWidget(WIDGET_KEY, undefined);
+		// The next session starts with a fresh slot, so it registers once again.
+		resetWidget();
 		// A cleared handle blocks every later paint, so a retry timer that fires
 		// after shutdown stays silent.
 		ui = undefined;
-		requestRender = undefined;
 	});
 }
