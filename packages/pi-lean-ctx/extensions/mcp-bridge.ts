@@ -571,6 +571,8 @@ export class McpBridge {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    /** Bound on this one call; `0` disables the bound. Other callers keep the default. */
+    timeoutMs: number = TOOL_CALL_TIMEOUT_MS,
   ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
     if (signal?.aborted) {
       throw new Error(`lean-ctx MCP tool "${name}" interrupted by host.`);
@@ -578,7 +580,7 @@ export class McpBridge {
 
     try {
       await this.ensureConnected(signal);
-      const result = await this.callToolWithTimeout(name, args, signal);
+      const result = await this.callToolWithTimeout(name, args, signal, timeoutMs);
       this.lastError = undefined;
       return this.toTextBlocks(result);
     } catch (error) {
@@ -594,7 +596,7 @@ export class McpBridge {
           timestamp: new Date().toISOString(),
         };
         await this.forceReconnect();
-        const retried = await this.callToolWithTimeout(name, args, signal);
+        const retried = await this.callToolWithTimeout(name, args, signal, timeoutMs);
         this.lastError = undefined;
         return this.toTextBlocks(retried);
       }
@@ -608,6 +610,7 @@ export class McpBridge {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    timeoutMs: number = TOOL_CALL_TIMEOUT_MS,
   ): Promise<McpCallResult> {
     if (signal?.aborted) {
       throw new Error(`lean-ctx MCP tool "${name}" interrupted by host.`);
@@ -621,18 +624,21 @@ export class McpBridge {
     }
 
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        this.lastHungTool = name;
-        reject(
-          new Error(
-            `lean-ctx MCP tool "${name}" timed out after ${Math.round(TOOL_CALL_TIMEOUT_MS / 1000)}s.`,
-          ),
-        );
-      }, TOOL_CALL_TIMEOUT_MS);
-    });
+    const timeout =
+      timeoutMs > 0
+        ? new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              this.lastHungTool = name;
+              reject(
+                new Error(
+                  `lean-ctx MCP tool "${name}" timed out after ${Math.round(timeoutMs / 1000)}s.`,
+                ),
+              );
+            }, timeoutMs);
+          })
+        : undefined;
 
-    const promises: Promise<McpCallResult>[] = [call, timeout];
+    const promises: Promise<McpCallResult>[] = timeout ? [call, timeout] : [call];
 
     if (signal) {
       let onAbort: (() => void) | undefined;
