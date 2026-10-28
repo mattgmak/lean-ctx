@@ -17,18 +17,30 @@ const RESULT_BODY_LINES = 6;
 const RESULT_BODY_LINES_EXPANDED = 40;
 const MESSAGE_BODY_LINES = 4;
 
+// One glyph table for every site, so no renderer hardcodes a character.
+export const ICON = {
+	clock: "\uF017",
+	done: "\uF00C",
+	fail: "\uF00D",
+	stopped: "\uF05E",
+	running: "\uF110",
+	id: "\uF292",
+};
+
 // The band token of a result block and of a follow-up message follows the
 // outcome, so a failed job never wears the success colour.
-export type Outcome = "success" | "failure" | "pending";
+export type Outcome = "success" | "failure" | "cancelled" | "pending";
 const BAND: Record<Outcome, string> = {
 	success: "toolSuccessBg",
 	failure: "toolErrorBg",
+	cancelled: "toolPendingBg",
 	pending: "toolPendingBg",
 };
-const GLYPH: Record<Outcome, { token: string; mark: string }> = {
-	success: { token: "success", mark: "✓" },
-	failure: { token: "error", mark: "✗" },
-	pending: { token: "warning", mark: "…" },
+const GLYPH: Record<Outcome, { token: string; mark: string; label: string }> = {
+	success: { token: "success", mark: ICON.done, label: "completed" },
+	failure: { token: "error", mark: ICON.fail, label: "failed" },
+	cancelled: { token: "warning", mark: ICON.stopped, label: "cancelled" },
+	pending: { token: "warning", mark: ICON.running, label: "running" },
 };
 // The palette gives every band token one base colour, so the band alone cannot
 // tell a finished job from a running one. Each line also wears a bar in the
@@ -53,6 +65,8 @@ const FAILURE_HINTS = [
 const EXIT_LINE = /\bexit[= ]\s*(\d+)/;
 const RPC_LINE = /\brpc_ms=(\d+)/;
 const MAX_WIDGET_JOBS = 3;
+// The glyph plus the elapsed value fill this column on every widget row.
+const ELAPSED_COL = 6;
 const LAST_LINE_MAX = 60;
 const MAX_WAKE_MESSAGES = 10;
 const POLL_TEXT_MAX = 4000;
@@ -178,6 +192,42 @@ function background(theme: unknown, text: string, token: string = WIDGET_BG): st
 	return typeof bg === "function" ? bg.call(theme, token, text) : text;
 }
 
+// A separator glyph names the element after it, and two spaces hold it away
+// from both neighbours.
+function field(theme: any, glyph: string, markToken: string, value: string, valueToken = "text"): string {
+	return `${theme.fg(markToken, glyph)}  ${theme.fg(valueToken, value)}`;
+}
+
+function boldTitle(theme: any, text: string): string {
+	const painted = theme.fg("toolTitle", text);
+	return typeof theme.bold === "function" ? theme.bold(painted) : painted;
+}
+
+function resultText(outcome: Outcome, exitCode?: number): string {
+	const label = GLYPH[outcome].label;
+	return exitCode === undefined ? label : `${label}, exit ${exitCode}`;
+}
+
+export interface HeadFields {
+	name: string;
+	elapsedMs: number;
+	outcome: Outcome;
+	exitCode?: number;
+	jobId: string;
+}
+
+// One line, four fields: name, elapsed, result, job id. The tool result and the
+// follow-up message share this shape, so both read the same way.
+export function headLine(theme: any, fields: HeadFields): string {
+	const glyph = GLYPH[fields.outcome];
+	return [
+		boldTitle(theme, fields.name),
+		field(theme, ICON.clock, "dim", formatElapsed(fields.elapsedMs), "accent"),
+		field(theme, glyph.mark, glyph.token, resultText(fields.outcome, fields.exitCode)),
+		field(theme, ICON.id, "dim", fields.jobId, "dim"),
+	].join("  ");
+}
+
 function exitCodeOf(text: string): number | undefined {
 	const found = EXIT_LINE.exec(text)?.[1];
 	return found === undefined ? undefined : Number(found);
@@ -189,20 +239,32 @@ function exitCodeOf(text: string): number | undefined {
 export function classifyOutcome(text: string, action: string): Outcome {
 	if (FAILURE_HINTS.some((hint) => text.includes(hint))) return "failure";
 	const code = exitCodeOf(text);
-	if (code !== undefined) return code === 0 ? "success" : "failure";
+	if (code !== undefined) return terminalOutcome(code);
+	// A wall stop names its cancel in words and carries no exit line.
+	if (CANCEL_HINTS.some((hint) => text.includes(hint))) return "cancelled";
 	// The rules hold for every action, so the text alone decides; `action` stays
 	// in the signature because every caller states the request it made.
 	void action;
-	// A running marker, a cancel request and any other text without an exit line
-	// state a job that carries no outcome yet.
+	// A running marker and any other text without an exit line state a job that
+	// carries no outcome yet.
 	return "pending";
+}
+
+// A cancelled job leaves with 130, the shell code for SIGINT, so the bare exit
+// code is enough to tell it apart from a failure.
+const CANCEL_EXIT = 130;
+const CANCEL_HINTS = ["was cancelled", "was stopped"];
+
+function terminalOutcome(code: number): Outcome {
+	if (code === 0) return "success";
+	return code === CANCEL_EXIT ? "cancelled" : "failure";
 }
 
 // The renderers trust the carried outcome and fall back to the text when an
 // older message holds no outcome field.
 function outcomeOf(details: unknown, text: string): Outcome {
 	const stated = (details as { outcome?: unknown } | undefined)?.outcome;
-	if (stated === "success" || stated === "failure" || stated === "pending") return stated;
+	if (stated === "success" || stated === "failure" || stated === "cancelled" || stated === "pending") return stated;
 	return classifyOutcome(text, "");
 }
 
@@ -258,8 +320,8 @@ export function boundMessageBody(output: string): string {
 	return body();
 }
 
-function elapsed(job: Job): string {
-	const seconds = Math.floor((Date.now() - job.startedAt) / 1000);
+function formatElapsed(ms: number): string {
+	const seconds = Math.max(0, Math.floor(ms / 1000));
 	if (seconds < 60) return `${seconds}s`;
 	const minutes = Math.floor(seconds / 60);
 	if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`;
@@ -522,17 +584,27 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 				const pad = Math.max(0, width - plainWidth(line) - 2);
 				return background(theme, " " + line + theme.fg("borderMuted", "·".repeat(pad)) + " ");
 			};
-			// The last output line sits in muted text and yields to the label on a
-			// narrow terminal, so the job name never gets cut.
+			// The elapsed column keeps a fixed width, so the name starts at the same
+			// column on every row. The pad is a plain space, which keeps the band.
+			const clockCell = (job: Job): string => {
+				const room = ELAPSED_COL - plainWidth(ICON.clock);
+				const value = formatElapsed(Date.now() - job.startedAt);
+				return theme.fg("dim", ICON.clock) + theme.fg("accent", value.padStart(room).slice(-room));
+			};
+			// Order: elapsed, name, command. The name yields first, so a long label
+			// never pushes the elapsed column or the command out of the row.
 			const row = (job: Job, width: number): string => {
-				const head = theme.fg("accent", "⏵ ")
-					+ theme.fg("toolTitle", job.name || job.id)
-					+ theme.fg("muted", ` ${job.command.replace(/\s+/g, " ")}`)
-					+ theme.fg("dim", ` · ${elapsed(job)}`)
-					+ (job.slow ? theme.fg("warning", " · poll 30s") : "");
-				const room = width - plainWidth(head) - 3;
-				const tail = job.lastLine && room > 3 ? theme.fg("muted", ` · ${truncateToWidth(job.lastLine, room)}`) : "";
-				return truncateToWidth(head + tail, width);
+				const cell = clockCell(job);
+				const room = width - plainWidth(cell) - 4;
+				if (room < 2) return truncateToWidth(cell, width);
+				const nameText = job.name || job.id;
+				const nameRoom = Math.min(plainWidth(nameText), Math.max(1, Math.floor(room / 2)));
+				const name = truncateToWidth(nameText, nameRoom);
+				const tailText = (job.lastLine || job.command).replace(/\s+/g, " ")
+					+ (job.slow ? " · poll 30s" : "");
+				const tailRoom = room - plainWidth(name);
+				const tail = tailRoom > 0 ? `  ${theme.fg("muted", truncateToWidth(tailText, tailRoom))}` : "";
+				return truncateToWidth(cell + "  " + theme.fg("toolTitle", name) + tail, width);
 			};
 			return {
 				invalidate() {},
@@ -567,6 +639,14 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		jobs.delete(job.id);
 		showJobs();
 	};
+
+	// The header names the job, so the tool result and the follow-up carry the
+	// four fields a renderer needs, and no renderer guesses them.
+	const jobHead = (job: Job) => ({
+		name: job.name || job.id,
+		jobId: job.id,
+		elapsedMs: Date.now() - job.startedAt,
+	});
 
 	// Every reply ends with the same diagnosis line, so a slow bridge call and a
 	// large status payload are visible without a second tool call.
@@ -658,7 +738,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 					job.wakes += 1;
 					wake(
 						`lean-ctx background job ${job.name || job.id} matched your wake pattern and still runs.\n$ ${job.command}\n\n${boundMessageBody(output)}`,
-						{ jobId: job.id, kind: "wake" },
+						{ ...jobHead(job), kind: "wake" },
 					);
 				}
 			}
@@ -667,7 +747,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		stopTracking(job);
 		wake(
 			`lean-ctx background job ${job.id} finished.\n$ ${job.command}\n\n${boundMessageBody(output)}`,
-			{ jobId: job.id, kind: "done" },
+			{ ...jobHead(job), kind: "done" },
 		);
 	};
 
@@ -695,7 +775,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 							+ "and is still running."
 							+ `\n[the wall limit could not be applied: the cancel failed twice, so this job is no longer tracked; last error: ${reason}]`
 							+ `\n$ ${job.command}`,
-						{ jobId: job.id, kind: "wall" },
+						{ ...jobHead(job), kind: "wall" },
 					);
 					return;
 				}
@@ -721,7 +801,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			`lean-ctx background job ${job.name || job.id} hit its wall limit of ${job.wallMs}ms and was cancelled.`
 				+ (job.note ? `\n[${job.note}]` : "")
 				+ `\n$ ${job.command}`,
-			{ jobId: job.id, kind: "wall" },
+			{ ...jobHead(job), kind: "wall" },
 		);
 	};
 
@@ -784,7 +864,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			return reply(
 				`${output}\n[not tracked for a wake message: ${MAX_TRACKED_JOBS} jobs already tracked]`,
 				{ started, chars, jobId: id },
-				{ jobId: id },
+				{ name: String(args.name ?? "").trim() || id, jobId: id, elapsedMs: 0 },
 			);
 		}
 		const wallMs = wallMsOf(args);
@@ -821,7 +901,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		return reply(
 			`${output}\n[a follow-up message arrives when it finishes. Continue with other work instead of polling.]`,
 			{ started, chars, jobId: id },
-			{ jobId: id },
+			jobHead(job),
 		);
 	};
 
@@ -854,7 +934,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		}
 		const job = jobs.get(jobId);
 		if (job && !STILL_RUNNING.test(output)) stopTracking(job);
-		return reply(clip(output), { started, chars: output.length, jobId }, { jobId });
+		return reply(clip(output), { started, chars: output.length, jobId }, job ? jobHead(job) : { jobId });
 	};
 
 	const forceKill = async (
@@ -879,6 +959,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 					+ "so the only token left would match unrelated processes. Nothing was killed; "
 					+ "run the job through a script path or pass a distinctive argument.",
 				{ started, chars: 0, jobId },
+				jobHead(job),
 			);
 		}
 		// A confirm may reach only the pids an earlier dry run listed, so a missing,
@@ -1019,7 +1100,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			lines.join("\n"),
 			{ started, chars: output.length, jobId },
 			{
-				jobId,
+				...jobHead(job),
 				pids: killable.map((row) => row.pid),
 				killed,
 				dropped: droppedPids,
@@ -1057,7 +1138,9 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			theme: any,
 		) {
 			const text = textOf(result as { content: Array<{ text?: string }> });
-			const details = (result.details ?? {}) as { name?: unknown; jobId?: unknown };
+			const details = (result.details ?? {}) as {
+				name?: unknown; jobId?: unknown; elapsedMs?: unknown; exitCode?: unknown;
+			};
 			const outcome = outcomeOf(result.details, text);
 			const all = text.split("\n");
 			const at = all.findIndex((line) => RPC_LINE.test(line));
@@ -1066,9 +1149,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 			while (body.length > 0 && body[body.length - 1] === "") body.pop();
 			const cap = expanded ? RESULT_BODY_LINES_EXPANDED : RESULT_BODY_LINES;
 			const shown = body.slice(0, cap);
-			const glyph = GLYPH[outcome];
 			const name = String(details.name || details.jobId || "ctx_bg");
-			const rpc = RPC_LINE.exec(text)?.[1];
 			// Box paints its padding rows through bgFn, so padY 1 gives the band one
 			// blank row above and below, like a regular tool block.
 			const box = new Box(1, 1, (line: string) => background(theme, line, BAND[outcome]));
@@ -1076,8 +1157,13 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 				barred(
 					theme,
 					outcome,
-					`${theme.fg(glyph.token, glyph.mark)} ${theme.fg("toolTitle", name)}`
-						+ (rpc ? theme.fg("dim", ` · ${rpc}ms`) : ""),
+					headLine(theme, {
+						name,
+						elapsedMs: typeof details.elapsedMs === "number" ? details.elapsedMs : 0,
+						outcome,
+						exitCode: typeof details.exitCode === "number" ? details.exitCode : undefined,
+						jobId: String(details.jobId ?? "-"),
+					}),
 				),
 				0,
 				0,
@@ -1119,8 +1205,22 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		const body = typeof message.content === "string" ? message.content : "";
 		const [head, ...rest] = body.split("\n");
 		const outcome = outcomeOf(message.details, body);
+		const details = (message.details ?? {}) as {
+			name?: unknown; jobId?: unknown; elapsedMs?: unknown; exitCode?: unknown;
+		};
+		// An older message may carry no job id, so the id in its prose stands in.
+		const jobId = String(details.jobId ?? /\bjob (\S+)/.exec(head ?? "")?.[1] ?? "-");
 		const tail = expanded ? rest : rest.slice(0, MESSAGE_BODY_LINES);
-		const lines = [theme.fg("toolTitle", `● ${head}`), ...tail.map((line: string) => theme.fg("text", ` ${line}`))];
+		const lines = [
+			headLine(theme, {
+				name: String(details.name || jobId),
+				elapsedMs: typeof details.elapsedMs === "number" ? details.elapsedMs : 0,
+				outcome,
+				exitCode: typeof details.exitCode === "number" ? details.exitCode : undefined,
+				jobId,
+			}),
+			...tail.map((line: string) => theme.fg("text", ` ${line}`)),
+		];
 		if (!expanded && rest.length > tail.length) lines.push(theme.fg("dim", ` +${rest.length - tail.length} lines`));
 		const box = new Box(1, 1, (line: string) => background(theme, line, BAND[outcome]));
 		for (const line of lines) box.addChild(new Text(barred(theme, outcome, line), 0, 0));

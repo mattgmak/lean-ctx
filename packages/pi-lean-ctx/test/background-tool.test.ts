@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	boundMessageBody,
 	classifyOutcome,
+	ICON,
 	killSignal,
 	ownGroups,
 	parseElapsed,
@@ -551,7 +552,7 @@ describe("ctx_bg", () => {
 		const lines = component.render(200);
 
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toContain("shell_w1 cargo test");
+		expect(lines[0]).toContain("2s  shell_w1  compiling 42 of 120");
 		expect(lines[0]).toContain("compiling 42 of 120");
 		component.dispose?.();
 
@@ -579,6 +580,40 @@ describe("ctx_bg", () => {
 		expect(lines[0]).toContain("compiled pi build");
 		expect(lines[0]).toContain("compiling core");
 		expect(lines[0]).not.toContain("shell_n1");
+	});
+
+	it("puts elapsed first and holds its column for a short and a long name", async () => {
+		const callTool = vi.fn(async (_name: string, args: Record<string, unknown>) => {
+			const status = args.background_action === "status";
+			const long = args.command === "make b" || args.job_id === "shell_l1";
+			const id = long ? "shell_l1" : "shell_s1";
+			return {
+				content: [{ type: "text", text: status ? RUNNING(id, `output of ${id}`) : STARTED(id) }],
+			};
+		});
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+
+		await execute({ command: "make a", name: "build" }, { mode: "tui", ui: { setWidget } });
+		await execute(
+			{ command: "make b", name: "integration test suite for the whole repository" },
+			{ mode: "tui", ui: { setWidget } },
+		);
+		await vi.advanceTimersByTimeAsync(2000);
+
+		const factory = setWidget.mock.calls.at(-1)?.[1] as (
+			tui: { requestRender: () => void },
+			theme: { fg: (color: string, text: string) => string },
+		) => { render(width: number): string[] };
+		const lines = factory({ requestRender: () => {} }, { fg: (_color, text) => text }).render(80);
+
+		expect(lines).toHaveLength(2);
+		// The clock glyph opens the row and its fixed column holds the name start,
+		// so the long label truncates instead of shifting the elapsed field.
+		expect(lines[0].slice(0, 9)).toBe(` ${ICON.clock}   2s  `);
+		expect(lines[1].slice(0, 9)).toBe(` ${ICON.clock}   2s  `);
+		expect(lines[0]).toContain("  build  output of shell_s1");
+		expect(lines[1]).toContain("  integration");
 	});
 
 	it("refuses a LEAN_CTX env key without calling the bridge", async () => {
@@ -1199,6 +1234,67 @@ describe("ctx_bg", () => {
 		expect(theme.fg.find((call) => call.text.startsWith("rpc_ms="))?.token).toBe("dim");
 	});
 
+	it("lays the result header out as name, elapsed, result and job id", () => {
+		const { tool } = harness({ callTool: vi.fn() });
+		const theme = bandTheme();
+		const body = drawn(tool().renderResult(
+			{
+				content: [{ type: "text", text: `${DONE("shell_h1", 0)}\nrpc_ms=12` }],
+				details: { name: "unit tests", jobId: "shell_h1", elapsedMs: 65_000, outcome: "success", exitCode: 0 },
+			},
+			{ expanded: false },
+			theme.theme,
+		));
+		const head = body.split("\n").find((line) => line.includes("unit tests")) ?? "";
+
+		expect(head).toContain(
+			`unit tests  ${ICON.clock}  1m05s  ${ICON.done}  completed, exit 0  ${ICON.id}  shell_h1`,
+		);
+		expect(head.indexOf("unit tests")).toBeLessThan(head.indexOf(ICON.clock));
+		expect(head.indexOf(ICON.clock)).toBeLessThan(head.indexOf(ICON.done));
+		expect(head.indexOf(ICON.done)).toBeLessThan(head.indexOf(ICON.id));
+		expect(theme.fg.find((call) => call.text === "unit tests")?.token).toBe("toolTitle");
+		expect(theme.fg.find((call) => call.text === ICON.done)?.token).toBe("success");
+		expect(theme.fg.find((call) => call.text === "shell_h1")?.token).toBe("dim");
+	});
+
+	it("shows the stopped glyph for a cancelled job and the running glyph for a running one", async () => {
+		const callTool = vi.fn().mockResolvedValue({
+			content: [{ type: "text", text: "[background:shell_c9 completed exit=130]" }],
+		});
+		const { execute, tool } = harness({ callTool });
+
+		const stopped = await execute({ background_action: "status", job_id: "shell_c9" });
+		expect(stopped.details).toMatchObject({ outcome: "cancelled", exitCode: 130 });
+		const stoppedBody = drawn(tool().renderResult(stopped, { expanded: false }, bandTheme().theme));
+		expect(stoppedBody).toContain(`${ICON.stopped}  cancelled, exit 130`);
+		expect(stoppedBody).not.toContain(ICON.fail);
+
+		callTool.mockResolvedValue({ content: [{ type: "text", text: RUNNING("shell_r9") }] });
+		const running = await execute({ background_action: "status", job_id: "shell_r9" });
+		const runningBody = drawn(tool().renderResult(running, { expanded: false }, bandTheme().theme));
+		expect(runningBody).toContain(`${ICON.running}  running`);
+		expect(runningBody).not.toContain(ICON.done);
+	});
+
+	it("lays the follow-up header out from the carried fields", () => {
+		const { renderer } = harness({ callTool: vi.fn() });
+		const theme = bandTheme();
+		const body = drawn(renderer()(
+			{
+				content: "lean-ctx background job shell_m1 finished.\n$ make\nok",
+				details: { outcome: "failure", exitCode: 3, name: "unit tests", jobId: "shell_m1", elapsedMs: 3000 },
+			},
+			{ expanded: false },
+			theme.theme,
+		));
+		const head = body.split("\n").find((line) => line.includes("unit tests")) ?? "";
+
+		expect(head).toContain(
+			`unit tests  ${ICON.clock}  3s  ${ICON.fail}  failed, exit 3  ${ICON.id}  shell_m1`,
+		);
+	});
+
 	it("leaves the call line to Pi's default renderer", () => {
 		const { tool } = harness({ callTool: vi.fn() });
 		expect(tool()).not.toHaveProperty("renderCall");
@@ -1324,6 +1420,7 @@ describe("classifyOutcome", () => {
 		expect(classifyOutcome("[background:shell_a1 completed exit=0]\nall tests passed", "status")).toBe("success");
 		expect(classifyOutcome("[background:shell_a1 completed exit 0]", "status")).toBe("success");
 		expect(classifyOutcome("[background:shell_a1 completed exit=1]\nboom", "status")).toBe("failure");
+		expect(classifyOutcome("[background:shell_a1 completed exit=130]", "status")).toBe("cancelled");
 	});
 
 	it("keeps a running or cancelled job pending", () => {
