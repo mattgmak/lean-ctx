@@ -66,8 +66,9 @@ const FAILURE_HINTS = [
 const EXIT_LINE = /\bexit[= ]\s*(\d+)/;
 const RPC_LINE = /\brpc_ms=(\d+)/;
 const MAX_WIDGET_JOBS = 3;
-// The glyph plus the elapsed value fill this column on every widget row.
-const ELAPSED_COL = 6;
+// The glyph, one space and the elapsed value fill this column on every widget
+// row. The pad follows the value, so the one space after the glyph holds.
+const ELAPSED_COL = 7;
 const LAST_LINE_MAX = 60;
 const MAX_WAKE_MESSAGES = 10;
 const POLL_TEXT_MAX = 4000;
@@ -583,10 +584,13 @@ function sameLines(left: WidgetLine[], right: WidgetLine[]): boolean {
 }
 
 // The elapsed column keeps a fixed width, so the name starts at the same column
-// on every row. The pad is a plain space, which keeps the band.
+// on every row. The glyph holds exactly one space away from the value, and the
+// pad is a plain space after both, which keeps the band.
 function clockCell(theme: any, elapsed: string): string {
-	const room = ELAPSED_COL - plainWidth(ICON.clock);
-	return theme.fg("dim", ICON.clock) + theme.fg("accent", elapsed.padStart(room).slice(-room));
+	const room = ELAPSED_COL - plainWidth(ICON.clock) - 1;
+	const value = elapsed.slice(0, room);
+	return theme.fg("dim", ICON.clock) + " " + theme.fg("accent", value)
+		+ " ".repeat(Math.max(0, room - plainWidth(value)));
 }
 
 // Order: elapsed, name, command. The name yields first, so a long label never

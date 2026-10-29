@@ -553,7 +553,8 @@ describe("ctx_bg", () => {
 		const lines = component.render(200);
 
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toContain("2s  shell_w1  compiling 42 of 120");
+		expect(lines[0]).toContain(`${ICON.clock} 2s`);
+		expect(lines[0]).toContain("shell_w1  compiling 42 of 120");
 		expect(lines[0]).toContain("compiling 42 of 120");
 		component.dispose?.();
 
@@ -611,10 +612,38 @@ describe("ctx_bg", () => {
 		expect(lines).toHaveLength(2);
 		// The clock glyph opens the row and its fixed column holds the name start,
 		// so the long label truncates instead of shifting the elapsed field.
-		expect(lines[0].slice(0, 9)).toBe(` ${ICON.clock}   2s  `);
-		expect(lines[1].slice(0, 9)).toBe(` ${ICON.clock}   2s  `);
+		expect(lines[0].slice(0, 8)).toBe(` ${ICON.clock} 2s   `);
+		expect(lines[1].slice(0, 8)).toBe(` ${ICON.clock} 2s   `);
+		// One space after the glyph, never a double space.
+		expect(lines[0].slice(0, 3)).toBe(` ${ICON.clock} `);
+		expect(lines[0][3]).toBe("2");
 		expect(lines[0]).toContain("  build  output of shell_s1");
 		expect(lines[1]).toContain("  integration");
+	});
+
+	it("keeps one space after the clock glyph on a job row without a name", async () => {
+		const callTool = vi.fn(async (_name: string, args: Record<string, unknown>) => ({
+			content: [{
+				type: "text",
+				text: args.background_action === "status" ? RUNNING("shell_z1", "step 1 of 2") : STARTED("shell_z1"),
+			}],
+		}));
+		const { execute } = harness({ callTool });
+		const setWidget = vi.fn();
+
+		await execute({ command: "make z" }, { mode: "tui", ui: { setWidget } });
+		await vi.advanceTimersByTimeAsync(2000);
+
+		const factory = setWidget.mock.calls.at(-1)?.[1] as (
+			tui: { requestRender: () => void },
+			theme: { fg: (color: string, text: string) => string },
+		) => { render(width: number): string[] };
+		const lines = factory({ requestRender: () => {} }, { fg: (_color, text) => text }).render(80);
+
+		// The nameless row falls back to the job id and keeps the same clock prefix.
+		expect(lines[0].startsWith(` ${ICON.clock} 2s`)).toBe(true);
+		expect(lines[0]).not.toContain(`${ICON.clock}  `);
+		expect(lines[0]).toContain("shell_z1");
 	});
 
 	it("refuses a LEAN_CTX env key without calling the bridge", async () => {
