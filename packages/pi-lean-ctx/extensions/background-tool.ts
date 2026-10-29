@@ -16,6 +16,7 @@ const WIDGET_BG = "customMessageBg";
 const RESULT_BODY_LINES = 6;
 const RESULT_BODY_LINES_EXPANDED = 40;
 const MESSAGE_BODY_LINES = 4;
+const JOBS_CHANNEL = "agent-sesh:background-jobs-running:v1";
 
 // One glyph table for every site, so no renderer hardcodes a character.
 export const ICON = {
@@ -685,6 +686,23 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		showJobs();
 	};
 
+	// The payload carries the live count, so a listener that missed one event
+	// still recovers on the next one. A bus failure must not break job tracking.
+	const emitJobsActive = (phase: "start" | "stop", job: Job): void => {
+		try {
+			const bus = pi.events;
+			if (typeof bus?.emit !== "function") return;
+			bus.emit(JOBS_CHANNEL, {
+				jobId: job.id,
+				...(job.name ? { name: job.name } : {}),
+				phase,
+				active: jobs.size,
+			});
+		} catch {
+			// A throwing listener leaves the jobs map alone.
+		}
+	};
+
 	const stopTracking = (job: Job) => {
 		clearInterval(job.timer);
 		if (job.wallTimer) clearTimeout(job.wallTimer);
@@ -692,6 +710,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		// A dry-run list dies with the tracking it belongs to.
 		job.dryRun = undefined;
 		jobs.delete(job.id);
+		emitJobsActive("stop", job);
 		showJobs();
 	};
 
@@ -944,6 +963,7 @@ export function registerBackgroundTool({ pi, registerTool, getBridge }: Deps): v
 		};
 		job.timer.unref?.();
 		jobs.set(id, job);
+		emitJobsActive("start", job);
 		if (wallMs > 0) {
 			const wallTimer = setTimeout(() => {
 				job.wallTimer = undefined;
